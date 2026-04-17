@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -203,7 +204,17 @@ func runReplay() {
 		fatal("failed to create replayer", "err", err)
 	}
 
-	if err := replayer.Run(); err != nil {
+	// Cancel on SIGINT/SIGTERM so Ctrl+C stops between files/queries
+	// rather than mid-query, and the checkpoint is saved before exit.
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := replayer.Run(ctx); err != nil {
+		if err == context.Canceled {
+			slog.Info("replay cancelled; checkpoint saved for resume")
+			return
+		}
 		fatal("replay error", "err", err)
 	}
 }

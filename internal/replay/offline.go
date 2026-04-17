@@ -2,6 +2,7 @@ package replay
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -82,7 +83,11 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 	}, nil
 }
 
-func (r *OfflineReplayer) Run() error {
+// Run replays all matching log files. On context cancellation the
+// replayer stops at the next safe point (between files or between per-
+// session queries), persists the current checkpoint, and returns
+// context.Canceled so callers can distinguish "interrupted" from "error".
+func (r *OfflineReplayer) Run(ctx context.Context) error {
 	defer r.pool.Close()
 	defer r.reporter.Close()
 
@@ -99,6 +104,12 @@ func (r *OfflineReplayer) Run() error {
 	slog.Info("replaying log files", "count", len(files))
 
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			slog.Info("replay interrupted, stopping before next file",
+				"file", filepath.Base(file))
+			return err
+		}
+
 		basename := filepath.Base(file)
 		if r.checkpoint.IsCompleted(basename) {
 			slog.Info("skipping completed file", "file", basename)
@@ -106,7 +117,12 @@ func (r *OfflineReplayer) Run() error {
 		}
 
 		slog.Info("replaying file", "file", basename)
-		if err := r.replayFile(file); err != nil {
+		if err := r.replayFile(ctx, file); err != nil {
+			// If the context was cancelled mid-file, the checkpoint was
+			// already saved by the periodic saver; propagate cancel up.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return fmt.Errorf("replaying %s: %w", file, err)
 		}
 
@@ -131,7 +147,7 @@ func (r *OfflineReplayer) findLogFiles() ([]string, error) {
 	return files, nil
 }
 
-func (r *OfflineReplayer) replayFile(filePath string) error {
+func (r *OfflineReplayer) replayFile(ctx context.Context, filePath string) error {
 	basename := filepath.Base(filePath)
 
 	// If this file was in_progress from a previous run, restart from the
@@ -227,6 +243,9 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 			var prevTimestamp time.Time
 			for _, se := range entries {
+				if ctx.Err() != nil {
+					return
+				}
 				// Safety: never replay DML/DDL against the target server.
 				if !IsReadOnly(se.entry.Query) {
 					continue
@@ -236,7 +255,11 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 					gap := se.entry.Timestamp.Sub(prevTimestamp)
 					scaledGap := time.Duration(float64(gap) / r.speedFactor)
 					if scaledGap > 0 && scaledGap < 10*time.Second {
-						time.Sleep(scaledGap)
+						select {
+						case <-time.After(scaledGap):
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 				prevTimestamp = se.entry.Timestamp

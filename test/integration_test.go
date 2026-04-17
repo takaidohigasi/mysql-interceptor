@@ -2,6 +2,7 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -329,7 +330,7 @@ func TestOfflineReplayWithDivergentServers(t *testing.T) {
 		t.Fatalf("failed to create replayer: %v", err)
 	}
 
-	if err := replayer.Run(); err != nil {
+	if err := replayer.Run(context.Background()); err != nil {
 		t.Fatalf("replay failed: %v", err)
 	}
 
@@ -450,7 +451,7 @@ func TestOfflineReplayIgnoreServerUUID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new replayer: %v", err)
 	}
-	if err := replayer.Run(); err != nil {
+	if err := replayer.Run(context.Background()); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 
