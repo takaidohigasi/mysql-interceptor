@@ -66,6 +66,7 @@ func (h *ProxyHandler) HandleQuery(query string) (*mysql.Result, error) {
 		captured := captureResult(result, err, duration)
 		h.shadowSender.Send(replay.ShadowQuery{
 			SessionID:    h.sessionID,
+			Database:     h.currentDB,
 			Query:        query,
 			OrigDuration: duration,
 			OrigResult:   captured,

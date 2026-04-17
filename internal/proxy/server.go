@@ -121,6 +121,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	handler := &ProxyHandler{
 		sessionID:    sessionID,
 		backend:      backendConn,
+		currentDB:    backendConn.GetDB(),
 		shadowSender: ps.shadowSender,
 	}
 

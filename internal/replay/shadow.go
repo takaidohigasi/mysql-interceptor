@@ -15,6 +15,7 @@ import (
 
 type ShadowQuery struct {
 	SessionID    uint64
+	Database     string // current DB at the time of the query (empty if none)
 	Query        string
 	OrigDuration time.Duration
 	OrigResult   *compare.CapturedResult
@@ -138,6 +139,18 @@ func (s *ShadowSender) worker() {
 			if err != nil {
 				log.Printf("[shadow] failed to get connection: %v", err)
 				continue
+			}
+
+			// Make sure the shadow connection is on the same database as the
+			// primary was when the query ran. Without this, queries with
+			// unqualified table references would hit the wrong schema (or
+			// fail on a fresh shadow connection with no default DB).
+			if sq.Database != "" && sq.Database != conn.GetDB() {
+				if _, err := conn.Execute("USE `" + sq.Database + "`"); err != nil {
+					log.Printf("[shadow] USE %s failed: %v", sq.Database, err)
+					s.pool.Put(conn)
+					continue
+				}
 			}
 
 			replayResult, err := ExecuteAndCapture(conn, sq.Query)
