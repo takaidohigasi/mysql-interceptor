@@ -11,6 +11,7 @@ import (
 	"expvar"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -100,7 +101,17 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 
 func handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	snap := map[string]int64{
+
+	// Runtime gauges are read live, not accumulated. ReadMemStats briefly
+	// pauses the world, but scrape intervals of 10s+ make this negligible.
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	// Mixed types: application counters are int64 (from atomic.Int64),
+	// runtime gauges are uint64 (from runtime.MemStats). JSON-encodes
+	// both as numbers; scrapers that parse them don't care.
+	snap := map[string]any{
+		// Application counters
 		"active_sessions":             Global.ActiveSessions.Load(),
 		"total_sessions":              Global.TotalSessions.Load(),
 		"queries_handled":             Global.QueriesHandled.Load(),
@@ -119,6 +130,18 @@ func handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"comparisons_ignored":         Global.ComparisonsIgnored.Load(),
 		"comparisons_digest_overflow": Global.ComparisonsDigestOver.Load(),
 		"comparisons_digest_count":    Global.ComparisonsDigestCount.Load(),
+
+		// Runtime gauges (uint64 from runtime.MemStats)
+		"heap_alloc_bytes":  ms.HeapAlloc,   // currently allocated on heap
+		"heap_inuse_bytes":  ms.HeapInuse,   // bytes in in-use spans
+		"heap_idle_bytes":   ms.HeapIdle,    // idle spans (may return to OS)
+		"heap_sys_bytes":    ms.HeapSys,     // heap obtained from OS
+		"heap_objects":      ms.HeapObjects, // live objects
+		"stack_inuse_bytes": ms.StackInuse,  // stack bytes in use
+		"sys_bytes":         ms.Sys,         // total mem obtained from OS
+		"num_goroutines":    runtime.NumGoroutine(),
+		"gc_cycles_total":   ms.NumGC,        // completed GC cycles
+		"gc_pause_ns_total": ms.PauseTotalNs, // cumulative STW pause time
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

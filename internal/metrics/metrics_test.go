@@ -59,6 +59,23 @@ func TestMetricsEndpointReturnsCounters(t *testing.T) {
 	if snap["comparisons_ignored"] != 7 {
 		t.Errorf("expected comparisons_ignored=7, got %d", snap["comparisons_ignored"])
 	}
+
+	// Runtime gauges — exact values aren't predictable, but they must
+	// exist and be plausible (>0 for heap_alloc_bytes, >=1 for goroutines).
+	if snap["heap_alloc_bytes"] <= 0 {
+		t.Errorf("expected heap_alloc_bytes > 0, got %d", snap["heap_alloc_bytes"])
+	}
+	if snap["num_goroutines"] < 1 {
+		t.Errorf("expected num_goroutines >= 1, got %d", snap["num_goroutines"])
+	}
+	for _, k := range []string{
+		"heap_inuse_bytes", "heap_idle_bytes", "heap_sys_bytes", "heap_objects",
+		"stack_inuse_bytes", "sys_bytes", "gc_cycles_total", "gc_pause_ns_total",
+	} {
+		if _, ok := snap[k]; !ok {
+			t.Errorf("expected key %q in metrics response", k)
+		}
+	}
 }
 
 func TestNewServerNilForEmptyAddr(t *testing.T) {

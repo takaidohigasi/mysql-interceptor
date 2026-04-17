@@ -289,6 +289,7 @@ Endpoints:
   - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
   - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
   - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`, `comparisons_digest_count` (gauge), `comparisons_digest_overflow`
+  - **Runtime (gauges):** `heap_alloc_bytes`, `heap_inuse_bytes`, `heap_idle_bytes`, `heap_sys_bytes`, `heap_objects`, `stack_inuse_bytes`, `sys_bytes`, `num_goroutines`, `gc_cycles_total`, `gc_pause_ns_total`
 - `GET /debug/vars` — Go runtime stats via expvar
 
 Operational logs go to stderr via Go's `slog`:
