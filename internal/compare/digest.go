@@ -164,11 +164,12 @@ func Digest(query string) string {
 				depth := 1
 				j++
 				for j < len(query) && depth > 0 {
-					if query[j] == '(' {
+					switch query[j] {
+					case '(':
 						depth++
-					} else if query[j] == ')' {
+					case ')':
 						depth--
-					} else if query[j] == '\'' {
+					case '\'':
 						j++
 						for j < len(query) && query[j] != '\'' {
 							if query[j] == '\\' {
