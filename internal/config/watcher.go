@@ -1,7 +1,7 @@
 package config
 
 import (
-	"log"
+	"log/slog"
 	"path/filepath"
 	"sync"
 
@@ -71,10 +71,10 @@ func (w *Watcher) watchLoop() {
 				continue
 			}
 
-			log.Printf("config file changed, reloading...")
+			slog.Info("config file changed, reloading", "path", w.path)
 			cfg, err := Load(w.path)
 			if err != nil {
-				log.Printf("failed to reload config: %v", err)
+				slog.Error("failed to reload config", "err", err)
 				continue
 			}
 
@@ -86,13 +86,13 @@ func (w *Watcher) watchLoop() {
 			for _, fn := range callbacks {
 				fn(cfg)
 			}
-			log.Printf("config reloaded successfully")
+			slog.Info("config reloaded successfully")
 
 		case err, ok := <-w.fsWatcher.Errors:
 			if !ok {
 				return
 			}
-			log.Printf("config watcher error: %v", err)
+			slog.Error("config watcher error", "err", err)
 		}
 	}
 }

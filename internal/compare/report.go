@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -56,7 +56,7 @@ func (r *Reporter) Record(result *CompareResult) {
 	defer r.mu.Unlock()
 
 	if err := r.enc.Encode(result); err != nil {
-		log.Printf("failed to write comparison result: %v", err)
+		slog.Error("failed to write comparison result", "err", err)
 	}
 }
 

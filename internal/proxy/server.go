@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -74,7 +74,9 @@ func (ps *ProxyServer) Serve() error {
 		return fmt.Errorf("listening on %s: %w", ps.cfg.Proxy.ListenAddr, err)
 	}
 	ps.listener = ln
-	log.Printf("MySQL Interceptor listening on %s, forwarding to %s", ps.cfg.Proxy.ListenAddr, ps.cfg.Backend.Addr)
+	slog.Info("proxy listening",
+		"listen_addr", ps.cfg.Proxy.ListenAddr,
+		"backend_addr", ps.cfg.Backend.Addr)
 
 	for {
 		conn, err := ln.Accept()
@@ -83,7 +85,7 @@ func (ps *ProxyServer) Serve() error {
 			case <-ps.ctx.Done():
 				return nil
 			default:
-				log.Printf("accept error: %v", err)
+				slog.Error("accept error", "err", err)
 				continue
 			}
 		}
@@ -109,11 +111,12 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	}()
 
 	remoteAddr := conn.RemoteAddr().String()
-	log.Printf("[session:%d] new connection from %s", sessionID, remoteAddr)
+	sessionLog := slog.With("session_id", sessionID, "remote", remoteAddr)
+	sessionLog.Info("new connection")
 
 	backendConn, err := backend.Connect(ps.cfg.Backend, ps.cfg.TLS.BackendSide)
 	if err != nil {
-		log.Printf("[session:%d] backend connect error: %v", sessionID, err)
+		sessionLog.Error("backend connect error", "err", err)
 		return
 	}
 	defer backendConn.Close()
@@ -150,13 +153,13 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 
 	serverConn, err := ps.serverConf.NewConn(conn, ps.cfg.Backend.User, ps.cfg.Backend.Password, handler)
 	if err != nil {
-		log.Printf("[session:%d] handshake error: %v", sessionID, err)
+		sessionLog.Error("handshake error", "err", err)
 		return
 	}
 
 	for {
 		if err := serverConn.HandleCommand(); err != nil {
-			log.Printf("[session:%d] closed: %v", sessionID, err)
+			sessionLog.Debug("session closed", "err", err)
 			return
 		}
 	}
@@ -170,7 +173,7 @@ func (ps *ProxyServer) Shutdown() {
 }
 
 func (ps *ProxyServer) doShutdown() {
-	log.Println("shutting down proxy server...")
+	slog.Info("shutting down proxy server")
 	ps.cancel()
 	if ps.listener != nil {
 		ps.listener.Close()
@@ -189,12 +192,13 @@ func (ps *ProxyServer) doShutdown() {
 
 	select {
 	case <-drained:
-		log.Println("all sessions drained cleanly")
+		slog.Info("all sessions drained cleanly")
 	case <-time.After(timeout):
-		log.Printf("shutdown timeout reached; force-closing active sessions")
+		slog.Warn("shutdown timeout reached; force-closing active sessions",
+			"timeout", timeout)
 		ps.sessionsMu.Lock()
 		for id, c := range ps.sessions {
-			log.Printf("[session:%d] force-closing", id)
+			slog.Info("force-closing session", "session_id", id)
 			c.Close()
 		}
 		ps.sessionsMu.Unlock()

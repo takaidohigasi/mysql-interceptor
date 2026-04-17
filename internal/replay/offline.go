@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -86,32 +86,32 @@ func (r *OfflineReplayer) Run() error {
 	}
 
 	if len(files) == 0 {
-		log.Println("no log files found to replay")
+		slog.Info("no log files found to replay")
 		return nil
 	}
 
-	log.Printf("found %d log files to replay", len(files))
+	slog.Info("replaying log files", "count", len(files))
 
 	for _, file := range files {
 		basename := filepath.Base(file)
 		if r.checkpoint.IsCompleted(basename) {
-			log.Printf("skipping completed file: %s", basename)
+			slog.Info("skipping completed file", "file", basename)
 			continue
 		}
 
-		log.Printf("replaying file: %s", basename)
+		slog.Info("replaying file", "file", basename)
 		if err := r.replayFile(file); err != nil {
 			return fmt.Errorf("replaying %s: %w", file, err)
 		}
 
 		if r.cfg.AutoDeleteCompleted {
 			if err := r.checkpoint.RemoveCompleted(r.cfg.InputDir); err != nil {
-				log.Printf("warning: failed to remove completed files: %v", err)
+				slog.Warn("failed to remove completed files", "err", err)
 			}
 		}
 	}
 
-	log.Println(r.reporter.Summary())
+	slog.Info("replay run complete", "summary", r.reporter.Summary())
 	return nil
 }
 
@@ -133,8 +133,9 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 	// (queries from different sessions interleave), so we rely on SELECT
 	// idempotency and re-run the whole file.
 	if progress := r.checkpoint.GetProgress(basename); progress != nil && progress.Status == "in_progress" {
-		log.Printf("restarting in_progress file from beginning: %s (previous run reached %d queries)",
-			basename, progress.LinesReplayed)
+		slog.Info("restarting in_progress file from beginning",
+			"file", basename,
+			"previous_processed", progress.LinesReplayed)
 	}
 
 	// Mark file in_progress and persist immediately, so a crash before
@@ -163,7 +164,7 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 		lineNum++
 		var entry logging.LogEntry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			log.Printf("skipping malformed line %d: %v", lineNum, err)
+			slog.Warn("skipping malformed line", "line", lineNum, "err", err)
 			continue
 		}
 		sessions[entry.SessionID] = append(sessions[entry.SessionID], sessionEntry{
@@ -192,7 +193,7 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 			case <-ticker.C:
 				r.checkpoint.SetProgress(basename, processed.Load(), 0)
 				if err := r.checkpoint.Save(); err != nil {
-					log.Printf("warning: periodic checkpoint save failed: %v", err)
+					slog.Warn("periodic checkpoint save failed", "err", err)
 				}
 			}
 		}
@@ -212,7 +213,8 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 			conn, err := r.pool.Get()
 			if err != nil {
-				log.Printf("[replay:session:%d] failed to get connection: %v", sid, err)
+				slog.Error("replay: failed to get connection",
+					"session_id", sid, "err", err)
 				return
 			}
 			defer r.pool.Put(conn)
@@ -235,7 +237,8 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 				replayResult, err := ExecuteAndCapture(conn, se.entry.Query)
 				if err != nil {
-					log.Printf("[replay:session:%d] execution error: %v", sid, err)
+					slog.Error("replay: execution error",
+						"session_id", sid, "err", err)
 					continue
 				}
 
@@ -261,7 +264,9 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 		return fmt.Errorf("saving checkpoint: %w", err)
 	}
 
-	log.Printf("completed replaying %s: %d lines read, %d queries replayed",
-		basename, lineNum, processed.Load())
+	slog.Info("completed replaying file",
+		"file", basename,
+		"lines_read", lineNum,
+		"queries_replayed", processed.Load())
 	return nil
 }

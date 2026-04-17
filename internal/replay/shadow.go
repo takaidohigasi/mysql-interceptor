@@ -3,7 +3,7 @@ package replay
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -122,8 +122,10 @@ func (s *ShadowSender) Close() {
 		s.wg.Wait()
 		s.reporter.Close()
 		s.pool.Close()
-		log.Printf("Shadow sender closed. Skipped non-SELECT queries: %d. Dropped (queue full): %d. %s",
-			s.skipped.Load(), s.dropped.Load(), s.reporter.Summary())
+		slog.Info("shadow sender closed",
+			"skipped_non_select", s.skipped.Load(),
+			"dropped_queue_full", s.dropped.Load(),
+			"summary", s.reporter.Summary())
 	})
 }
 
@@ -137,7 +139,7 @@ func (s *ShadowSender) worker() {
 		case sq := <-s.queryCh:
 			conn, err := s.pool.Get()
 			if err != nil {
-				log.Printf("[shadow] failed to get connection: %v", err)
+				slog.Error("shadow: failed to get connection", "err", err)
 				continue
 			}
 
@@ -147,7 +149,7 @@ func (s *ShadowSender) worker() {
 			// fail on a fresh shadow connection with no default DB).
 			if sq.Database != "" && sq.Database != conn.GetDB() {
 				if _, err := conn.Execute("USE `" + sq.Database + "`"); err != nil {
-					log.Printf("[shadow] USE %s failed: %v", sq.Database, err)
+					slog.Error("shadow: USE failed", "db", sq.Database, "err", err)
 					s.pool.Put(conn)
 					continue
 				}
@@ -157,7 +159,7 @@ func (s *ShadowSender) worker() {
 			s.pool.Put(conn)
 
 			if err != nil {
-				log.Printf("[shadow] execution error: %v", err)
+				slog.Error("shadow: execution error", "err", err)
 				continue
 			}
 

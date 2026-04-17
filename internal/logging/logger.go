@@ -3,7 +3,7 @@ package logging
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -83,7 +83,7 @@ func (l *Logger) Log(entry LogEntry) {
 
 func (l *Logger) SetEnabled(enabled bool) {
 	l.enabled.Store(enabled)
-	log.Printf("SQL logging %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
+	slog.Info("sql logging toggled", "enabled", enabled)
 }
 
 func (l *Logger) Dropped() int64 {
@@ -112,7 +112,7 @@ func (l *Logger) writeLoop() {
 				continue
 			}
 			if err := enc.Encode(entry); err != nil {
-				log.Printf("failed to write log entry: %v", err)
+				slog.Error("failed to write sql log entry", "err", err)
 			}
 		case <-l.stop:
 			// Drain any remaining buffered entries, then exit.
@@ -121,7 +121,7 @@ func (l *Logger) writeLoop() {
 				case entry := <-l.entryCh:
 					if l.enabled.Load() {
 						if err := enc.Encode(entry); err != nil {
-							log.Printf("failed to write log entry: %v", err)
+							slog.Error("failed to write sql log entry", "err", err)
 						}
 					}
 				default:

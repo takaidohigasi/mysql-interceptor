@@ -3,7 +3,7 @@ package bench
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"sort"
 	"sync"
@@ -69,21 +69,18 @@ func Run(cfg Config) (*BenchmarkReport, error) {
 	report := &BenchmarkReport{}
 
 	for _, query := range cfg.Queries {
-		log.Printf("benchmarking query: %s", truncateQuery(query, 80))
+		slog.Info("benchmarking query", "query", truncateQuery(query, 80))
 
-		// Warmup
-		log.Printf("  warming up (%d iterations)...", cfg.WarmupIters)
+		slog.Info("warmup", "iterations", cfg.WarmupIters)
 		runQuery(directDB, query, cfg.WarmupIters, 1)
 		runQuery(proxyDB, query, cfg.WarmupIters, 1)
 
-		// Benchmark direct
-		log.Printf("  direct: %d iterations, concurrency %d", cfg.Iterations, cfg.Concurrency)
+		slog.Info("bench direct", "iterations", cfg.Iterations, "concurrency", cfg.Concurrency)
 		directResult := runQuery(directDB, query, cfg.Iterations, cfg.Concurrency)
 		directResult.Label = "direct"
 		directResult.Query = query
 
-		// Benchmark proxy
-		log.Printf("  proxy:  %d iterations, concurrency %d", cfg.Iterations, cfg.Concurrency)
+		slog.Info("bench proxy", "iterations", cfg.Iterations, "concurrency", cfg.Concurrency)
 		proxyResult := runQuery(proxyDB, query, cfg.Iterations, cfg.Concurrency)
 		proxyResult.Label = "proxy"
 		proxyResult.Query = query

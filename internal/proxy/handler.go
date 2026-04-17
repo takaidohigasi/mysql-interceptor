@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
@@ -151,7 +151,9 @@ func (h *ProxyHandler) HandleOtherCommand(cmd byte, data []byte) error {
 		h.backend.Close()
 		return nil
 	default:
-		log.Printf("[session:%d] unsupported command: 0x%02x", h.sessionID, cmd)
+		slog.Warn("unsupported command",
+			"session_id", h.sessionID,
+			"cmd", cmd)
 		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, "command not supported")
 	}
 }
