@@ -14,10 +14,12 @@ import (
 
 type Logger struct {
 	entryCh chan LogEntry
+	stop    chan struct{}
+	done    chan struct{}
 	writer  *lumberjack.Logger
 	enabled atomic.Bool
+	closed  atomic.Bool
 	dropped atomic.Int64
-	done    chan struct{}
 	once    sync.Once
 }
 
@@ -51,8 +53,9 @@ func NewLogger(cfg LoggerConfig) (*Logger, error) {
 
 	l := &Logger{
 		entryCh: make(chan LogEntry, 10000),
-		writer:  lj,
+		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
+		writer:  lj,
 	}
 	l.enabled.Store(cfg.Enabled)
 
@@ -62,12 +65,17 @@ func NewLogger(cfg LoggerConfig) (*Logger, error) {
 }
 
 func (l *Logger) Log(entry LogEntry) {
-	if !l.enabled.Load() {
+	if l.closed.Load() || !l.enabled.Load() {
 		return
 	}
 
+	// Non-blocking send: if the writer goroutine has already exited or the
+	// buffer is full, drop the entry rather than blocking the caller or
+	// risking a deadlock during shutdown.
 	select {
 	case l.entryCh <- entry:
+	case <-l.stop:
+		l.dropped.Add(1)
 	default:
 		l.dropped.Add(1)
 	}
@@ -84,7 +92,8 @@ func (l *Logger) Dropped() int64 {
 
 func (l *Logger) Close() {
 	l.once.Do(func() {
-		close(l.entryCh)
+		l.closed.Store(true)
+		close(l.stop)
 		<-l.done
 		l.writer.Close()
 	})
@@ -96,12 +105,29 @@ func (l *Logger) writeLoop() {
 	enc := json.NewEncoder(l.writer)
 	enc.SetEscapeHTML(false)
 
-	for entry := range l.entryCh {
-		if !l.enabled.Load() {
-			continue
-		}
-		if err := enc.Encode(entry); err != nil {
-			log.Printf("failed to write log entry: %v", err)
+	for {
+		select {
+		case entry := <-l.entryCh:
+			if !l.enabled.Load() {
+				continue
+			}
+			if err := enc.Encode(entry); err != nil {
+				log.Printf("failed to write log entry: %v", err)
+			}
+		case <-l.stop:
+			// Drain any remaining buffered entries, then exit.
+			for {
+				select {
+				case entry := <-l.entryCh:
+					if l.enabled.Load() {
+						if err := enc.Encode(entry); err != nil {
+							log.Printf("failed to write log entry: %v", err)
+						}
+					}
+				default:
+					return
+				}
+			}
 		}
 	}
 }

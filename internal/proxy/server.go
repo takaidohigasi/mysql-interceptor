@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -25,8 +26,15 @@ type ProxyServer struct {
 	serverConf   *server.Server
 	logger       *logging.Logger
 	shadowSender *replay.ShadowSender
-	sessions     sync.Map
-	sessionSeq   atomic.Uint64
+
+	// sessions tracks active client connections so they can be closed on
+	// shutdown. The mutex guards insertion/deletion and final drain iteration.
+	sessionsMu sync.Mutex
+	sessions   map[uint64]net.Conn
+	sessionsWg sync.WaitGroup
+	sessionSeq atomic.Uint64
+
+	shutdownOnce sync.Once
 	ctx          context.Context
 	cancel       context.CancelFunc
 }
@@ -38,6 +46,7 @@ func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *re
 		cfg:          cfg,
 		logger:       logger,
 		shadowSender: shadowSender,
+		sessions:     make(map[uint64]net.Conn),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -80,12 +89,24 @@ func (ps *ProxyServer) Serve() error {
 		}
 
 		sessionID := ps.sessionSeq.Add(1)
+		ps.sessionsWg.Add(1)
 		go ps.handleConnection(sessionID, conn)
 	}
 }
 
 func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
+	defer ps.sessionsWg.Done()
 	defer conn.Close()
+
+	// Register the connection for shutdown to close it.
+	ps.sessionsMu.Lock()
+	ps.sessions[sessionID] = conn
+	ps.sessionsMu.Unlock()
+	defer func() {
+		ps.sessionsMu.Lock()
+		delete(ps.sessions, sessionID)
+		ps.sessionsMu.Unlock()
+	}()
 
 	remoteAddr := conn.RemoteAddr().String()
 	log.Printf("[session:%d] new connection from %s", sessionID, remoteAddr)
@@ -132,9 +153,6 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 		return
 	}
 
-	ps.sessions.Store(sessionID, serverConn)
-	defer ps.sessions.Delete(sessionID)
-
 	for {
 		if err := serverConn.HandleCommand(); err != nil {
 			log.Printf("[session:%d] closed: %v", sessionID, err)
@@ -143,11 +161,43 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	}
 }
 
+// Shutdown gracefully stops the proxy: stops accepting new connections,
+// waits up to ShutdownTimeout for active sessions to drain, then forcibly
+// closes any remaining sessions. Idempotent — safe to call multiple times.
 func (ps *ProxyServer) Shutdown() {
+	ps.shutdownOnce.Do(ps.doShutdown)
+}
+
+func (ps *ProxyServer) doShutdown() {
 	log.Println("shutting down proxy server...")
 	ps.cancel()
 	if ps.listener != nil {
 		ps.listener.Close()
+	}
+
+	timeout := ps.cfg.Proxy.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		ps.sessionsWg.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		log.Println("all sessions drained cleanly")
+	case <-time.After(timeout):
+		log.Printf("shutdown timeout reached; force-closing active sessions")
+		ps.sessionsMu.Lock()
+		for id, c := range ps.sessions {
+			log.Printf("[session:%d] force-closing", id)
+			c.Close()
+		}
+		ps.sessionsMu.Unlock()
+		<-drained
 	}
 }
 

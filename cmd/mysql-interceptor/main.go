@@ -81,7 +81,6 @@ func runServe() {
 		if err != nil {
 			log.Fatalf("failed to create query logger: %v", err)
 		}
-		defer queryLogger.Close()
 	}
 
 	// Set up config hot-reload
@@ -104,7 +103,6 @@ func runServe() {
 		if err != nil {
 			log.Fatalf("failed to create shadow sender: %v", err)
 		}
-		defer shadowSender.Close()
 		log.Printf("Shadow traffic enabled: forwarding to %s", cfg.Replay.Shadow.TargetAddr)
 	}
 
@@ -122,8 +120,21 @@ func runServe() {
 		srv.Shutdown()
 	}()
 
-	if err := srv.Serve(); err != nil {
-		log.Fatalf("serve error: %v", err)
+	serveErr := srv.Serve()
+
+	// Shutdown order matters: sessions must finish before the logger or
+	// shadow sender are closed, otherwise a late Log() call will panic on
+	// send-to-closed-channel.
+	srv.Shutdown()
+	if shadowSender != nil {
+		shadowSender.Close()
+	}
+	if queryLogger != nil {
+		queryLogger.Close()
+	}
+
+	if serveErr != nil {
+		log.Fatalf("serve error: %v", serveErr)
 	}
 }
 
