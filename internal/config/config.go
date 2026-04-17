@@ -27,6 +27,7 @@ type BenchConfig struct {
 
 type ProxyConfig struct {
 	ListenAddr      string        `yaml:"listen_addr"`
+	MetricsAddr     string        `yaml:"metrics_addr"` // "" to disable; e.g. "127.0.0.1:9090"
 	MaxConnections  int           `yaml:"max_connections"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/logging"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
 )
 
@@ -92,12 +93,15 @@ func (ps *ProxyServer) Serve() error {
 
 		sessionID := ps.sessionSeq.Add(1)
 		ps.sessionsWg.Add(1)
+		metrics.Global.TotalSessions.Add(1)
+		metrics.Global.ActiveSessions.Add(1)
 		go ps.handleConnection(sessionID, conn)
 	}
 }
 
 func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	defer ps.sessionsWg.Done()
+	defer metrics.Global.ActiveSessions.Add(-1)
 	defer conn.Close()
 
 	// Register the connection for shutdown to close it.

@@ -11,6 +11,7 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/bench"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/logging"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 	"github.com/takaidohigasi/mysql-interceptor/internal/proxy"
 	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
 )
@@ -146,6 +147,10 @@ func runServe() {
 	if err != nil {
 		fatal("failed to create proxy server", "err", err)
 	}
+
+	metricsSrv := metrics.NewServer(cfg.Proxy.MetricsAddr)
+	metricsSrv.Start()
+	defer metricsSrv.Shutdown()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

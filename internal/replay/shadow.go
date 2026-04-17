@@ -11,6 +11,7 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 type ShadowQuery struct {
@@ -87,12 +88,14 @@ func (s *ShadowSender) Send(sq ShadowQuery) {
 	// Always enforce read-only: never replay DML/DDL to shadow server.
 	if !IsReadOnly(sq.Query) {
 		s.skipped.Add(1)
+		metrics.Global.ShadowSkipped.Add(1)
 		return
 	}
 
 	// Short-circuit if closed to avoid a send-on-closed-channel race.
 	if s.closed.Load() {
 		s.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
 		return
 	}
 
@@ -100,8 +103,10 @@ func (s *ShadowSender) Send(sq ShadowQuery) {
 	case s.queryCh <- sq:
 	case <-s.ctx.Done():
 		s.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
 	default:
 		s.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
 	}
 }
 
@@ -164,6 +169,7 @@ func (s *ShadowSender) worker() {
 				continue
 			}
 
+			metrics.Global.ShadowQueriesReplayed.Add(1)
 			if sq.OrigResult != nil {
 				cmpResult := s.engine.Compare(sq.OrigResult, replayResult, sq.Query, sq.SessionID)
 				s.reporter.Record(cmpResult)

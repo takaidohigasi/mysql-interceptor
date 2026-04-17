@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 	"gopkg.in/lumberjack.v2"
 )
 
@@ -76,8 +77,10 @@ func (l *Logger) Log(entry LogEntry) {
 	case l.entryCh <- entry:
 	case <-l.stop:
 		l.dropped.Add(1)
+		metrics.Global.LoggerDropped.Add(1)
 	default:
 		l.dropped.Add(1)
+		metrics.Global.LoggerDropped.Add(1)
 	}
 }
 

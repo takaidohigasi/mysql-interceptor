@@ -7,6 +7,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
 )
 
@@ -60,6 +61,11 @@ func (h *ProxyHandler) HandleQuery(query string) (*mysql.Result, error) {
 // afterExecute handles the post-execution bookkeeping (logging + shadow
 // forwarding) common to HandleQuery and HandleStmtExecute.
 func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{}, result *mysql.Result, err error, duration time.Duration) {
+	metrics.Global.QueriesHandled.Add(1)
+	if err != nil {
+		metrics.Global.QueryErrors.Add(1)
+	}
+
 	if h.logQuery != nil {
 		evt := QueryEvent{
 			Timestamp: time.Now().Add(-duration),
