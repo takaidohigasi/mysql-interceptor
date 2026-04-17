@@ -17,6 +17,7 @@ type ShadowQuery struct {
 	SessionID    uint64
 	Database     string // current DB at the time of the query (empty if none)
 	Query        string
+	Args         []interface{} // non-nil for prepared statement executions
 	OrigDuration time.Duration
 	OrigResult   *compare.CapturedResult
 }
@@ -155,7 +156,7 @@ func (s *ShadowSender) worker() {
 				}
 			}
 
-			replayResult, err := ExecuteAndCapture(conn, sq.Query)
+			replayResult, err := ExecuteAndCapture(conn, sq.Query, sq.Args...)
 			s.pool.Put(conn)
 
 			if err != nil {

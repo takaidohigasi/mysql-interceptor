@@ -7,9 +7,9 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 )
 
-func ExecuteAndCapture(conn *client.Conn, query string) (*compare.CapturedResult, error) {
+func ExecuteAndCapture(conn *client.Conn, query string, args ...interface{}) (*compare.CapturedResult, error) {
 	start := time.Now()
-	result, err := conn.Execute(query)
+	result, err := conn.Execute(query, args...)
 	duration := time.Since(start)
 
 	captured := &compare.CapturedResult{

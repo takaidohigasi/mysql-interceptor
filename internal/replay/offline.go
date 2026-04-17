@@ -235,7 +235,7 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 				}
 				prevTimestamp = se.entry.Timestamp
 
-				replayResult, err := ExecuteAndCapture(conn, se.entry.Query)
+				replayResult, err := ExecuteAndCapture(conn, se.entry.Query, se.entry.Args...)
 				if err != nil {
 					slog.Error("replay: execution error",
 						"session_id", sid, "err", err)
