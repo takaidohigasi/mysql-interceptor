@@ -12,12 +12,12 @@ import (
 )
 
 type ProxyHandler struct {
-	sessionID    uint64
-	sourceIP     string // client IP without port; passed to shadow for CIDR filtering
-	backend      *client.Conn
-	currentDB    string
-	logQuery     func(entry QueryEvent)
-	shadowSender *replay.ShadowSender
+	sessionID     uint64
+	sourceIP      string // client IP without port; passed to shadow for CIDR filtering
+	backend       *client.Conn
+	currentDB     string
+	logQuery      func(entry QueryEvent)
+	shadowSession *replay.ShadowSession // nil if shadow is disabled or failed to start
 }
 
 type QueryEvent struct {
@@ -42,11 +42,17 @@ type preparedStmt struct {
 }
 
 func (h *ProxyHandler) UseDB(dbName string) error {
+	start := time.Now()
 	_, err := h.backend.Execute("USE " + dbName)
 	if err != nil {
 		return err
 	}
 	h.currentDB = dbName
+
+	// Forward the USE to shadow so its pinned connection follows the
+	// primary's current database. Uses the regular afterExecute path so
+	// log/shadow/metrics bookkeeping is consistent with other commands.
+	h.afterExecute("use_db", "USE `"+dbName+"`", nil, start, time.Since(start), nil, nil)
 	return nil
 }
 
@@ -86,9 +92,9 @@ func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{},
 		h.logQuery(evt)
 	}
 
-	if h.shadowSender != nil {
+	if h.shadowSession != nil {
 		captured := captureResult(result, err, duration)
-		h.shadowSender.Send(replay.ShadowQuery{
+		h.shadowSession.Send(replay.ShadowQuery{
 			SessionID:    h.sessionID,
 			SourceIP:     h.sourceIP,
 			Database:     h.currentDB,

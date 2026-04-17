@@ -27,43 +27,44 @@ type ShadowQuery struct {
 	OrigResult   *compare.CapturedResult
 }
 
+// ShadowSender is the configuration and lifecycle root for shadow traffic.
+// Actual query forwarding happens via per-primary-session ShadowSession
+// objects opened via StartSession — each holds its own dedicated backend
+// connection so temp tables, session variables, and transactions on the
+// primary are faithfully mirrored on the shadow.
 type ShadowSender struct {
-	pool       *backend.Pool
-	queryCh    chan ShadowQuery
-	engine     *compare.Engine
-	reporter   *compare.Reporter
-	timeout    time.Duration
+	// Shared dependencies
+	backendCfg     config.BackendConfig
+	tlsCfg         config.BackendSideTLSConfig
+	engine         *compare.Engine
+	reporter       *compare.Reporter
+	timeout        time.Duration
+	sessionQueueSz int
+
+	// Aggregate counters (across all sessions)
 	dropped    atomic.Int64
 	skipped    atomic.Int64
-	disabled   atomic.Int64 // counter for sends rejected because enabled=false
-	filtered   atomic.Int64 // counter for sends rejected by CIDR filter
-	sampledOut atomic.Int64 // counter for sends dropped by sample_rate
-	enabled    atomic.Bool
-	// sampleRateBits stores the float64 sample rate (in [0.0, 1.0]) via
-	// atomic uint64 bits. 1.0 = shadow all queries (default).
+	disabled   atomic.Int64
+	filtered   atomic.Int64
+	sampledOut atomic.Int64
+
+	// Runtime-tunable policy (atomics for lock-free reads)
+	enabled        atomic.Bool
 	sampleRateBits atomic.Uint64
-	// allowedCIDRs and excludedCIDRs are atomic pointers to slices so
-	// the CIDR lists can be hot-reloaded without locking the Send path.
-	allowedCIDRs  atomic.Pointer[[]*net.IPNet]
-	excludedCIDRs atomic.Pointer[[]*net.IPNet]
-	closed        atomic.Bool
-	wg            sync.WaitGroup
-	once          sync.Once
-	ctx           context.Context
-	cancel        context.CancelFunc
+	allowedCIDRs   atomic.Pointer[[]*net.IPNet]
+	excludedCIDRs  atomic.Pointer[[]*net.IPNet]
+
+	// Active sessions registry for shutdown
+	sessionsMu sync.Mutex
+	sessions   map[uint64]*ShadowSession
+
+	closed atomic.Bool
+	once   sync.Once
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig) (*ShadowSender, error) {
-	pool := backend.NewPool(
-		config.BackendConfig{
-			Addr:     cfg.TargetAddr,
-			User:     cfg.TargetUser,
-			Password: cfg.TargetPassword,
-		},
-		cfg.TLS,
-		cfg.MaxConcurrent,
-	)
-
 	ignoreColumns := make(map[string]bool)
 	for _, col := range compareCfg.IgnoreColumns {
 		ignoreColumns[col] = true
@@ -89,19 +90,27 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 
 	queueSize := cfg.QueueSize
 	if queueSize <= 0 {
-		queueSize = 10000
+		// Per-session default: small, since each active primary session
+		// now has its own queue and a dedicated goroutine draining it.
+		queueSize = 64
 	}
+
 	s := &ShadowSender{
-		pool:     pool,
-		queryCh:  make(chan ShadowQuery, queueSize),
-		engine:   engine,
-		reporter: reporter,
-		timeout:  cfg.Timeout,
-		ctx:      ctx,
-		cancel:   cancel,
+		backendCfg: config.BackendConfig{
+			Addr:     cfg.TargetAddr,
+			User:     cfg.TargetUser,
+			Password: cfg.TargetPassword,
+		},
+		tlsCfg:         cfg.TLS,
+		engine:         engine,
+		reporter:       reporter,
+		timeout:        cfg.Timeout,
+		sessionQueueSz: queueSize,
+		sessions:       make(map[uint64]*ShadowSession),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
-	// Default to enabled when *bool is nil (e.g. tests constructing
-	// ShadowConfig directly without going through config.applyDefaults).
+
 	initiallyEnabled := true
 	if cfg.Enabled != nil {
 		initiallyEnabled = *cfg.Enabled
@@ -119,87 +128,107 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 	s.allowedCIDRs.Store(&allowed)
 	s.excludedCIDRs.Store(&excluded)
 
-	// Default sample rate is 1.0 (shadow everything) when nil.
 	initialRate := 1.0
 	if cfg.SampleRate != nil {
 		initialRate = *cfg.SampleRate
 	}
 	s.sampleRateBits.Store(math.Float64bits(initialRate))
 
-	for i := 0; i < cfg.MaxConcurrent; i++ {
-		s.wg.Add(1)
-		go s.worker()
-	}
-
 	return s, nil
 }
 
-func (s *ShadowSender) Send(sq ShadowQuery) {
-	// Fast-path: shadow paused via config toggle. Don't count against
-	// dropped (dropped means "tried to send but queue full"); use a
-	// separate disabled counter so the operator can see how many were
-	// intentionally skipped.
+// StartSession opens a dedicated shadow connection for the given primary
+// session. Returns (nil, nil) if shadow is currently disabled — callers
+// should skip shadowing in that case. If the backend connection fails,
+// returns the error so the caller can decide whether to proceed without
+// shadow (recommended) or surface it.
+func (s *ShadowSender) StartSession(sessionID uint64, initialDB string) (*ShadowSession, error) {
+	if s.closed.Load() {
+		return nil, fmt.Errorf("shadow sender is closed")
+	}
+	if !s.enabled.Load() {
+		return nil, nil
+	}
+
+	conn, err := backend.Connect(s.backendCfg, s.tlsCfg)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to shadow server: %w", err)
+	}
+	if initialDB != "" && initialDB != conn.GetDB() {
+		if _, err := conn.Execute("USE `" + initialDB + "`"); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("USE %q on shadow: %w", initialDB, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	ss := &ShadowSession{
+		sessionID:  sessionID,
+		sender:     s,
+		conn:       conn,
+		queryCh:    make(chan ShadowQuery, s.sessionQueueSz),
+		tempTables: make(map[string]struct{}),
+		done:       make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	s.sessionsMu.Lock()
+	s.sessions[sessionID] = ss
+	s.sessionsMu.Unlock()
+	metrics.Global.ShadowActiveSessions.Add(1)
+
+	go ss.run()
+	return ss, nil
+}
+
+// Send applies only the non-session-state filter gates (enabled /
+// sample_rate / CIDR) and increments counters. Session-aware checks
+// (category + temp-table tracking) are the responsibility of a
+// ShadowSession. Returns true if the query would pass the global gates
+// — mostly useful as a test hook; real forwarding goes through
+// StartSession + ShadowSession.Send.
+func (s *ShadowSender) Send(sq ShadowQuery) bool {
+	return s.shouldSendPreCategory(sq)
+}
+
+// shouldSendPreCategory applies configurable gates that don't require
+// session state: enabled, sample_rate, CIDR. Used by ShadowSession.Send
+// before the session-aware category check.
+func (s *ShadowSender) shouldSendPreCategory(sq ShadowQuery) bool {
 	if !s.enabled.Load() {
 		s.disabled.Add(1)
 		metrics.Global.ShadowDisabled.Add(1)
-		return
+		return false
 	}
 
-	// Sample-rate check: a random fraction of queries can be dropped
-	// here to cap shadow overhead under high primary load. Evaluated
-	// before the more expensive CIDR/readonly checks so the sampling
-	// itself is cheap.
 	rate := math.Float64frombits(s.sampleRateBits.Load())
 	if rate < 1.0 && (rate <= 0.0 || rand.Float64() >= rate) {
 		s.sampledOut.Add(1)
 		metrics.Global.ShadowSampledOut.Add(1)
-		return
+		return false
 	}
 
-	// CIDR filter: reject if excluded, or if allow-list is non-empty
-	// and source doesn't match it.
 	if !s.isAllowedByCIDR(sq.SourceIP) {
 		s.filtered.Add(1)
 		metrics.Global.ShadowFilteredByCIDR.Add(1)
-		return
+		return false
 	}
 
-	// Always enforce read-only: never replay DML/DDL to shadow server.
-	if !IsReadOnly(sq.Query) {
-		s.skipped.Add(1)
-		metrics.Global.ShadowSkipped.Add(1)
-		return
-	}
-
-	// Short-circuit if closed to avoid a send-on-closed-channel race.
-	if s.closed.Load() {
-		s.dropped.Add(1)
-		metrics.Global.ShadowDropped.Add(1)
-		return
-	}
-
-	select {
-	case s.queryCh <- sq:
-	case <-s.ctx.Done():
-		s.dropped.Add(1)
-		metrics.Global.ShadowDropped.Add(1)
-	default:
-		s.dropped.Add(1)
-		metrics.Global.ShadowDropped.Add(1)
-	}
+	return true
 }
 
-func (s *ShadowSender) Dropped() int64 {
-	return s.dropped.Load()
-}
+// --- counter accessors ---------------------------------------------------
 
-func (s *ShadowSender) Skipped() int64 {
-	return s.skipped.Load()
-}
+func (s *ShadowSender) Dropped() int64    { return s.dropped.Load() }
+func (s *ShadowSender) Skipped() int64    { return s.skipped.Load() }
+func (s *ShadowSender) Filtered() int64   { return s.filtered.Load() }
+func (s *ShadowSender) SampledOut() int64 { return s.sampledOut.Load() }
 
-// SetEnabled toggles whether incoming queries are forwarded to the shadow
-// server. When disabled, Send() short-circuits and queries are counted
-// under shadow_disabled rather than replayed. Hot-reloadable.
+// --- runtime controls ---------------------------------------------------
+
+func (s *ShadowSender) IsEnabled() bool { return s.enabled.Load() }
+
 func (s *ShadowSender) SetEnabled(enabled bool) {
 	prev := s.enabled.Swap(enabled)
 	if prev != enabled {
@@ -212,27 +241,10 @@ func (s *ShadowSender) SetEnabled(enabled bool) {
 	}
 }
 
-func (s *ShadowSender) IsEnabled() bool {
-	return s.enabled.Load()
-}
-
-// Filtered returns the count of sends rejected by the CIDR filter.
-func (s *ShadowSender) Filtered() int64 {
-	return s.filtered.Load()
-}
-
-// SampledOut returns the count of sends dropped by sample_rate.
-func (s *ShadowSender) SampledOut() int64 {
-	return s.sampledOut.Load()
-}
-
-// SampleRate returns the currently active sample rate.
 func (s *ShadowSender) SampleRate() float64 {
 	return math.Float64frombits(s.sampleRateBits.Load())
 }
 
-// SetSampleRate updates the fraction of primary queries forwarded to the
-// shadow. Must be in [0.0, 1.0]. Hot-reloadable.
 func (s *ShadowSender) SetSampleRate(rate float64) error {
 	if rate < 0.0 || rate > 1.0 {
 		return fmt.Errorf("sample_rate must be in [0.0, 1.0], got %v", rate)
@@ -244,8 +256,6 @@ func (s *ShadowSender) SetSampleRate(rate float64) error {
 	return nil
 }
 
-// SetCIDRs replaces the allow and exclude CIDR lists atomically.
-// Pass empty slices to clear a list. Hot-reloadable.
 func (s *ShadowSender) SetCIDRs(allowed, excluded []string) error {
 	a, err := parseCIDRs(allowed)
 	if err != nil {
@@ -264,9 +274,8 @@ func (s *ShadowSender) SetCIDRs(allowed, excluded []string) error {
 
 // isAllowedByCIDR reports whether the source IP satisfies the current
 // allow/exclude CIDR policy. Returns true (allow) when no filters apply.
-// If sourceIP is empty or unparseable, we allow the send — filtering
-// is best-effort and shouldn't block shadow for Unix sockets or other
-// non-TCP transports.
+// Empty/unparseable IPs pass — CIDR filtering is best-effort and shouldn't
+// block shadow for Unix sockets or other non-TCP transports.
 func (s *ShadowSender) isAllowedByCIDR(sourceIP string) bool {
 	allowed := *s.allowedCIDRs.Load()
 	excluded := *s.excludedCIDRs.Load()
@@ -277,14 +286,12 @@ func (s *ShadowSender) isAllowedByCIDR(sourceIP string) bool {
 	if ip == nil {
 		return true
 	}
-	// Exclude wins over allow: matching any exclude rejects immediately.
 	for _, n := range excluded {
 		if n.Contains(ip) {
 			return false
 		}
 	}
 	if len(allowed) == 0 {
-		// Only exclude rules defined, and none matched → allow.
 		return true
 	}
 	for _, n := range allowed {
@@ -310,97 +317,42 @@ func parseCIDRs(patterns []string) ([]*net.IPNet, error) {
 	return out, nil
 }
 
+// Close stops the sender, force-closes all active ShadowSessions, and
+// flushes the reporter. Idempotent.
 func (s *ShadowSender) Close() {
 	s.once.Do(func() {
-		// Mark closed first so Send() short-circuits. Then cancel the context
-		// to wake workers. We do NOT close the queryCh — that would race with
-		// in-flight Send() calls; workers exit via ctx.Done() instead.
 		s.closed.Store(true)
 		s.cancel()
-		s.wg.Wait()
+
+		// Snapshot sessions, then close each. Close() on a session
+		// unregisters itself from s.sessions, so we can't hold the mutex
+		// while iterating.
+		s.sessionsMu.Lock()
+		sessions := make([]*ShadowSession, 0, len(s.sessions))
+		for _, ss := range s.sessions {
+			sessions = append(sessions, ss)
+		}
+		s.sessionsMu.Unlock()
+
+		for _, ss := range sessions {
+			ss.Close()
+		}
+
 		s.reporter.Close()
-		s.pool.Close()
 		slog.Info("shadow sender closed",
-			"skipped_non_select", s.skipped.Load(),
+			"skipped_unsafe", s.skipped.Load(),
 			"dropped_queue_full", s.dropped.Load(),
 			"summary", s.reporter.Summary())
 	})
 }
 
-func (s *ShadowSender) worker() {
-	defer s.wg.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case sq := <-s.queryCh:
-			s.processQuery(sq)
-		}
+// unregisterSession is called by ShadowSession.Close to clear itself
+// from the active registry.
+func (s *ShadowSender) unregisterSession(sessionID uint64) {
+	s.sessionsMu.Lock()
+	if _, ok := s.sessions[sessionID]; ok {
+		delete(s.sessions, sessionID)
+		metrics.Global.ShadowActiveSessions.Add(-1)
 	}
-}
-
-// processQuery handles one shadow query with a timeout. If the shadow
-// backend is slow, we abandon the result rather than pin the worker.
-// Note: go-mysql's client.Execute has no native context support, so we
-// enforce the timeout by running Execute in a goroutine and dropping
-// the connection on timeout so the worker can move on.
-func (s *ShadowSender) processQuery(sq ShadowQuery) {
-	conn, err := s.pool.Get()
-	if err != nil {
-		slog.Error("shadow: failed to get connection", "err", err)
-		return
-	}
-
-	// Make sure the shadow connection is on the same database as the
-	// primary was when the query ran. Without this, queries with
-	// unqualified table references would hit the wrong schema (or
-	// fail on a fresh shadow connection with no default DB).
-	if sq.Database != "" && sq.Database != conn.GetDB() {
-		if _, err := conn.Execute("USE `" + sq.Database + "`"); err != nil {
-			slog.Error("shadow: USE failed", "db", sq.Database, "err", err)
-			s.pool.Put(conn)
-			return
-		}
-	}
-
-	type execResult struct {
-		result *compare.CapturedResult
-		err    error
-	}
-	done := make(chan execResult, 1)
-	go func() {
-		r, e := ExecuteAndCapture(conn, sq.Query, sq.Args...)
-		done <- execResult{r, e}
-	}()
-
-	timeout := s.timeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-
-	select {
-	case res := <-done:
-		s.pool.Put(conn)
-		if res.err != nil {
-			slog.Error("shadow: execution error", "err", res.err)
-			return
-		}
-		metrics.Global.ShadowQueriesReplayed.Add(1)
-		if sq.OrigResult != nil {
-			cmpResult := s.engine.Compare(sq.OrigResult, res.result, sq.Query, sq.SessionID)
-			s.reporter.Record(cmpResult)
-		}
-	case <-time.After(timeout):
-		// Close the connection instead of returning it to the pool: the
-		// background Execute is still running on it. Close causes the
-		// Execute to error out, and the goroutine will GC once it returns.
-		slog.Warn("shadow: query timeout exceeded, dropping connection",
-			"timeout", timeout, "query", sq.Query)
-		conn.Close()
-		metrics.Global.ShadowDropped.Add(1)
-	case <-s.ctx.Done():
-		conn.Close()
-		return
-	}
+	s.sessionsMu.Unlock()
 }

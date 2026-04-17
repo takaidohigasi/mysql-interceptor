@@ -33,6 +33,7 @@ type Counters struct {
 	ShadowSampledOut       atomic.Int64 // sends dropped by sample_rate roll
 	ShadowFilteredByCIDR   atomic.Int64 // sends rejected by CIDR allow/exclude filter
 	ShadowEnabledGauge     atomic.Int64 // 0 or 1; current toggle state
+	ShadowActiveSessions   atomic.Int64 // current count of pinned shadow sessions
 	ShadowQueriesReplayed  atomic.Int64
 	ComparisonsTotal       atomic.Int64
 	ComparisonsMatched     atomic.Int64
@@ -138,6 +139,7 @@ func snapshot() []metric {
 
 		// Shadow
 		{"shadow_enabled", "gauge", "1 when shadow traffic is enabled, 0 when paused via config toggle", float64(Global.ShadowEnabledGauge.Load())},
+		{"shadow_active_sessions", "gauge", "Current count of pinned shadow sessions (one per active primary session)", float64(Global.ShadowActiveSessions.Load())},
 		{"shadow_queries_replayed", "counter", "Shadow queries successfully executed against the shadow server", float64(Global.ShadowQueriesReplayed.Load())},
 		{"shadow_disabled", "counter", "Sends rejected because shadow.enabled=false", float64(Global.ShadowDisabled.Load())},
 		{"shadow_sampled_out", "counter", "Sends dropped by shadow.sample_rate", float64(Global.ShadowSampledOut.Load())},

@@ -172,12 +172,27 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	}
 	defer backendConn.Close()
 
+	// Start a dedicated shadow session if shadow is configured. A failure
+	// here must never fail the primary — we just proceed without shadow
+	// for this session.
+	var shadowSession *replay.ShadowSession
+	if ps.shadowSender != nil {
+		ss, sErr := ps.shadowSender.StartSession(sessionID, backendConn.GetDB())
+		if sErr != nil {
+			sessionLog.Warn("shadow session start failed; continuing without shadow for this session",
+				"err", sErr)
+		} else if ss != nil {
+			shadowSession = ss
+			defer shadowSession.Close()
+		}
+	}
+
 	handler := &ProxyHandler{
-		sessionID:    sessionID,
-		sourceIP:     sourceIP,
-		backend:      backendConn,
-		currentDB:    backendConn.GetDB(),
-		shadowSender: ps.shadowSender,
+		sessionID:     sessionID,
+		sourceIP:      sourceIP,
+		backend:       backendConn,
+		currentDB:     backendConn.GetDB(),
+		shadowSession: shadowSession,
 	}
 
 	if ps.logger != nil {
