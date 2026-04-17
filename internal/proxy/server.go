@@ -35,6 +35,10 @@ type ProxyServer struct {
 	sessionsWg sync.WaitGroup
 	sessionSeq atomic.Uint64
 
+	// connSlots bounds concurrent client sessions to Proxy.MaxConnections.
+	// Empty slot receive = permission to accept; send back on release.
+	connSlots chan struct{}
+
 	shutdownOnce sync.Once
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -43,11 +47,17 @@ type ProxyServer struct {
 func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *replay.ShadowSender) (*ProxyServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	maxConns := cfg.Proxy.MaxConnections
+	if maxConns <= 0 {
+		maxConns = 1000
+	}
+
 	ps := &ProxyServer{
 		cfg:          cfg,
 		logger:       logger,
 		shadowSender: shadowSender,
 		sessions:     make(map[uint64]net.Conn),
+		connSlots:    make(chan struct{}, maxConns),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -77,8 +87,10 @@ func (ps *ProxyServer) Serve() error {
 	ps.listener = ln
 	slog.Info("proxy listening",
 		"listen_addr", ps.cfg.Proxy.ListenAddr,
-		"backend_addr", ps.cfg.Backend.Addr)
+		"backend_addr", ps.cfg.Backend.Addr,
+		"max_connections", cap(ps.connSlots))
 
+	backoff := time.Duration(0)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -86,9 +98,36 @@ func (ps *ProxyServer) Serve() error {
 			case <-ps.ctx.Done():
 				return nil
 			default:
-				slog.Error("accept error", "err", err)
+			}
+			// Temporary errors (e.g., EMFILE under fd pressure) shouldn't
+			// turn into a busy loop. Exponential backoff up to 1s.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				slog.Debug("accept timed out", "err", err)
 				continue
 			}
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff < time.Second {
+				backoff *= 2
+			}
+			slog.Error("accept error, backing off",
+				"err", err, "backoff", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ps.ctx.Done():
+				return nil
+			}
+			continue
+		}
+		backoff = 0
+
+		// Enforce MaxConnections: block here until a slot frees up, or
+		// reject the connection if shutdown is in progress.
+		select {
+		case ps.connSlots <- struct{}{}:
+		case <-ps.ctx.Done():
+			conn.Close()
+			return nil
 		}
 
 		sessionID := ps.sessionSeq.Add(1)
@@ -102,6 +141,7 @@ func (ps *ProxyServer) Serve() error {
 func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	defer ps.sessionsWg.Done()
 	defer metrics.Global.ActiveSessions.Add(-1)
+	defer func() { <-ps.connSlots }()
 	defer conn.Close()
 
 	// Register the connection for shutdown to close it.
