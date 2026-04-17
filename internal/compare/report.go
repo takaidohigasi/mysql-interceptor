@@ -11,12 +11,13 @@ import (
 )
 
 type Reporter struct {
-	writer     io.WriteCloser
-	mu         sync.Mutex
-	enc        *json.Encoder
-	totalCount atomic.Int64
-	matchCount atomic.Int64
-	diffCount  atomic.Int64
+	writer      io.WriteCloser
+	mu          sync.Mutex
+	enc         *json.Encoder
+	totalCount  atomic.Int64
+	matchCount  atomic.Int64
+	diffCount   atomic.Int64
+	digestStats *DigestStats
 }
 
 func NewReporter(outputFile string) (*Reporter, error) {
@@ -35,8 +36,9 @@ func NewReporter(outputFile string) (*Reporter, error) {
 	enc.SetEscapeHTML(false)
 
 	return &Reporter{
-		writer: w,
-		enc:    enc,
+		writer:      w,
+		enc:         enc,
+		digestStats: NewDigestStats(),
 	}, nil
 }
 
@@ -47,6 +49,8 @@ func (r *Reporter) Record(result *CompareResult) {
 	} else {
 		r.diffCount.Add(1)
 	}
+
+	r.digestStats.Record(result)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -60,7 +64,14 @@ func (r *Reporter) Summary() string {
 	total := r.totalCount.Load()
 	matched := r.matchCount.Load()
 	diffed := r.diffCount.Load()
-	return fmt.Sprintf("Comparison summary: total=%d matched=%d different=%d", total, matched, diffed)
+
+	s := fmt.Sprintf("Comparison summary: total=%d matched=%d different=%d", total, matched, diffed)
+	s += r.digestStats.PrintSummary()
+	return s
+}
+
+func (r *Reporter) DigestStats() *DigestStats {
+	return r.digestStats
 }
 
 func (r *Reporter) Close() error {

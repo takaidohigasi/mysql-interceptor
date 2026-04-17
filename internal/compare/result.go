@@ -4,6 +4,7 @@ import "time"
 
 type CompareResult struct {
 	Query          string       `json:"query"`
+	QueryDigest    string       `json:"query_digest"`
 	SessionID      uint64       `json:"session_id"`
 	Timestamp      time.Time    `json:"timestamp"`
 	Match          bool         `json:"match"`

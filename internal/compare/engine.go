@@ -22,6 +22,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 func (e *Engine) Compare(original, replay *CapturedResult, query string, sessionID uint64) *CompareResult {
 	result := &CompareResult{
 		Query:          query,
+		QueryDigest:    Digest(query),
 		SessionID:      sessionID,
 		Timestamp:      time.Now(),
 		Match:          true,
