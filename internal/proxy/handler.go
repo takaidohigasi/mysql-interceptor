@@ -1,18 +1,22 @@
 package proxy
 
 import (
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
+	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
 )
 
 type ProxyHandler struct {
-	sessionID  uint64
-	backend    *client.Conn
-	currentDB  string
-	logQuery   func(entry QueryEvent)
+	sessionID    uint64
+	backend      *client.Conn
+	currentDB    string
+	logQuery     func(entry QueryEvent)
+	shadowSender *replay.ShadowSender
 }
 
 type QueryEvent struct {
@@ -59,7 +63,43 @@ func (h *ProxyHandler) HandleQuery(query string) (*mysql.Result, error) {
 		h.logQuery(evt)
 	}
 
+	if h.shadowSender != nil {
+		captured := captureResult(result, err, duration)
+		h.shadowSender.Send(replay.ShadowQuery{
+			SessionID:    h.sessionID,
+			Query:        query,
+			OrigDuration: duration,
+			OrigResult:   captured,
+		})
+	}
+
 	return result, err
+}
+
+func captureResult(result *mysql.Result, err error, duration time.Duration) *compare.CapturedResult {
+	captured := &compare.CapturedResult{
+		Duration: duration,
+	}
+	if err != nil {
+		captured.Error = err.Error()
+		return captured
+	}
+	if result != nil {
+		captured.AffectedRows = result.AffectedRows
+		if result.Resultset != nil {
+			for _, field := range result.Fields {
+				captured.Columns = append(captured.Columns, string(field.Name))
+			}
+			for rowIdx := 0; rowIdx < len(result.Values); rowIdx++ {
+				row := make([]string, len(result.Values[rowIdx]))
+				for colIdx := range result.Values[rowIdx] {
+					row[colIdx] = fmt.Sprintf("%v", result.Values[rowIdx][colIdx].Value())
+				}
+				captured.Rows = append(captured.Rows, row)
+			}
+		}
+	}
+	return captured
 }
 
 func (h *ProxyHandler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {

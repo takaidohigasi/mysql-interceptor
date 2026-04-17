@@ -16,27 +16,30 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/logging"
+	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
 )
 
 type ProxyServer struct {
-	cfg        *config.Config
-	listener   net.Listener
-	serverConf *server.Server
-	logger     *logging.Logger
-	sessions   sync.Map
-	sessionSeq atomic.Uint64
-	ctx        context.Context
-	cancel     context.CancelFunc
+	cfg          *config.Config
+	listener     net.Listener
+	serverConf   *server.Server
+	logger       *logging.Logger
+	shadowSender *replay.ShadowSender
+	sessions     sync.Map
+	sessionSeq   atomic.Uint64
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
-func NewProxyServer(cfg *config.Config, logger *logging.Logger) (*ProxyServer, error) {
+func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *replay.ShadowSender) (*ProxyServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ps := &ProxyServer{
-		cfg:    cfg,
-		logger: logger,
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:          cfg,
+		logger:       logger,
+		shadowSender: shadowSender,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	var svr *server.Server
@@ -95,8 +98,9 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	defer backendConn.Close()
 
 	handler := &ProxyHandler{
-		sessionID: sessionID,
-		backend:   backendConn,
+		sessionID:    sessionID,
+		backend:      backendConn,
+		shadowSender: ps.shadowSender,
 	}
 
 	if ps.logger != nil {
