@@ -168,6 +168,20 @@ func (h *ProxyHandler) HandleOtherCommand(cmd byte, data []byte) error {
 	case mysql.COM_QUIT:
 		h.backend.Close()
 		return nil
+	case mysql.COM_STATISTICS,
+		mysql.COM_PROCESS_INFO,
+		mysql.COM_DEBUG,
+		mysql.COM_REFRESH,
+		mysql.COM_TIME,
+		mysql.COM_SLEEP,
+		mysql.COM_CONNECT:
+		// Best-effort no-op: these are informational or deprecated commands
+		// that rarely carry data and can be safely ignored without breaking
+		// the client connection. Return nil so the session continues.
+		slog.Debug("informational command accepted",
+			"session_id", h.sessionID,
+			"cmd", cmd)
+		return nil
 	default:
 		slog.Warn("unsupported command",
 			"session_id", h.sessionID,

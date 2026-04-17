@@ -129,6 +129,41 @@ func TestDigest_Empty(t *testing.T) {
 	}
 }
 
+func TestDigest_StripsComments(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: "/* trace_id=abc123 */ SELECT * FROM users WHERE id = 1",
+			want:  "select * from users where id = ?",
+		},
+		{
+			input: "-- app annotation\nSELECT 1",
+			want:  "select ?",
+		},
+		{
+			input: "SELECT * FROM users /* hint */ WHERE id = 1",
+			want:  "select * from users where id = ?",
+		},
+	}
+	for _, tt := range tests {
+		got := Digest(tt.input)
+		if got != tt.want {
+			t.Errorf("Digest(%q)\n  got:  %q\n  want: %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDigest_CommentsWithNumbersDontLeak(t *testing.T) {
+	// Traces/hints with embedded numbers must not produce distinct digests.
+	q1 := Digest("/* trace=abc123 */ SELECT * FROM users WHERE id = 1")
+	q2 := Digest("/* trace=xyz999 */ SELECT * FROM users WHERE id = 2")
+	if q1 != q2 {
+		t.Errorf("expected same digest for comment-annotated queries:\n  q1: %s\n  q2: %s", q1, q2)
+	}
+}
+
 func TestDigest_HexLiteral(t *testing.T) {
 	got := Digest("SELECT * FROM users WHERE token = 0xDEADBEEF")
 	want := "select * from users where token = ?"

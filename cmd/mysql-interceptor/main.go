@@ -140,7 +140,12 @@ func runServe() {
 		if err != nil {
 			fatal("failed to create shadow sender", "err", err)
 		}
-		slog.Info("shadow traffic enabled", "target", cfg.Replay.Shadow.TargetAddr)
+		// Read-only enforcement is always applied regardless of the
+		// readonly: field. Surface this up-front so operators don't expect
+		// DML replay if they set readonly: false.
+		slog.Info("shadow traffic enabled",
+			"target", cfg.Replay.Shadow.TargetAddr,
+			"readonly_enforced", true)
 	}
 
 	srv, err := proxy.NewProxyServer(cfg, queryLogger, shadowSender)
@@ -230,12 +235,20 @@ func runBench() {
 		fatal("no benchmark queries configured in bench.queries")
 	}
 
+	// The proxy may bind to 0.0.0.0 but outgoing connections to that
+	// address don't work on all OSes; rewrite to 127.0.0.1 for the
+	// benchmark's loopback dials.
+	proxyAddr := cfg.Proxy.ListenAddr
+	if strings.HasPrefix(proxyAddr, "0.0.0.0:") {
+		proxyAddr = "127.0.0.1" + strings.TrimPrefix(proxyAddr, "0.0.0.0")
+	}
+
 	directDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
 		cfg.Backend.User, cfg.Backend.Password, cfg.Backend.Addr, cfg.Backend.DB)
 	proxyDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
-		cfg.Backend.User, cfg.Backend.Password, cfg.Proxy.ListenAddr, cfg.Backend.DB)
+		cfg.Backend.User, cfg.Backend.Password, proxyAddr, cfg.Backend.DB)
 
-	slog.Info("benchmarking", "direct", cfg.Backend.Addr, "proxy", cfg.Proxy.ListenAddr)
+	slog.Info("benchmarking", "direct", cfg.Backend.Addr, "proxy", proxyAddr)
 
 	report, err := bench.Run(bench.Config{
 		DirectDSN:   directDSN,
