@@ -149,38 +149,72 @@ func (s *ShadowSender) worker() {
 		case <-s.ctx.Done():
 			return
 		case sq := <-s.queryCh:
-			conn, err := s.pool.Get()
-			if err != nil {
-				slog.Error("shadow: failed to get connection", "err", err)
-				continue
-			}
-
-			// Make sure the shadow connection is on the same database as the
-			// primary was when the query ran. Without this, queries with
-			// unqualified table references would hit the wrong schema (or
-			// fail on a fresh shadow connection with no default DB).
-			if sq.Database != "" && sq.Database != conn.GetDB() {
-				if _, err := conn.Execute("USE `" + sq.Database + "`"); err != nil {
-					slog.Error("shadow: USE failed", "db", sq.Database, "err", err)
-					s.pool.Put(conn)
-					continue
-				}
-			}
-
-			replayResult, err := ExecuteAndCapture(conn, sq.Query, sq.Args...)
-			s.pool.Put(conn)
-
-			if err != nil {
-				slog.Error("shadow: execution error", "err", err)
-				continue
-			}
-
-			metrics.Global.ShadowQueriesReplayed.Add(1)
-			if sq.OrigResult != nil {
-				cmpResult := s.engine.Compare(sq.OrigResult, replayResult, sq.Query, sq.SessionID)
-				s.reporter.Record(cmpResult)
-			}
+			s.processQuery(sq)
 		}
 	}
 }
 
+// processQuery handles one shadow query with a timeout. If the shadow
+// backend is slow, we abandon the result rather than pin the worker.
+// Note: go-mysql's client.Execute has no native context support, so we
+// enforce the timeout by running Execute in a goroutine and dropping
+// the connection on timeout so the worker can move on.
+func (s *ShadowSender) processQuery(sq ShadowQuery) {
+	conn, err := s.pool.Get()
+	if err != nil {
+		slog.Error("shadow: failed to get connection", "err", err)
+		return
+	}
+
+	// Make sure the shadow connection is on the same database as the
+	// primary was when the query ran. Without this, queries with
+	// unqualified table references would hit the wrong schema (or
+	// fail on a fresh shadow connection with no default DB).
+	if sq.Database != "" && sq.Database != conn.GetDB() {
+		if _, err := conn.Execute("USE `" + sq.Database + "`"); err != nil {
+			slog.Error("shadow: USE failed", "db", sq.Database, "err", err)
+			s.pool.Put(conn)
+			return
+		}
+	}
+
+	type execResult struct {
+		result *compare.CapturedResult
+		err    error
+	}
+	done := make(chan execResult, 1)
+	go func() {
+		r, e := ExecuteAndCapture(conn, sq.Query, sq.Args...)
+		done <- execResult{r, e}
+	}()
+
+	timeout := s.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	select {
+	case res := <-done:
+		s.pool.Put(conn)
+		if res.err != nil {
+			slog.Error("shadow: execution error", "err", res.err)
+			return
+		}
+		metrics.Global.ShadowQueriesReplayed.Add(1)
+		if sq.OrigResult != nil {
+			cmpResult := s.engine.Compare(sq.OrigResult, res.result, sq.Query, sq.SessionID)
+			s.reporter.Record(cmpResult)
+		}
+	case <-time.After(timeout):
+		// Close the connection instead of returning it to the pool: the
+		// background Execute is still running on it. Close causes the
+		// Execute to error out, and the goroutine will GC once it returns.
+		slog.Warn("shadow: query timeout exceeded, dropping connection",
+			"timeout", timeout, "query", sq.Query)
+		conn.Close()
+		metrics.Global.ShadowDropped.Add(1)
+	case <-s.ctx.Done():
+		conn.Close()
+		return
+	}
+}
