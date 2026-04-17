@@ -1,0 +1,57 @@
+proxy:
+  listen_addr: "0.0.0.0:3307"
+  max_connections: 1000
+  shutdown_timeout: 30s
+
+backend:
+  addr: "127.0.0.1:3306"
+  user: "root"
+  password: ""
+  db: ""
+
+tls:
+  client_side:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+  backend_side:
+    enabled: false
+    ca_file: ""
+    skip_verify: false
+
+logging:
+  enabled: true
+  output_dir: "./logs"
+  file_prefix: "queries"
+  rotation:
+    max_size_mb: 100
+    max_age_days: 7
+    max_backups: 5
+    compress: true
+
+replay:
+  mode: "disabled"    # "disabled" | "shadow" | "offline"
+  shadow:
+    target_addr: "127.0.0.1:3307"
+    target_user: "root"
+    target_password: ""
+    readonly: true
+    async: true
+    timeout: 5s
+    max_concurrent: 100
+  offline:
+    input_dir: "./logs"
+    file_pattern: "queries-*.jsonl"
+    target_addr: "127.0.0.1:3308"
+    target_user: "root"
+    target_password: ""
+    speed_factor: 1.0
+    concurrency: 10
+    checkpoint_file: "./logs/.replay-checkpoint.json"
+    auto_delete_completed: false
+
+comparison:
+  output_file: "./logs/diff-report.jsonl"
+  ignore_columns: ["updated_at", "created_at"]
+  time_threshold_ms: 100

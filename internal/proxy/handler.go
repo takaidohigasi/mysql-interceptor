@@ -1,0 +1,117 @@
+package proxy
+
+import (
+	"log"
+	"time"
+
+	"github.com/go-mysql-org/go-mysql/client"
+	"github.com/go-mysql-org/go-mysql/mysql"
+)
+
+type ProxyHandler struct {
+	sessionID  uint64
+	backend    *client.Conn
+	currentDB  string
+	logQuery   func(entry QueryEvent)
+}
+
+type QueryEvent struct {
+	Timestamp    time.Time
+	SessionID    uint64
+	QueryType    string
+	Query        string
+	Args         []interface{}
+	Duration     time.Duration
+	AffectedRows uint64
+	RowsReturned int
+	Err          error
+}
+
+func (h *ProxyHandler) UseDB(dbName string) error {
+	_, err := h.backend.Execute("USE " + dbName)
+	if err != nil {
+		return err
+	}
+	h.currentDB = dbName
+	return nil
+}
+
+func (h *ProxyHandler) HandleQuery(query string) (*mysql.Result, error) {
+	start := time.Now()
+	result, err := h.backend.Execute(query)
+	duration := time.Since(start)
+
+	if h.logQuery != nil {
+		evt := QueryEvent{
+			Timestamp: start,
+			SessionID: h.sessionID,
+			QueryType: "query",
+			Query:     query,
+			Duration:  duration,
+			Err:       err,
+		}
+		if result != nil {
+			evt.AffectedRows = result.AffectedRows
+			if result.Resultset != nil {
+				evt.RowsReturned = len(result.Values)
+			}
+		}
+		h.logQuery(evt)
+	}
+
+	return result, err
+}
+
+func (h *ProxyHandler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {
+	return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "not supported")
+}
+
+func (h *ProxyHandler) HandleStmtPrepare(query string) (int, int, interface{}, error) {
+	// Phase 4 will implement full prepared statement support.
+	// For now, return an error so clients fall back to text protocol.
+	return 0, 0, nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "prepared statements not yet supported")
+}
+
+func (h *ProxyHandler) HandleStmtExecute(context interface{}, query string, args []interface{}) (*mysql.Result, error) {
+	start := time.Now()
+	result, err := h.backend.Execute(query, args...)
+	duration := time.Since(start)
+
+	if h.logQuery != nil {
+		evt := QueryEvent{
+			Timestamp: start,
+			SessionID: h.sessionID,
+			QueryType: "execute",
+			Query:     query,
+			Args:      args,
+			Duration:  duration,
+			Err:       err,
+		}
+		if result != nil {
+			evt.AffectedRows = result.AffectedRows
+			if result.Resultset != nil {
+				evt.RowsReturned = len(result.Values)
+			}
+		}
+		h.logQuery(evt)
+	}
+
+	return result, err
+}
+
+func (h *ProxyHandler) HandleStmtClose(context interface{}) error {
+	return nil
+}
+
+func (h *ProxyHandler) HandleOtherCommand(cmd byte, data []byte) error {
+	switch cmd {
+	case mysql.COM_PING:
+		return h.backend.Ping()
+	case mysql.COM_QUIT:
+		h.backend.Close()
+		return nil
+	default:
+		log.Printf("[session:%d] unsupported command: 0x%02x", h.sessionID, cmd)
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, "command not supported")
+	}
+}
