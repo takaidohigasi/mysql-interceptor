@@ -13,6 +13,7 @@ import (
 
 type ProxyHandler struct {
 	sessionID    uint64
+	sourceIP     string // client IP without port; passed to shadow for CIDR filtering
 	backend      *client.Conn
 	currentDB    string
 	logQuery     func(entry QueryEvent)
@@ -89,6 +90,7 @@ func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{},
 		captured := captureResult(result, err, duration)
 		h.shadowSender.Send(replay.ShadowQuery{
 			SessionID:    h.sessionID,
+			SourceIP:     h.sourceIP,
 			Database:     h.currentDB,
 			Query:        query,
 			Args:         args,

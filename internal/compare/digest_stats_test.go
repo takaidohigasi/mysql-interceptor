@@ -143,6 +143,80 @@ func TestDigestStats_PrintSummary(t *testing.T) {
 	}
 }
 
+func TestDigestStats_CappedAtMax(t *testing.T) {
+	ds := NewDigestStatsWithCap(3)
+
+	// Each table name is genuinely distinct (Digest strips numeric
+	// literals but not identifier letters), so these three produce
+	// three different digests: "select * from users where id = ?",
+	// "select * from orders where id = ?", "select * from products where id = ?".
+	tables := []string{"users", "orders", "products"}
+	for _, tbl := range tables {
+		ds.Record(&CompareResult{
+			Query:          "SELECT * FROM " + tbl + " WHERE id = 1",
+			Match:          true,
+			OriginalTimeMs: 1.0,
+			ReplayTimeMs:   1.0,
+		})
+	}
+	if got := ds.Overflow(); got != 0 {
+		t.Errorf("expected no overflow before cap, got %d", got)
+	}
+	summaries := ds.Summaries()
+	if len(summaries) != 3 {
+		t.Errorf("expected 3 digests tracked, got %d", len(summaries))
+	}
+
+	// 4th distinct digest → dropped.
+	ds.Record(&CompareResult{
+		Query:          "SELECT * FROM sessions WHERE id = 1",
+		Match:          true,
+		OriginalTimeMs: 1.0,
+	})
+	if got := ds.Overflow(); got != 1 {
+		t.Errorf("expected overflow=1 for 4th digest, got %d", got)
+	}
+	summaries = ds.Summaries()
+	if len(summaries) != 3 {
+		t.Errorf("expected digest count still 3 after overflow, got %d", len(summaries))
+	}
+
+	// Same digest as an already-tracked one → accepted (updates counts).
+	ds.Record(&CompareResult{
+		Query:          "SELECT * FROM users WHERE id = 99",
+		Match:          true,
+		OriginalTimeMs: 2.0,
+	})
+	if got := ds.Overflow(); got != 1 {
+		t.Errorf("overflow shouldn't increment for existing digest, got %d", got)
+	}
+	after := ds.Summaries()
+	for _, s := range after {
+		if s.SampleQuery == "SELECT * FROM users WHERE id = 1" {
+			if s.Count != 2 {
+				t.Errorf("expected users digest count=2, got %d", s.Count)
+			}
+			return
+		}
+	}
+	t.Error("expected users digest to still be tracked")
+}
+
+func TestDigestStats_DefaultCap(t *testing.T) {
+	// NewDigestStats() (no arg) uses the default cap.
+	ds := NewDigestStats()
+	if ds.maxDigests != DefaultMaxUniqueDigests {
+		t.Errorf("expected default cap %d, got %d", DefaultMaxUniqueDigests, ds.maxDigests)
+	}
+}
+
+func TestDigestStats_NegativeCapUsesDefault(t *testing.T) {
+	ds := NewDigestStatsWithCap(-5)
+	if ds.maxDigests != DefaultMaxUniqueDigests {
+		t.Errorf("expected negative cap to fall back to default, got %d", ds.maxDigests)
+	}
+}
+
 func TestDigestStats_ReservoirBounded(t *testing.T) {
 	ds := NewDigestStats()
 

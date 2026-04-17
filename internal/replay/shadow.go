@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand/v2"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +19,7 @@ import (
 
 type ShadowQuery struct {
 	SessionID    uint64
+	SourceIP     string // client IP (without port) for CIDR filtering
 	Database     string // current DB at the time of the query (empty if none)
 	Query        string
 	Args         []interface{} // non-nil for prepared statement executions
@@ -24,20 +28,29 @@ type ShadowQuery struct {
 }
 
 type ShadowSender struct {
-	pool     *backend.Pool
-	queryCh  chan ShadowQuery
-	engine   *compare.Engine
-	reporter *compare.Reporter
-	timeout  time.Duration
-	dropped  atomic.Int64
-	skipped  atomic.Int64
-	disabled atomic.Int64 // counter for sends rejected because enabled=false
-	enabled  atomic.Bool
-	closed   atomic.Bool
-	wg       sync.WaitGroup
-	once     sync.Once
-	ctx      context.Context
-	cancel   context.CancelFunc
+	pool       *backend.Pool
+	queryCh    chan ShadowQuery
+	engine     *compare.Engine
+	reporter   *compare.Reporter
+	timeout    time.Duration
+	dropped    atomic.Int64
+	skipped    atomic.Int64
+	disabled   atomic.Int64 // counter for sends rejected because enabled=false
+	filtered   atomic.Int64 // counter for sends rejected by CIDR filter
+	sampledOut atomic.Int64 // counter for sends dropped by sample_rate
+	enabled    atomic.Bool
+	// sampleRateBits stores the float64 sample rate (in [0.0, 1.0]) via
+	// atomic uint64 bits. 1.0 = shadow all queries (default).
+	sampleRateBits atomic.Uint64
+	// allowedCIDRs and excludedCIDRs are atomic pointers to slices so
+	// the CIDR lists can be hot-reloaded without locking the Send path.
+	allowedCIDRs  atomic.Pointer[[]*net.IPNet]
+	excludedCIDRs atomic.Pointer[[]*net.IPNet]
+	closed        atomic.Bool
+	wg            sync.WaitGroup
+	once          sync.Once
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig) (*ShadowSender, error) {
@@ -67,16 +80,20 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		IgnoreQueryRegex: ignoreRegexes,
 	})
 
-	reporter, err := compare.NewReporter(compareCfg.OutputFile)
+	reporter, err := compare.NewReporterWithDigestCap(compareCfg.OutputFile, compareCfg.MaxUniqueDigests)
 	if err != nil {
 		return nil, fmt.Errorf("creating shadow reporter: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	queueSize := cfg.QueueSize
+	if queueSize <= 0 {
+		queueSize = 10000
+	}
 	s := &ShadowSender{
 		pool:     pool,
-		queryCh:  make(chan ShadowQuery, 10000),
+		queryCh:  make(chan ShadowQuery, queueSize),
 		engine:   engine,
 		reporter: reporter,
 		timeout:  cfg.Timeout,
@@ -90,6 +107,24 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		initiallyEnabled = *cfg.Enabled
 	}
 	s.enabled.Store(initiallyEnabled)
+
+	allowed, err := parseCIDRs(cfg.AllowedSourceCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("allowed_source_cidrs: %w", err)
+	}
+	excluded, err := parseCIDRs(cfg.ExcludedSourceCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("excluded_source_cidrs: %w", err)
+	}
+	s.allowedCIDRs.Store(&allowed)
+	s.excludedCIDRs.Store(&excluded)
+
+	// Default sample rate is 1.0 (shadow everything) when nil.
+	initialRate := 1.0
+	if cfg.SampleRate != nil {
+		initialRate = *cfg.SampleRate
+	}
+	s.sampleRateBits.Store(math.Float64bits(initialRate))
 
 	for i := 0; i < cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
@@ -107,6 +142,25 @@ func (s *ShadowSender) Send(sq ShadowQuery) {
 	if !s.enabled.Load() {
 		s.disabled.Add(1)
 		metrics.Global.ShadowDisabled.Add(1)
+		return
+	}
+
+	// Sample-rate check: a random fraction of queries can be dropped
+	// here to cap shadow overhead under high primary load. Evaluated
+	// before the more expensive CIDR/readonly checks so the sampling
+	// itself is cheap.
+	rate := math.Float64frombits(s.sampleRateBits.Load())
+	if rate < 1.0 && (rate <= 0.0 || rand.Float64() >= rate) {
+		s.sampledOut.Add(1)
+		metrics.Global.ShadowSampledOut.Add(1)
+		return
+	}
+
+	// CIDR filter: reject if excluded, or if allow-list is non-empty
+	// and source doesn't match it.
+	if !s.isAllowedByCIDR(sq.SourceIP) {
+		s.filtered.Add(1)
+		metrics.Global.ShadowFilteredByCIDR.Add(1)
 		return
 	}
 
@@ -160,6 +214,100 @@ func (s *ShadowSender) SetEnabled(enabled bool) {
 
 func (s *ShadowSender) IsEnabled() bool {
 	return s.enabled.Load()
+}
+
+// Filtered returns the count of sends rejected by the CIDR filter.
+func (s *ShadowSender) Filtered() int64 {
+	return s.filtered.Load()
+}
+
+// SampledOut returns the count of sends dropped by sample_rate.
+func (s *ShadowSender) SampledOut() int64 {
+	return s.sampledOut.Load()
+}
+
+// SampleRate returns the currently active sample rate.
+func (s *ShadowSender) SampleRate() float64 {
+	return math.Float64frombits(s.sampleRateBits.Load())
+}
+
+// SetSampleRate updates the fraction of primary queries forwarded to the
+// shadow. Must be in [0.0, 1.0]. Hot-reloadable.
+func (s *ShadowSender) SetSampleRate(rate float64) error {
+	if rate < 0.0 || rate > 1.0 {
+		return fmt.Errorf("sample_rate must be in [0.0, 1.0], got %v", rate)
+	}
+	prev := math.Float64frombits(s.sampleRateBits.Swap(math.Float64bits(rate)))
+	if prev != rate {
+		slog.Info("shadow sample rate updated", "rate", rate)
+	}
+	return nil
+}
+
+// SetCIDRs replaces the allow and exclude CIDR lists atomically.
+// Pass empty slices to clear a list. Hot-reloadable.
+func (s *ShadowSender) SetCIDRs(allowed, excluded []string) error {
+	a, err := parseCIDRs(allowed)
+	if err != nil {
+		return fmt.Errorf("allowed_source_cidrs: %w", err)
+	}
+	e, err := parseCIDRs(excluded)
+	if err != nil {
+		return fmt.Errorf("excluded_source_cidrs: %w", err)
+	}
+	s.allowedCIDRs.Store(&a)
+	s.excludedCIDRs.Store(&e)
+	slog.Info("shadow CIDR filters updated",
+		"allowed", len(a), "excluded", len(e))
+	return nil
+}
+
+// isAllowedByCIDR reports whether the source IP satisfies the current
+// allow/exclude CIDR policy. Returns true (allow) when no filters apply.
+// If sourceIP is empty or unparseable, we allow the send — filtering
+// is best-effort and shouldn't block shadow for Unix sockets or other
+// non-TCP transports.
+func (s *ShadowSender) isAllowedByCIDR(sourceIP string) bool {
+	allowed := *s.allowedCIDRs.Load()
+	excluded := *s.excludedCIDRs.Load()
+	if len(allowed) == 0 && len(excluded) == 0 {
+		return true
+	}
+	ip := net.ParseIP(sourceIP)
+	if ip == nil {
+		return true
+	}
+	// Exclude wins over allow: matching any exclude rejects immediately.
+	for _, n := range excluded {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	if len(allowed) == 0 {
+		// Only exclude rules defined, and none matched → allow.
+		return true
+	}
+	for _, n := range allowed {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCIDRs(patterns []string) ([]*net.IPNet, error) {
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+	out := make([]*net.IPNet, 0, len(patterns))
+	for _, p := range patterns {
+		_, n, err := net.ParseCIDR(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", p, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 func (s *ShadowSender) Close() {

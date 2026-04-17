@@ -28,6 +28,7 @@ type LoggerConfig struct {
 	Enabled    bool
 	OutputDir  string
 	FilePrefix string
+	QueueSize  int // channel buffer size; 0 → default 10000
 	MaxSizeMB  int
 	MaxAgeDays int
 	MaxBackups int
@@ -52,8 +53,12 @@ func NewLogger(cfg LoggerConfig) (*Logger, error) {
 		LocalTime:  true,
 	}
 
+	queueSize := cfg.QueueSize
+	if queueSize <= 0 {
+		queueSize = 10000
+	}
 	l := &Logger{
-		entryCh: make(chan LogEntry, 10000),
+		entryCh: make(chan LogEntry, queueSize),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 		writer:  lj,

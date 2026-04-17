@@ -62,7 +62,7 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		IgnoreQueryRegex: ignoreRegexes,
 	})
 
-	reporter, err := compare.NewReporter(compareCfg.OutputFile)
+	reporter, err := compare.NewReporterWithDigestCap(compareCfg.OutputFile, compareCfg.MaxUniqueDigests)
 	if err != nil {
 		return nil, fmt.Errorf("creating reporter: %w", err)
 	}
@@ -179,8 +179,12 @@ func (r *OfflineReplayer) replayFile(ctx context.Context, filePath string) error
 	}
 	sessions := make(map[uint64][]sessionEntry)
 
+	bufSize := r.cfg.ScannerBufferSizeBytes
+	if bufSize <= 0 {
+		bufSize = 1024 * 1024 // 1 MiB default
+	}
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+	scanner.Buffer(make([]byte, bufSize), bufSize)
 	var lineNum int64
 	for scanner.Scan() {
 		lineNum++

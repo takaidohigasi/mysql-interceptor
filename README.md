@@ -135,18 +135,46 @@ Duplicate live queries to a shadow server and compare responses:
 replay:
   mode: "shadow"
   shadow:
+    enabled: true           # hot-reloadable: set false to pause without restart
     target_addr: "mysql-shadow:3306"
     target_user: "shadow_user"
     target_password: "secret"
-    readonly: true       # only replay SELECT queries
+    readonly: true          # always enforced — only SELECT queries
     timeout: 5s
     max_concurrent: 100
+
+    # Source-IP filter (optional, hot-reloadable).
+    # Empty lists = no restriction. Exclude wins over allow.
+    allowed_source_cidrs:
+      - "10.0.0.0/8"        # only shadow traffic from internal app subnet
+    excluded_source_cidrs:
+      - "10.0.5.0/24"       # but never shadow queries from DBA hosts
 
 comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at"]
   time_threshold_ms: 100
 ```
+
+**Shadow filter evaluation** (per query, in order):
+
+1. `shadow.enabled: false` → skipped (counter: `shadow_disabled`)
+2. `shadow.sample_rate` roll fails → skipped (counter: `shadow_sampled_out`)
+3. Source IP matches any `excluded_source_cidrs` → filtered (counter: `shadow_filtered_by_cidr`)
+4. `allowed_source_cidrs` is non-empty and source IP doesn't match → filtered (same counter)
+5. Non-SELECT query → skipped (counter: `shadow_skipped`)
+6. Queue full → dropped (counter: `shadow_dropped`)
+7. Otherwise → enqueued for replay
+
+**Throttling under load:** `sample_rate` is a simple way to cap shadow overhead. `0.1` sends ~10% of queries to the shadow server. Combined with hot-reload, you can dial it down during high-traffic windows:
+
+```bash
+yq -i '.replay.shadow.sample_rate = 0.1' config.yaml   # cut shadow to 10%
+# later:
+yq -i '.replay.shadow.sample_rate = 1.0' config.yaml   # back to full
+```
+
+All four filter stages are observable via `/metrics`, so you can verify that a CIDR change is actually rejecting the intended traffic before trusting it.
 
 ### Offline Replay
 
@@ -255,8 +283,38 @@ proxy:
 
 Endpoints:
 - `GET /healthz` — 200 OK (liveness)
-- `GET /metrics` — JSON counters (active_sessions, total_sessions, queries_handled, query_errors, logger_dropped, shadow_dropped, shadow_skipped, shadow_queries_replayed)
+- `GET /metrics` — Prometheus/OpenMetrics text format (compatible with Datadog `openmetrics` check and Prometheus scrapers)
+- `GET /metrics.json` — same metrics, JSON format, for human debugging
 - `GET /debug/vars` — Go runtime stats via expvar
+
+Available metrics:
+  - **Sessions:** `active_sessions`, `total_sessions`
+  - **Queries:** `queries_handled`, `query_errors`
+  - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
+  - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
+  - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`, `comparisons_digest_count` (gauge), `comparisons_digest_overflow`
+  - **Runtime (gauges):** `heap_alloc_bytes`, `heap_inuse_bytes`, `heap_idle_bytes`, `heap_sys_bytes`, `heap_objects`, `stack_inuse_bytes`, `sys_bytes`, `num_goroutines`, `gc_cycles_total`, `gc_pause_ns_total`
+
+### Datadog integration
+
+On Kubernetes, the Datadog agent can auto-discover the proxy via pod annotations:
+
+```yaml
+metadata:
+  annotations:
+    ad.datadoghq.com/mysql-interceptor.check_names: '["openmetrics"]'
+    ad.datadoghq.com/mysql-interceptor.init_configs: '[{}]'
+    ad.datadoghq.com/mysql-interceptor.instances: |
+      [
+        {
+          "openmetrics_endpoint": "http://%%host%%:9090/metrics",
+          "namespace": "mysql_interceptor",
+          "metrics": [".*"]
+        }
+      ]
+```
+
+(Replace `mysql-interceptor` with your container name. Port 9090 matches the default `proxy.metrics_addr`.)
 
 Operational logs go to stderr via Go's `slog`:
 

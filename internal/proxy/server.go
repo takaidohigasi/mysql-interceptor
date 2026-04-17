@@ -155,6 +155,13 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	}()
 
 	remoteAddr := conn.RemoteAddr().String()
+	// Strip the port so CIDR filtering can match on host IP alone.
+	// Unix sockets and malformed addrs fall through to "" which the
+	// shadow sender treats as "no filter applies".
+	sourceIP := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		sourceIP = h
+	}
 	sessionLog := slog.With("session_id", sessionID, "remote", remoteAddr)
 	sessionLog.Info("new connection")
 
@@ -167,6 +174,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 
 	handler := &ProxyHandler{
 		sessionID:    sessionID,
+		sourceIP:     sourceIP,
 		backend:      backendConn,
 		currentDB:    backendConn.GetDB(),
 		shadowSender: ps.shadowSender,
