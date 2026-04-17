@@ -382,3 +382,101 @@ func TestOfflineReplayWithDivergentServers(t *testing.T) {
 		t.Error("expected queries.jsonl to be marked as completed in checkpoint")
 	}
 }
+
+// TestOfflineReplayIgnoreServerUUID verifies the comparison.ignore_queries
+// whitelist end-to-end: a SELECT @@server_uuid query replayed against a
+// different MySQL instance legitimately diverges, and with the correct
+// ignore pattern the diff report marks it "ignored" rather than "different".
+func TestOfflineReplayIgnoreServerUUID(t *testing.T) {
+	skipIfNoMySQL(t)
+
+	addr1 := getEnvOrDefault("MYSQL1_ADDR", "127.0.0.1:3306")
+	addr2 := getEnvOrDefault("MYSQL2_ADDR", "127.0.0.1:3307")
+	tmpDir := t.TempDir()
+
+	// Query the primary once to get the real uuid to seed the fake log with.
+	conn1, err := client.Connect(addr1, "root", "rootpass", "test_db")
+	if err != nil {
+		t.Fatalf("connect primary: %v", err)
+	}
+	primaryCaptured, err := replay.ExecuteAndCapture(conn1, "SELECT @@server_uuid")
+	conn1.Close()
+	if err != nil || primaryCaptured.Error != "" {
+		t.Fatalf("primary @@server_uuid: %v / %s", err, primaryCaptured.Error)
+	}
+
+	// Build a log file that references the exact primary response.
+	logFile := filepath.Join(tmpDir, "queries.jsonl")
+	entry := logging.LogEntry{
+		Timestamp:    time.Now().Add(-time.Second),
+		SessionID:    1,
+		SourceIP:     "127.0.0.1",
+		User:         "root",
+		Database:     "test_db",
+		QueryType:    "query",
+		Query:        "SELECT @@server_uuid",
+		ResponseTime: 0.5,
+		RowsReturned: 1,
+	}
+	f, err := os.Create(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(f).Encode(entry); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	reportFile := filepath.Join(tmpDir, "diff-report.jsonl")
+	checkpointFile := filepath.Join(tmpDir, "checkpoint.json")
+
+	// Run replay with @@server_uuid in the ignore list.
+	replayer, err := replay.NewOfflineReplayer(
+		config.OfflineConfig{
+			InputDir:       tmpDir,
+			FilePattern:    "queries.jsonl",
+			TargetAddr:     addr2,
+			TargetUser:     "root",
+			TargetPassword: "rootpass",
+			SpeedFactor:    0,
+			Concurrency:    1,
+			CheckpointFile: checkpointFile,
+		},
+		config.ComparisonConfig{
+			OutputFile:    reportFile,
+			IgnoreQueries: []string{"@@server_uuid"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("new replayer: %v", err)
+	}
+	if err := replayer.Run(); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+
+	// Parse the report and confirm the single entry is marked ignored.
+	reportData, err := os.ReadFile(reportFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []compare.CompareResult
+	dec := json.NewDecoder(bytes.NewReader(reportData))
+	for dec.More() {
+		var cr compare.CompareResult
+		if err := dec.Decode(&cr); err != nil {
+			break
+		}
+		results = append(results, cr)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	got := results[0]
+	if got.Query != "SELECT @@server_uuid" {
+		t.Errorf("unexpected query: %s", got.Query)
+	}
+	if !got.Ignored {
+		t.Error("expected the server_uuid result to be marked Ignored=true via the whitelist")
+	}
+	t.Logf("server_uuid result correctly classified as ignored: digest=%q", got.QueryDigest)
+}
