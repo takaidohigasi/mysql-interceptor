@@ -7,7 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
-## [v0.0.3] — 2026-04-17
+<a id="v0.0.3"></a>
+## v0.0.3
+
+_Released 2026-04-17._
 
 ### Highlights
 
@@ -83,7 +86,10 @@ minor versions).
   with JOIN) are rejected even if one table is a tracked temp. This avoids
   accidentally mutating persistent tables if a typo targets the wrong one.
 
-## [v0.0.2] — 2026-04-17
+<a id="v0.0.2"></a>
+## v0.0.2
+
+_Released 2026-04-17._
 
 ### Highlights
 
@@ -93,13 +99,54 @@ minor versions).
   patterns, and per-digest latency stats.
 - **Graceful shutdown** with session drain + fix for two close-on-channel
   panics discovered under `-race`.
-- **`/healthz` + `/metrics` endpoint** (JSON).
+- **`/healthz` + `/metrics` endpoint** (JSON format in v0.0.2; became
+  Prometheus in v0.0.3).
 - **CI** with `-race` on every push; release workflow auto-runs bench and
   appends a latency table to the Release body.
 
-See the full list of fixes and features in PR #1.
+### Added
 
-## [v0.0.1] — 2026-04-17
+- Prepared statement support (`HandleStmtPrepare/Execute/Close`) via
+  pass-through to the backend's `*client.Stmt`.
+- Real-time shadow traffic with per-session routing, response comparison
+  engine, and JSONL diff report.
+- Ignore-pattern whitelist (`comparison.ignore_queries`) — regex list that
+  marks matching queries as `ignored` rather than `differed`.
+- Per-digest latency stats (avg / p95 / p99) with reservoir sampling so
+  memory stays bounded regardless of workload duration.
+- Graceful SIGINT handling in offline replay: saves checkpoint before exit
+  so the next run resumes cleanly.
+- `/healthz` and `/metrics` HTTP endpoints on `proxy.metrics_addr`.
+- `LOG_LEVEL` / `LOG_FORMAT` env vars for structured logging (slog).
+- Shadow `timeout` and `readonly` config (readonly always enforced).
+- `logging.redact_args` — opt-in redaction of prepared-stmt bind values in
+  the SQL log.
+- Checkpoint file for offline replay with auto-resume and optional
+  auto-delete of completed input files.
+- Query digest normalizer that groups parameterized variants together.
+- Bench tool that runs identical queries direct-vs-proxy and reports
+  latency overhead (appended to each GitHub Release).
+
+### Fixed
+
+- Two `send-on-closed-channel` panics (`Logger`, `ShadowSender`) discovered
+  under `-race`.
+- `MaxConnections` config is now actually enforced.
+- Accept loop backs off exponentially on listener errors instead of
+  spinning.
+- Byte-slice rendering in captured rows (MySQL VARCHAR columns no longer
+  show up as `[97 108 105 99 101]` in diff reports).
+- Backend connect now uses a 10-second timeout.
+- Offline replay checkpoint is saved periodically (every 5s) during replay,
+  not only at file end.
+- Shadow queries now `USE <db>` first so unqualified table references hit
+  the right schema.
+- Digest strips SQL comments so trace-annotated queries group correctly.
+
+<a id="v0.0.1"></a>
+## v0.0.1
+
+_Released 2026-04-17._
 
 Initial release. Basic MySQL proxy with:
 
