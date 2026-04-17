@@ -53,6 +53,8 @@ release:
   draft: false
   prerelease: auto
   name_template: "v{{.Version}}"
+  header: |
+    Full release notes for this version: [**CHANGELOG.md#v{{.Version}}**](https://github.com/takaidohigasi/mysql-interceptor/blob/main/CHANGELOG.md#v{{.Version}}).
 
 changelog:
   use: git
