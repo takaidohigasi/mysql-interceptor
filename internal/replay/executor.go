@@ -1,7 +1,6 @@
 package replay
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
@@ -32,8 +31,7 @@ func ExecuteAndCapture(conn *client.Conn, query string) (*compare.CapturedResult
 		for rowIdx := 0; rowIdx < len(result.Values); rowIdx++ {
 			row := make([]string, len(result.Values[rowIdx]))
 			for colIdx := range result.Values[rowIdx] {
-				val := result.Values[rowIdx][colIdx]
-				row[colIdx] = fmt.Sprintf("%v", val.Value())
+				row[colIdx] = compare.FormatCellValue(result.Values[rowIdx][colIdx].Value())
 			}
 			captured.Rows = append(captured.Rows, row)
 		}

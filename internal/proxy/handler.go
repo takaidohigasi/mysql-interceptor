@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"fmt"
 	"log"
 	"time"
 
@@ -93,7 +92,7 @@ func captureResult(result *mysql.Result, err error, duration time.Duration) *com
 			for rowIdx := 0; rowIdx < len(result.Values); rowIdx++ {
 				row := make([]string, len(result.Values[rowIdx]))
 				for colIdx := range result.Values[rowIdx] {
-					row[colIdx] = fmt.Sprintf("%v", result.Values[rowIdx][colIdx].Value())
+					row[colIdx] = compare.FormatCellValue(result.Values[rowIdx][colIdx].Value())
 				}
 				captured.Rows = append(captured.Rows, row)
 			}
