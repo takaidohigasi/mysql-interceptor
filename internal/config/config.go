@@ -61,6 +61,11 @@ type LoggingConfig struct {
 	Enabled    bool           `yaml:"enabled"`
 	OutputDir  string         `yaml:"output_dir"`
 	FilePrefix string         `yaml:"file_prefix"`
+	// RedactArgs replaces prepared-statement bind values in logged entries
+	// with "<redacted>" so they never hit disk. Useful when queries may
+	// bind passwords, tokens, or other PII. The query text (with ?
+	// placeholders) is still recorded.
+	RedactArgs bool           `yaml:"redact_args"`
 	Rotation   RotationConfig `yaml:"rotation"`
 }
 

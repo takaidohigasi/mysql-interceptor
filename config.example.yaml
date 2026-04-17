@@ -25,6 +25,7 @@ logging:
   enabled: true
   output_dir: "./logs"
   file_prefix: "queries"
+  redact_args: false       # set true to replace prepared-stmt bind values with <redacted>
   rotation:
     max_size_mb: 100
     max_age_days: 7

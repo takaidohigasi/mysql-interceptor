@@ -133,10 +133,15 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	}
 
 	if ps.logger != nil {
+		redactArgs := ps.cfg.Logging.RedactArgs
 		handler.logQuery = func(evt QueryEvent) {
 			errStr := ""
 			if evt.Err != nil {
 				errStr = evt.Err.Error()
+			}
+			args := evt.Args
+			if redactArgs && len(args) > 0 {
+				args = redact(args)
 			}
 			ps.logger.Log(logging.LogEntry{
 				Timestamp:    evt.Timestamp,
@@ -146,7 +151,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 				Database:     handler.currentDB,
 				QueryType:    evt.QueryType,
 				Query:        evt.Query,
-				Args:         evt.Args,
+				Args:         args,
 				ResponseTime: float64(evt.Duration.Microseconds()) / 1000.0,
 				RowsAffected: evt.AffectedRows,
 				RowsReturned: evt.RowsReturned,
@@ -208,6 +213,16 @@ func (ps *ProxyServer) doShutdown() {
 		ps.sessionsMu.Unlock()
 		<-drained
 	}
+}
+
+// redact returns a new slice with every element replaced by "<redacted>".
+// Used when logging.redact_args is true so bind values never persist.
+func redact(args []interface{}) []interface{} {
+	out := make([]interface{}, len(args))
+	for i := range args {
+		out[i] = "<redacted>"
+	}
+	return out
 }
 
 func buildClientSideTLSConfig(cfg config.ClientSideTLSConfig) (*tls.Config, error) {
