@@ -26,6 +26,10 @@ type Counters struct {
 	ShadowDropped         atomic.Int64
 	ShadowSkipped         atomic.Int64
 	ShadowQueriesReplayed atomic.Int64
+	ComparisonsTotal      atomic.Int64
+	ComparisonsMatched    atomic.Int64
+	ComparisonsDiffered   atomic.Int64
+	ComparisonsIgnored    atomic.Int64
 }
 
 // Global is the singleton counter set. Components increment fields on it
@@ -99,6 +103,10 @@ func handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"shadow_dropped":          Global.ShadowDropped.Load(),
 		"shadow_skipped":          Global.ShadowSkipped.Load(),
 		"shadow_queries_replayed": Global.ShadowQueriesReplayed.Load(),
+		"comparisons_total":       Global.ComparisonsTotal.Load(),
+		"comparisons_matched":     Global.ComparisonsMatched.Load(),
+		"comparisons_differed":    Global.ComparisonsDiffered.Load(),
+		"comparisons_ignored":     Global.ComparisonsIgnored.Load(),
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

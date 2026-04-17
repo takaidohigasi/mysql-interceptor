@@ -24,10 +24,12 @@ func TestMetricsEndpointReturnsCounters(t *testing.T) {
 	Global.ActiveSessions.Store(3)
 	Global.TotalSessions.Store(42)
 	Global.QueriesHandled.Store(100)
+	Global.ComparisonsIgnored.Store(7)
 	defer func() {
 		Global.ActiveSessions.Store(0)
 		Global.TotalSessions.Store(0)
 		Global.QueriesHandled.Store(0)
+		Global.ComparisonsIgnored.Store(0)
 	}()
 
 	rr := httptest.NewRecorder()
@@ -53,6 +55,9 @@ func TestMetricsEndpointReturnsCounters(t *testing.T) {
 	}
 	if snap["queries_handled"] != 100 {
 		t.Errorf("expected queries_handled=100, got %d", snap["queries_handled"])
+	}
+	if snap["comparisons_ignored"] != 7 {
+		t.Errorf("expected comparisons_ignored=7, got %d", snap["comparisons_ignored"])
 	}
 }
 

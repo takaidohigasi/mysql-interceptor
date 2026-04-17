@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 type Reporter struct {
@@ -45,13 +47,17 @@ func NewReporter(outputFile string) (*Reporter, error) {
 
 func (r *Reporter) Record(result *CompareResult) {
 	r.totalCount.Add(1)
+	metrics.Global.ComparisonsTotal.Add(1)
 	switch {
 	case result.Ignored:
 		r.ignoredCount.Add(1)
+		metrics.Global.ComparisonsIgnored.Add(1)
 	case result.Match:
 		r.matchCount.Add(1)
+		metrics.Global.ComparisonsMatched.Add(1)
 	default:
 		r.diffCount.Add(1)
+		metrics.Global.ComparisonsDiffered.Add(1)
 	}
 
 	r.digestStats.Record(result)
