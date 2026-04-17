@@ -135,18 +135,36 @@ Duplicate live queries to a shadow server and compare responses:
 replay:
   mode: "shadow"
   shadow:
+    enabled: true           # hot-reloadable: set false to pause without restart
     target_addr: "mysql-shadow:3306"
     target_user: "shadow_user"
     target_password: "secret"
-    readonly: true       # only replay SELECT queries
+    readonly: true          # always enforced — only SELECT queries
     timeout: 5s
     max_concurrent: 100
+
+    # Source-IP filter (optional, hot-reloadable).
+    # Empty lists = no restriction. Exclude wins over allow.
+    allowed_source_cidrs:
+      - "10.0.0.0/8"        # only shadow traffic from internal app subnet
+    excluded_source_cidrs:
+      - "10.0.5.0/24"       # but never shadow queries from DBA hosts
 
 comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at"]
   time_threshold_ms: 100
 ```
+
+**Shadow filter evaluation** (per query):
+
+1. If `shadow.enabled: false` → skipped (counter: `shadow_disabled`)
+2. If source IP matches any `excluded_source_cidrs` → filtered (counter: `shadow_filtered_by_cidr`)
+3. If `allowed_source_cidrs` is non-empty and source IP doesn't match → filtered (same counter)
+4. Non-SELECT query → skipped (counter: `shadow_skipped`)
+5. Otherwise → enqueued for replay
+
+All four filter stages are observable via `/metrics`, so you can verify that a CIDR change is actually rejecting the intended traffic before trusting it.
 
 ### Offline Replay
 
@@ -255,7 +273,12 @@ proxy:
 
 Endpoints:
 - `GET /healthz` — 200 OK (liveness)
-- `GET /metrics` — JSON counters (active_sessions, total_sessions, queries_handled, query_errors, logger_dropped, shadow_dropped, shadow_skipped, shadow_queries_replayed)
+- `GET /metrics` — JSON counters:
+  - **Sessions:** `active_sessions`, `total_sessions`
+  - **Queries:** `queries_handled`, `query_errors`
+  - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
+  - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
+  - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`
 - `GET /debug/vars` — Go runtime stats via expvar
 
 Operational logs go to stderr via Go's `slog`:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 type ShadowQuery struct {
 	SessionID    uint64
+	SourceIP     string // client IP (without port) for CIDR filtering
 	Database     string // current DB at the time of the query (empty if none)
 	Query        string
 	Args         []interface{} // non-nil for prepared statement executions
@@ -32,12 +34,17 @@ type ShadowSender struct {
 	dropped  atomic.Int64
 	skipped  atomic.Int64
 	disabled atomic.Int64 // counter for sends rejected because enabled=false
+	filtered atomic.Int64 // counter for sends rejected by CIDR filter
 	enabled  atomic.Bool
-	closed   atomic.Bool
-	wg       sync.WaitGroup
-	once     sync.Once
-	ctx      context.Context
-	cancel   context.CancelFunc
+	// allowedCIDRs and excludedCIDRs are atomic pointers to slices so
+	// the CIDR lists can be hot-reloaded without locking the Send path.
+	allowedCIDRs  atomic.Pointer[[]*net.IPNet]
+	excludedCIDRs atomic.Pointer[[]*net.IPNet]
+	closed        atomic.Bool
+	wg            sync.WaitGroup
+	once          sync.Once
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig) (*ShadowSender, error) {
@@ -91,6 +98,17 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 	}
 	s.enabled.Store(initiallyEnabled)
 
+	allowed, err := parseCIDRs(cfg.AllowedSourceCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("allowed_source_cidrs: %w", err)
+	}
+	excluded, err := parseCIDRs(cfg.ExcludedSourceCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("excluded_source_cidrs: %w", err)
+	}
+	s.allowedCIDRs.Store(&allowed)
+	s.excludedCIDRs.Store(&excluded)
+
 	for i := 0; i < cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
 		go s.worker()
@@ -107,6 +125,14 @@ func (s *ShadowSender) Send(sq ShadowQuery) {
 	if !s.enabled.Load() {
 		s.disabled.Add(1)
 		metrics.Global.ShadowDisabled.Add(1)
+		return
+	}
+
+	// CIDR filter: reject if excluded, or if allow-list is non-empty
+	// and source doesn't match it.
+	if !s.isAllowedByCIDR(sq.SourceIP) {
+		s.filtered.Add(1)
+		metrics.Global.ShadowFilteredByCIDR.Add(1)
 		return
 	}
 
@@ -160,6 +186,77 @@ func (s *ShadowSender) SetEnabled(enabled bool) {
 
 func (s *ShadowSender) IsEnabled() bool {
 	return s.enabled.Load()
+}
+
+// Filtered returns the count of sends rejected by the CIDR filter.
+func (s *ShadowSender) Filtered() int64 {
+	return s.filtered.Load()
+}
+
+// SetCIDRs replaces the allow and exclude CIDR lists atomically.
+// Pass empty slices to clear a list. Hot-reloadable.
+func (s *ShadowSender) SetCIDRs(allowed, excluded []string) error {
+	a, err := parseCIDRs(allowed)
+	if err != nil {
+		return fmt.Errorf("allowed_source_cidrs: %w", err)
+	}
+	e, err := parseCIDRs(excluded)
+	if err != nil {
+		return fmt.Errorf("excluded_source_cidrs: %w", err)
+	}
+	s.allowedCIDRs.Store(&a)
+	s.excludedCIDRs.Store(&e)
+	slog.Info("shadow CIDR filters updated",
+		"allowed", len(a), "excluded", len(e))
+	return nil
+}
+
+// isAllowedByCIDR reports whether the source IP satisfies the current
+// allow/exclude CIDR policy. Returns true (allow) when no filters apply.
+// If sourceIP is empty or unparseable, we allow the send — filtering
+// is best-effort and shouldn't block shadow for Unix sockets or other
+// non-TCP transports.
+func (s *ShadowSender) isAllowedByCIDR(sourceIP string) bool {
+	allowed := *s.allowedCIDRs.Load()
+	excluded := *s.excludedCIDRs.Load()
+	if len(allowed) == 0 && len(excluded) == 0 {
+		return true
+	}
+	ip := net.ParseIP(sourceIP)
+	if ip == nil {
+		return true
+	}
+	// Exclude wins over allow: matching any exclude rejects immediately.
+	for _, n := range excluded {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	if len(allowed) == 0 {
+		// Only exclude rules defined, and none matched → allow.
+		return true
+	}
+	for _, n := range allowed {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCIDRs(patterns []string) ([]*net.IPNet, error) {
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+	out := make([]*net.IPNet, 0, len(patterns))
+	for _, p := range patterns {
+		_, n, err := net.ParseCIDR(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", p, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 func (s *ShadowSender) Close() {

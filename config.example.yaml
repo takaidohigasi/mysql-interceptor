@@ -46,6 +46,17 @@ replay:
     readonly: true          # always enforced — non-SELECT queries are never replayed
     timeout: 5s             # per-query timeout; slow shadows are abandoned
     max_concurrent: 100
+    # CIDR filters (hot-reloadable). Empty lists mean "no restriction".
+    # Evaluation: exclude wins over allow — a source IP matching any
+    # excluded_source_cidrs is never shadowed. If allowed_source_cidrs is
+    # non-empty, the source IP must also match one of them.
+    #   allowed_source_cidrs:
+    #     - "10.0.0.0/8"      # only internal app servers
+    #     - "192.168.1.0/24"
+    #   excluded_source_cidrs:
+    #     - "10.0.5.0/24"     # never shadow DBA hosts
+    allowed_source_cidrs: []
+    excluded_source_cidrs: []
   offline:
     input_dir: "./logs"
     file_pattern: "queries-*.jsonl"

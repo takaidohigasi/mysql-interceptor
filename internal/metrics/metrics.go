@@ -26,6 +26,7 @@ type Counters struct {
 	ShadowDropped         atomic.Int64
 	ShadowSkipped         atomic.Int64
 	ShadowDisabled        atomic.Int64 // sends rejected because shadow.enabled=false
+	ShadowFilteredByCIDR  atomic.Int64 // sends rejected by CIDR allow/exclude filter
 	ShadowEnabledGauge    atomic.Int64 // 0 or 1; current toggle state
 	ShadowQueriesReplayed atomic.Int64
 	ComparisonsTotal      atomic.Int64
@@ -105,6 +106,7 @@ func handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"shadow_dropped":          Global.ShadowDropped.Load(),
 		"shadow_skipped":          Global.ShadowSkipped.Load(),
 		"shadow_disabled":         Global.ShadowDisabled.Load(),
+		"shadow_filtered_by_cidr": Global.ShadowFilteredByCIDR.Load(),
 		"shadow_enabled":          Global.ShadowEnabledGauge.Load(),
 		"shadow_queries_replayed": Global.ShadowQueriesReplayed.Load(),
 		"comparisons_total":       Global.ComparisonsTotal.Load(),

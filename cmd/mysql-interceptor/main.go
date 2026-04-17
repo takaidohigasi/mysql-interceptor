@@ -152,8 +152,16 @@ func runServe() {
 			if queryLogger != nil {
 				queryLogger.SetEnabled(newCfg.Logging.Enabled)
 			}
-			if shadowSender != nil && newCfg.Replay.Shadow.Enabled != nil {
-				shadowSender.SetEnabled(*newCfg.Replay.Shadow.Enabled)
+			if shadowSender != nil {
+				if newCfg.Replay.Shadow.Enabled != nil {
+					shadowSender.SetEnabled(*newCfg.Replay.Shadow.Enabled)
+				}
+				if err := shadowSender.SetCIDRs(
+					newCfg.Replay.Shadow.AllowedSourceCIDRs,
+					newCfg.Replay.Shadow.ExcludedSourceCIDRs,
+				); err != nil {
+					slog.Warn("failed to update shadow CIDR filters", "err", err)
+				}
 			}
 		})
 	}

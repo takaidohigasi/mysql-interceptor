@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"time"
@@ -93,6 +94,14 @@ type ShadowConfig struct {
 	// without restarting the proxy (e.g. during shadow-server maintenance).
 	// Defaults to true when mode is "shadow".
 	Enabled *bool `yaml:"enabled,omitempty"`
+	// AllowedSourceCIDRs, if non-empty, restricts shadow forwarding to
+	// sessions whose client IP falls within one of the listed CIDRs.
+	// Example: ["10.0.0.0/8", "192.168.1.0/24"]. Leave empty to allow all.
+	AllowedSourceCIDRs []string `yaml:"allowed_source_cidrs"`
+	// ExcludedSourceCIDRs is evaluated first: any source IP matching one
+	// of these CIDRs is never shadowed, even if it also matches
+	// AllowedSourceCIDRs. Useful for excluding e.g. DBA hosts from shadow.
+	ExcludedSourceCIDRs []string `yaml:"excluded_source_cidrs"`
 	// ReadOnly is always enforced regardless of this flag — kept for backward
 	// compatibility and to make the safety behavior explicit in config files.
 	ReadOnly      bool          `yaml:"readonly"`
@@ -228,6 +237,16 @@ func (c *Config) Validate() error {
 	for i, pat := range c.Comparison.IgnoreQueries {
 		if _, err := regexp.Compile("(?i)" + pat); err != nil {
 			return fmt.Errorf("comparison.ignore_queries[%d] invalid regex %q: %w", i, pat, err)
+		}
+	}
+	for i, cidr := range c.Replay.Shadow.AllowedSourceCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("replay.shadow.allowed_source_cidrs[%d] invalid CIDR %q: %w", i, cidr, err)
+		}
+	}
+	for i, cidr := range c.Replay.Shadow.ExcludedSourceCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("replay.shadow.excluded_source_cidrs[%d] invalid CIDR %q: %w", i, cidr, err)
 		}
 	}
 	return nil
