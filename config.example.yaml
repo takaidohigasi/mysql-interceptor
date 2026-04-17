@@ -55,3 +55,11 @@ comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at", "created_at"]
   time_threshold_ms: 100
+
+bench:
+  queries:
+    - "SELECT 1"
+    - "SELECT * FROM information_schema.tables LIMIT 10"
+  concurrency: 4
+  iterations: 1000
+  warmup_iterations: 50

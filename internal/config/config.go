@@ -15,6 +15,14 @@ type Config struct {
 	Logging    LoggingConfig    `yaml:"logging"`
 	Replay     ReplayConfig     `yaml:"replay"`
 	Comparison ComparisonConfig `yaml:"comparison"`
+	Bench      BenchConfig      `yaml:"bench"`
+}
+
+type BenchConfig struct {
+	Queries     []string `yaml:"queries"`
+	Concurrency int      `yaml:"concurrency"`
+	Iterations  int      `yaml:"iterations"`
+	WarmupIters int      `yaml:"warmup_iterations"`
 }
 
 type ProxyConfig struct {
@@ -152,6 +160,15 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Replay.Offline.Concurrency == 0 {
 		cfg.Replay.Offline.Concurrency = 10
+	}
+	if cfg.Bench.Concurrency == 0 {
+		cfg.Bench.Concurrency = 1
+	}
+	if cfg.Bench.Iterations == 0 {
+		cfg.Bench.Iterations = 100
+	}
+	if cfg.Bench.WarmupIters == 0 {
+		cfg.Bench.WarmupIters = 10
 	}
 }
 

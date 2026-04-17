@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-mysql-org/go-mysql v1.14.0
+	github.com/go-sql-driver/mysql v1.9.3
 	gopkg.in/lumberjack.v2 v2.0.0
 	gopkg.in/yaml.v3 v3.0.1
 )

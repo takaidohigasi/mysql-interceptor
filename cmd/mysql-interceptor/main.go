@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/takaidohigasi/mysql-interceptor/internal/bench"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/logging"
 	"github.com/takaidohigasi/mysql-interceptor/internal/proxy"
@@ -25,8 +26,7 @@ func main() {
 	case "replay":
 		runReplay()
 	case "bench":
-		fmt.Println("bench subcommand not yet implemented")
-		os.Exit(1)
+		runBench()
 	default:
 		printUsage()
 		os.Exit(1)
@@ -140,4 +140,46 @@ func runReplay() {
 	if err := replayer.Run(); err != nil {
 		log.Fatalf("replay error: %v", err)
 	}
+}
+
+func runBench() {
+	configPath := "config.yaml"
+	for i := 2; i < len(os.Args); i++ {
+		if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			configPath = os.Args[i+1]
+			i++
+		}
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
+
+	if len(cfg.Bench.Queries) == 0 {
+		log.Fatal("no benchmark queries configured in bench.queries")
+	}
+
+	// Build DSNs from config
+	directDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
+		cfg.Backend.User, cfg.Backend.Password, cfg.Backend.Addr, cfg.Backend.DB)
+	proxyDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
+		cfg.Backend.User, cfg.Backend.Password, cfg.Proxy.ListenAddr, cfg.Backend.DB)
+
+	log.Printf("Direct DSN: %s@tcp(%s)", cfg.Backend.User, cfg.Backend.Addr)
+	log.Printf("Proxy DSN:  %s@tcp(%s)", cfg.Backend.User, cfg.Proxy.ListenAddr)
+
+	report, err := bench.Run(bench.Config{
+		DirectDSN:   directDSN,
+		ProxyDSN:    proxyDSN,
+		Queries:     cfg.Bench.Queries,
+		Concurrency: cfg.Bench.Concurrency,
+		Iterations:  cfg.Bench.Iterations,
+		WarmupIters: cfg.Bench.WarmupIters,
+	})
+	if err != nil {
+		log.Fatalf("benchmark error: %v", err)
+	}
+
+	report.Print()
 }
