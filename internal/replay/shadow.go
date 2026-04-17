@@ -43,7 +43,7 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 			User:     cfg.TargetUser,
 			Password: cfg.TargetPassword,
 		},
-		config.BackendSideTLSConfig{},
+		cfg.TLS,
 		cfg.MaxConcurrent,
 	)
 

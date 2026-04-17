@@ -41,7 +41,7 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 			User:     cfg.TargetUser,
 			Password: cfg.TargetPassword,
 		},
-		config.BackendSideTLSConfig{},
+		cfg.TLS,
 		cfg.Concurrency,
 	)
 

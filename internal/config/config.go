@@ -77,9 +77,10 @@ type ReplayConfig struct {
 }
 
 type ShadowConfig struct {
-	TargetAddr     string        `yaml:"target_addr"`
-	TargetUser     string        `yaml:"target_user"`
-	TargetPassword string        `yaml:"target_password"`
+	TargetAddr     string               `yaml:"target_addr"`
+	TargetUser     string               `yaml:"target_user"`
+	TargetPassword string               `yaml:"target_password"`
+	TLS            BackendSideTLSConfig `yaml:"tls"`
 	// ReadOnly is always enforced regardless of this flag — kept for backward
 	// compatibility and to make the safety behavior explicit in config files.
 	ReadOnly      bool          `yaml:"readonly"`
@@ -89,15 +90,16 @@ type ShadowConfig struct {
 }
 
 type OfflineConfig struct {
-	InputDir             string  `yaml:"input_dir"`
-	FilePattern          string  `yaml:"file_pattern"`
-	TargetAddr           string  `yaml:"target_addr"`
-	TargetUser           string  `yaml:"target_user"`
-	TargetPassword       string  `yaml:"target_password"`
-	SpeedFactor          float64 `yaml:"speed_factor"`
-	Concurrency          int     `yaml:"concurrency"`
-	CheckpointFile       string  `yaml:"checkpoint_file"`
-	AutoDeleteCompleted  bool    `yaml:"auto_delete_completed"`
+	InputDir            string               `yaml:"input_dir"`
+	FilePattern         string               `yaml:"file_pattern"`
+	TargetAddr          string               `yaml:"target_addr"`
+	TargetUser          string               `yaml:"target_user"`
+	TargetPassword      string               `yaml:"target_password"`
+	TLS                 BackendSideTLSConfig `yaml:"tls"`
+	SpeedFactor         float64              `yaml:"speed_factor"`
+	Concurrency         int                  `yaml:"concurrency"`
+	CheckpointFile      string               `yaml:"checkpoint_file"`
+	AutoDeleteCompleted bool                 `yaml:"auto_delete_completed"`
 }
 
 type ComparisonConfig struct {

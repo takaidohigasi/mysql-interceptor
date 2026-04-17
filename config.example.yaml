@@ -36,6 +36,10 @@ replay:
     target_addr: "127.0.0.1:3307"
     target_user: "root"
     target_password: ""
+    tls:
+      enabled: false
+      ca_file: ""
+      skip_verify: false
     readonly: true          # always enforced — non-SELECT queries are never replayed
     async: true
     timeout: 5s
@@ -46,6 +50,10 @@ replay:
     target_addr: "127.0.0.1:3308"
     target_user: "root"
     target_password: ""
+    tls:
+      enabled: false
+      ca_file: ""
+      skip_verify: false
     speed_factor: 1.0
     concurrency: 10
     checkpoint_file: "./logs/.replay-checkpoint.json"
