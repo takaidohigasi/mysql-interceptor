@@ -19,14 +19,18 @@ Offline Replay:  Log Files --> Replayer --> Target MySQL --> Comparison Report
 
 ## Features
 
-- **Transparent proxying** - Full MySQL protocol support (queries, prepared statements, COM_PING)
-- **TLS support** - Configurable independently on client-side and backend-side
-- **SQL logging** - Async JSON-lines logging with rotation, enable/disable via config hot-reload
-- **Real-time shadow traffic** - Duplicate live queries to a shadow server, compare responses inline
-- **Offline replay** - Replay recorded queries from log files against a target server
+- **Transparent proxying** - Full MySQL protocol support (text queries, prepared statements, COM_PING, field list)
+- **TLS support** - Configurable independently on client/backend/shadow/offline-replay sides
+- **SQL logging** - Async JSON-lines logging with rotation, enable/disable via config hot-reload, optional arg redaction
+- **Real-time shadow traffic** - Duplicate live queries to a shadow server, compare responses inline (always read-only)
+- **Offline replay** - Replay recorded queries from log files against a target server (always read-only)
 - **Response comparison** - Compare content (rows, columns, errors) and timing between servers
-- **Checkpoint tracking** - Resume replay from last position, auto-delete completed log files
-- **Benchmarking** - Compare latency with and without proxy (p50/p95/p99 stats)
+- **Query digest stats** - Aggregate avg/p95/p99 response times grouped by query digest (bounded memory via reservoir sampling)
+- **Checkpoint tracking** - Resume replay from last position, auto-delete completed log files, periodic progress saves
+- **Graceful shutdown** - Drain active sessions on SIGTERM with configurable timeout, force-close after
+- **Metrics endpoint** - `/healthz` + `/metrics` HTTP endpoint (JSON counters; stdlib-only, no Prometheus dep)
+- **Structured logging** - slog-based operational logs with JSON or text format via `LOG_FORMAT` / `LOG_LEVEL`
+- **Benchmarking** - Compare latency with and without proxy (p50/p95/p99 stats, Markdown output)
 
 ## Quick Start
 
@@ -98,6 +102,7 @@ logging:
   enabled: true          # hot-reloadable
   output_dir: "./logs"
   file_prefix: "queries"
+  redact_args: false     # set true to redact prepared-statement bind values
   rotation:
     max_size_mb: 100
     max_age_days: 7
@@ -225,6 +230,44 @@ The diff report (JSONL) shows per-query comparison results:
 
 Difference types: `error`, `row_count`, `column_count`, `column_name`, `cell_value`, `affected_rows`
 
+### Query digest stats
+
+After replay/shadow runs, the comparison report includes a per-digest summary:
+
+```
+=== Query Digest Summary (2 unique digests) ===
+
+Digest                                       Count  Match   Diff | Orig Avg  Orig P95  Orig P99 | Rply Avg  Rply P95  Rply P99
+select * from users where id = ?               150    150      0 |   2.34ms    5.10ms    8.90ms |   3.12ms    6.80ms   12.10ms
+select * from orders where user_id = ?          50     48      2 |   1.50ms    3.20ms    4.80ms |   1.80ms    4.00ms    6.20ms
+```
+
+SQL literals (numbers, strings, `IN (...)` lists) are replaced with `?` to group identical query patterns. Percentiles use reservoir sampling (10k samples per digest) — memory stays bounded regardless of how long the proxy runs.
+
+## Observability
+
+Enable the metrics endpoint in your config:
+
+```yaml
+proxy:
+  metrics_addr: "127.0.0.1:9090"    # "" to disable
+```
+
+Endpoints:
+- `GET /healthz` — 200 OK (liveness)
+- `GET /metrics` — JSON counters (active_sessions, total_sessions, queries_handled, query_errors, logger_dropped, shadow_dropped, shadow_skipped, shadow_queries_replayed)
+- `GET /debug/vars` — Go runtime stats via expvar
+
+Operational logs go to stderr via Go's `slog`:
+
+```bash
+# Default: text output, info level
+./bin/mysql-interceptor serve --config config.yaml
+
+# Structured JSON at debug level
+LOG_FORMAT=json LOG_LEVEL=debug ./bin/mysql-interceptor serve --config config.yaml
+```
+
 ## Testing
 
 ### Unit tests
@@ -257,9 +300,11 @@ The integration tests verify:
 ## CI
 
 GitHub Actions runs on every push/PR:
-- **Unit tests** - all `./internal/...` tests
-- **Integration tests** - 2 MySQL service containers with divergent schemas
+- **Unit tests** - `./internal/...` tests with `-race`
+- **Integration tests** - 2 MySQL service containers with divergent schemas, including proxy round-trip and prepared-statement tests
 - **Docker build** - verifies the container image builds correctly
+
+On tag push (`v*`), the release workflow runs GoReleaser to build multi-platform binaries and a Docker image, then runs the benchmark against a fresh MySQL and appends the latency table to the GitHub Release body.
 
 ## License
 
