@@ -3,7 +3,7 @@ package replay
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,11 +11,14 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 type ShadowQuery struct {
 	SessionID    uint64
+	Database     string // current DB at the time of the query (empty if none)
 	Query        string
+	Args         []interface{} // non-nil for prepared statement executions
 	OrigDuration time.Duration
 	OrigResult   *compare.CapturedResult
 }
@@ -28,7 +31,11 @@ type ShadowSender struct {
 	timeout  time.Duration
 	dropped  atomic.Int64
 	skipped  atomic.Int64
+	disabled atomic.Int64 // counter for sends rejected because enabled=false
+	enabled  atomic.Bool
+	closed   atomic.Bool
 	wg       sync.WaitGroup
+	once     sync.Once
 	ctx      context.Context
 	cancel   context.CancelFunc
 }
@@ -40,7 +47,7 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 			User:     cfg.TargetUser,
 			Password: cfg.TargetPassword,
 		},
-		config.BackendSideTLSConfig{},
+		cfg.TLS,
 		cfg.MaxConcurrent,
 	)
 
@@ -49,9 +56,15 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		ignoreColumns[col] = true
 	}
 
+	ignoreRegexes, err := compare.CompileIgnoreQueries(compareCfg.IgnoreQueries)
+	if err != nil {
+		return nil, fmt.Errorf("compiling ignore_queries: %w", err)
+	}
+
 	engine := compare.NewEngine(compare.EngineConfig{
-		IgnoreColumns:   ignoreColumns,
-		TimeThresholdMs: compareCfg.TimeThresholdMs,
+		IgnoreColumns:    ignoreColumns,
+		TimeThresholdMs:  compareCfg.TimeThresholdMs,
+		IgnoreQueryRegex: ignoreRegexes,
 	})
 
 	reporter, err := compare.NewReporter(compareCfg.OutputFile)
@@ -70,6 +83,13 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		ctx:      ctx,
 		cancel:   cancel,
 	}
+	// Default to enabled when *bool is nil (e.g. tests constructing
+	// ShadowConfig directly without going through config.applyDefaults).
+	initiallyEnabled := true
+	if cfg.Enabled != nil {
+		initiallyEnabled = *cfg.Enabled
+	}
+	s.enabled.Store(initiallyEnabled)
 
 	for i := 0; i < cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
@@ -80,16 +100,38 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 }
 
 func (s *ShadowSender) Send(sq ShadowQuery) {
+	// Fast-path: shadow paused via config toggle. Don't count against
+	// dropped (dropped means "tried to send but queue full"); use a
+	// separate disabled counter so the operator can see how many were
+	// intentionally skipped.
+	if !s.enabled.Load() {
+		s.disabled.Add(1)
+		metrics.Global.ShadowDisabled.Add(1)
+		return
+	}
+
 	// Always enforce read-only: never replay DML/DDL to shadow server.
 	if !IsReadOnly(sq.Query) {
 		s.skipped.Add(1)
+		metrics.Global.ShadowSkipped.Add(1)
+		return
+	}
+
+	// Short-circuit if closed to avoid a send-on-closed-channel race.
+	if s.closed.Load() {
+		s.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
 		return
 	}
 
 	select {
 	case s.queryCh <- sq:
+	case <-s.ctx.Done():
+		s.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
 	default:
 		s.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
 	}
 }
 
@@ -101,44 +143,116 @@ func (s *ShadowSender) Skipped() int64 {
 	return s.skipped.Load()
 }
 
+// SetEnabled toggles whether incoming queries are forwarded to the shadow
+// server. When disabled, Send() short-circuits and queries are counted
+// under shadow_disabled rather than replayed. Hot-reloadable.
+func (s *ShadowSender) SetEnabled(enabled bool) {
+	prev := s.enabled.Swap(enabled)
+	if prev != enabled {
+		slog.Info("shadow traffic toggled", "enabled", enabled)
+		if enabled {
+			metrics.Global.ShadowEnabledGauge.Store(1)
+		} else {
+			metrics.Global.ShadowEnabledGauge.Store(0)
+		}
+	}
+}
+
+func (s *ShadowSender) IsEnabled() bool {
+	return s.enabled.Load()
+}
+
 func (s *ShadowSender) Close() {
-	s.cancel()
-	close(s.queryCh)
-	s.wg.Wait()
-	s.reporter.Close()
-	s.pool.Close()
-	log.Printf("Shadow sender closed. Skipped non-SELECT queries: %d. Dropped (queue full): %d. %s",
-		s.skipped.Load(), s.dropped.Load(), s.reporter.Summary())
+	s.once.Do(func() {
+		// Mark closed first so Send() short-circuits. Then cancel the context
+		// to wake workers. We do NOT close the queryCh — that would race with
+		// in-flight Send() calls; workers exit via ctx.Done() instead.
+		s.closed.Store(true)
+		s.cancel()
+		s.wg.Wait()
+		s.reporter.Close()
+		s.pool.Close()
+		slog.Info("shadow sender closed",
+			"skipped_non_select", s.skipped.Load(),
+			"dropped_queue_full", s.dropped.Load(),
+			"summary", s.reporter.Summary())
+	})
 }
 
 func (s *ShadowSender) worker() {
 	defer s.wg.Done()
 
-	for sq := range s.queryCh {
+	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
-		}
-
-		conn, err := s.pool.Get()
-		if err != nil {
-			log.Printf("[shadow] failed to get connection: %v", err)
-			continue
-		}
-
-		replayResult, err := ExecuteAndCapture(conn, sq.Query)
-		s.pool.Put(conn)
-
-		if err != nil {
-			log.Printf("[shadow] execution error: %v", err)
-			continue
-		}
-
-		if sq.OrigResult != nil {
-			cmpResult := s.engine.Compare(sq.OrigResult, replayResult, sq.Query, sq.SessionID)
-			s.reporter.Record(cmpResult)
+		case sq := <-s.queryCh:
+			s.processQuery(sq)
 		}
 	}
 }
 
+// processQuery handles one shadow query with a timeout. If the shadow
+// backend is slow, we abandon the result rather than pin the worker.
+// Note: go-mysql's client.Execute has no native context support, so we
+// enforce the timeout by running Execute in a goroutine and dropping
+// the connection on timeout so the worker can move on.
+func (s *ShadowSender) processQuery(sq ShadowQuery) {
+	conn, err := s.pool.Get()
+	if err != nil {
+		slog.Error("shadow: failed to get connection", "err", err)
+		return
+	}
+
+	// Make sure the shadow connection is on the same database as the
+	// primary was when the query ran. Without this, queries with
+	// unqualified table references would hit the wrong schema (or
+	// fail on a fresh shadow connection with no default DB).
+	if sq.Database != "" && sq.Database != conn.GetDB() {
+		if _, err := conn.Execute("USE `" + sq.Database + "`"); err != nil {
+			slog.Error("shadow: USE failed", "db", sq.Database, "err", err)
+			s.pool.Put(conn)
+			return
+		}
+	}
+
+	type execResult struct {
+		result *compare.CapturedResult
+		err    error
+	}
+	done := make(chan execResult, 1)
+	go func() {
+		r, e := ExecuteAndCapture(conn, sq.Query, sq.Args...)
+		done <- execResult{r, e}
+	}()
+
+	timeout := s.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	select {
+	case res := <-done:
+		s.pool.Put(conn)
+		if res.err != nil {
+			slog.Error("shadow: execution error", "err", res.err)
+			return
+		}
+		metrics.Global.ShadowQueriesReplayed.Add(1)
+		if sq.OrigResult != nil {
+			cmpResult := s.engine.Compare(sq.OrigResult, res.result, sq.Query, sq.SessionID)
+			s.reporter.Record(cmpResult)
+		}
+	case <-time.After(timeout):
+		// Close the connection instead of returning it to the pool: the
+		// background Execute is still running on it. Close causes the
+		// Execute to error out, and the goroutine will GC once it returns.
+		slog.Warn("shadow: query timeout exceeded, dropping connection",
+			"timeout", timeout, "query", sq.Query)
+		conn.Close()
+		metrics.Global.ShadowDropped.Add(1)
+	case <-s.ctx.Done():
+		conn.Close()
+		return
+	}
+}

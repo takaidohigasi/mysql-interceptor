@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,7 @@ type BenchConfig struct {
 
 type ProxyConfig struct {
 	ListenAddr      string        `yaml:"listen_addr"`
+	MetricsAddr     string        `yaml:"metrics_addr"` // "" to disable; e.g. "127.0.0.1:9090"
 	MaxConnections  int           `yaml:"max_connections"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
@@ -57,9 +59,14 @@ type BackendSideTLSConfig struct {
 }
 
 type LoggingConfig struct {
-	Enabled    bool           `yaml:"enabled"`
-	OutputDir  string         `yaml:"output_dir"`
-	FilePrefix string         `yaml:"file_prefix"`
+	Enabled    bool   `yaml:"enabled"`
+	OutputDir  string `yaml:"output_dir"`
+	FilePrefix string `yaml:"file_prefix"`
+	// RedactArgs replaces prepared-statement bind values in logged entries
+	// with "<redacted>" so they never hit disk. Useful when queries may
+	// bind passwords, tokens, or other PII. The query text (with ?
+	// placeholders) is still recorded.
+	RedactArgs bool           `yaml:"redact_args"`
 	Rotation   RotationConfig `yaml:"rotation"`
 }
 
@@ -77,33 +84,50 @@ type ReplayConfig struct {
 }
 
 type ShadowConfig struct {
-	TargetAddr     string        `yaml:"target_addr"`
-	TargetUser     string        `yaml:"target_user"`
-	TargetPassword string        `yaml:"target_password"`
+	TargetAddr     string               `yaml:"target_addr"`
+	TargetUser     string               `yaml:"target_user"`
+	TargetPassword string               `yaml:"target_password"`
+	TLS            BackendSideTLSConfig `yaml:"tls"`
+	// Enabled gates whether live queries are forwarded to the shadow
+	// server. Hot-reloadable: set false in config to pause shadow sending
+	// without restarting the proxy (e.g. during shadow-server maintenance).
+	// Defaults to true when mode is "shadow".
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// ReadOnly is always enforced regardless of this flag — kept for backward
 	// compatibility and to make the safety behavior explicit in config files.
 	ReadOnly      bool          `yaml:"readonly"`
-	Async         bool          `yaml:"async"`
 	Timeout       time.Duration `yaml:"timeout"`
 	MaxConcurrent int           `yaml:"max_concurrent"`
 }
 
 type OfflineConfig struct {
-	InputDir             string  `yaml:"input_dir"`
-	FilePattern          string  `yaml:"file_pattern"`
-	TargetAddr           string  `yaml:"target_addr"`
-	TargetUser           string  `yaml:"target_user"`
-	TargetPassword       string  `yaml:"target_password"`
-	SpeedFactor          float64 `yaml:"speed_factor"`
-	Concurrency          int     `yaml:"concurrency"`
-	CheckpointFile       string  `yaml:"checkpoint_file"`
-	AutoDeleteCompleted  bool    `yaml:"auto_delete_completed"`
+	InputDir            string               `yaml:"input_dir"`
+	FilePattern         string               `yaml:"file_pattern"`
+	TargetAddr          string               `yaml:"target_addr"`
+	TargetUser          string               `yaml:"target_user"`
+	TargetPassword      string               `yaml:"target_password"`
+	TLS                 BackendSideTLSConfig `yaml:"tls"`
+	SpeedFactor         float64              `yaml:"speed_factor"`
+	Concurrency         int                  `yaml:"concurrency"`
+	CheckpointFile      string               `yaml:"checkpoint_file"`
+	AutoDeleteCompleted bool                 `yaml:"auto_delete_completed"`
 }
 
 type ComparisonConfig struct {
 	OutputFile      string   `yaml:"output_file"`
 	IgnoreColumns   []string `yaml:"ignore_columns"`
 	TimeThresholdMs float64  `yaml:"time_threshold_ms"`
+	// IgnoreQueries is a list of case-insensitive regular expressions.
+	// If the query text matches any pattern, the comparison result is
+	// marked Ignored=true and doesn't contribute to the diff count.
+	// Use this for queries that read server-local state and therefore
+	// always diverge between instances:
+	//   - "@@server_uuid"
+	//   - "@@hostname"
+	//   - "CONNECTION_ID\\s*\\("
+	//   - "LAST_INSERT_ID\\s*\\("
+	//   - "\\bNOW\\s*\\("
+	IgnoreQueries []string `yaml:"ignore_queries"`
 }
 
 func Load(path string) (*Config, error) {
@@ -157,6 +181,13 @@ func applyDefaults(cfg *Config) {
 	if cfg.Replay.Shadow.MaxConcurrent == 0 {
 		cfg.Replay.Shadow.MaxConcurrent = 100
 	}
+	// Shadow is enabled by default; only an explicit `enabled: false`
+	// disables it. We use *bool so "not set" is distinguishable from
+	// "set to false".
+	if cfg.Replay.Shadow.Enabled == nil {
+		t := true
+		cfg.Replay.Shadow.Enabled = &t
+	}
 	// Read-only filter is always applied. Setting the default to true here
 	// makes the behavior explicit for anyone inspecting the effective config.
 	cfg.Replay.Shadow.ReadOnly = true
@@ -192,6 +223,11 @@ func (c *Config) Validate() error {
 	if c.TLS.ClientSide.Enabled {
 		if c.TLS.ClientSide.CertFile == "" || c.TLS.ClientSide.KeyFile == "" {
 			return fmt.Errorf("tls.client_side.cert_file and key_file are required when TLS is enabled")
+		}
+	}
+	for i, pat := range c.Comparison.IgnoreQueries {
+		if _, err := regexp.Compile("(?i)" + pat); err != nil {
+			return fmt.Errorf("comparison.ignore_queries[%d] invalid regex %q: %w", i, pat, err)
 		}
 	}
 	return nil

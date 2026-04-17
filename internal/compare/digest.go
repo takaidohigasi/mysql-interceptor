@@ -27,6 +27,33 @@ func Digest(query string) string {
 	for i < len(query) {
 		ch := query[i]
 
+		// Strip /* ... */ block comments — their contents should never
+		// influence the digest (otherwise the same query with different
+		// trace IDs or annotations would produce distinct digests).
+		if ch == '/' && i+1 < len(query) && query[i+1] == '*' {
+			end := strings.Index(query[i+2:], "*/")
+			if end == -1 {
+				// Unterminated comment — treat the rest as consumed.
+				i = len(query)
+				continue
+			}
+			i += 2 + end + 2
+			continue
+		}
+
+		// Strip -- line comments (either "-- " at start or "--" followed
+		// by whitespace; MySQL requires the space after -- ).
+		if ch == '-' && i+1 < len(query) && query[i+1] == '-' &&
+			(i+2 >= len(query) || query[i+2] == ' ' || query[i+2] == '\t' || query[i+2] == '\n') {
+			nl := strings.IndexByte(query[i:], '\n')
+			if nl == -1 {
+				i = len(query)
+				continue
+			}
+			i += nl
+			continue
+		}
+
 		// Collapse whitespace runs into a single space
 		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
 			b.WriteByte(' ')
@@ -137,11 +164,12 @@ func Digest(query string) string {
 				depth := 1
 				j++
 				for j < len(query) && depth > 0 {
-					if query[j] == '(' {
+					switch query[j] {
+					case '(':
 						depth++
-					} else if query[j] == ')' {
+					case ')':
 						depth--
-					} else if query[j] == '\'' {
+					case '\'':
 						j++
 						for j < len(query) && query[j] != '\'' {
 							if query[j] == '\\' {
@@ -162,8 +190,13 @@ func Digest(query string) string {
 		i++
 	}
 
-	// Normalize to lowercase for consistent grouping
-	return strings.ToLower(strings.TrimSpace(b.String()))
+	// Collapse any runs of spaces that the comment-stripping pass may have
+	// introduced (a comment flanked by spaces leaves two spaces behind).
+	result := strings.ToLower(strings.TrimSpace(b.String()))
+	for strings.Contains(result, "  ") {
+		result = strings.ReplaceAll(result, "  ", " ")
+	}
+	return result
 }
 
 func isDigit(ch byte) bool {

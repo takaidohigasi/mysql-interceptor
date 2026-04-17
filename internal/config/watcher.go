@@ -1,9 +1,10 @@
 package config
 
 import (
-	"log"
+	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -67,14 +68,26 @@ func (w *Watcher) watchLoop() {
 			if eventAbs != absPath {
 				continue
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			// Many editors save via write-to-temp + rename; cover both
+			// the Write-in-place and the atomic-rename cases, plus the
+			// Remove event some editors produce before the rename lands.
+			reload := event.Op&fsnotify.Write != 0 ||
+				event.Op&fsnotify.Create != 0 ||
+				event.Op&fsnotify.Rename != 0 ||
+				event.Op&fsnotify.Remove != 0
+			if !reload {
 				continue
 			}
+			// For rename/remove we need a brief settle window so we read
+			// the new file, not a transient empty one.
+			if event.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
+				time.Sleep(50 * time.Millisecond)
+			}
 
-			log.Printf("config file changed, reloading...")
+			slog.Info("config file changed, reloading", "path", w.path)
 			cfg, err := Load(w.path)
 			if err != nil {
-				log.Printf("failed to reload config: %v", err)
+				slog.Error("failed to reload config", "err", err)
 				continue
 			}
 
@@ -86,13 +99,13 @@ func (w *Watcher) watchLoop() {
 			for _, fn := range callbacks {
 				fn(cfg)
 			}
-			log.Printf("config reloaded successfully")
+			slog.Info("config reloaded successfully")
 
 		case err, ok := <-w.fsWatcher.Errors:
 			if !ok {
 				return
 			}
-			log.Printf("config watcher error: %v", err)
+			slog.Error("config watcher error", "err", err)
 		}
 	}
 }

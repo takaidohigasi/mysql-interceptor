@@ -3,12 +3,14 @@ package compare
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"time"
 )
 
 type EngineConfig struct {
-	IgnoreColumns   map[string]bool
-	TimeThresholdMs float64
+	IgnoreColumns    map[string]bool
+	TimeThresholdMs  float64
+	IgnoreQueryRegex []*regexp.Regexp // if any match, result is marked Ignored
 }
 
 type Engine struct {
@@ -19,6 +21,34 @@ func NewEngine(cfg EngineConfig) *Engine {
 	return &Engine{cfg: cfg}
 }
 
+// CompileIgnoreQueries compiles a list of string patterns into case-
+// insensitive regular expressions. Returns an error if any pattern is
+// invalid. Helper for EngineConfig construction from string config.
+func CompileIgnoreQueries(patterns []string) ([]*regexp.Regexp, error) {
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+	out := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		re, err := regexp.Compile("(?i)" + p)
+		if err != nil {
+			return nil, fmt.Errorf("compiling ignore pattern %q: %w", p, err)
+		}
+		out = append(out, re)
+	}
+	return out, nil
+}
+
+// matchesIgnore reports whether the query matches any ignore pattern.
+func (e *Engine) matchesIgnore(query string) bool {
+	for _, re := range e.cfg.IgnoreQueryRegex {
+		if re.MatchString(query) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Engine) Compare(original, replay *CapturedResult, query string, sessionID uint64) *CompareResult {
 	result := &CompareResult{
 		Query:          query,
@@ -26,6 +56,7 @@ func (e *Engine) Compare(original, replay *CapturedResult, query string, session
 		SessionID:      sessionID,
 		Timestamp:      time.Now(),
 		Match:          true,
+		Ignored:        e.matchesIgnore(query),
 		OriginalTimeMs: float64(original.Duration.Microseconds()) / 1000.0,
 		ReplayTimeMs:   float64(replay.Duration.Microseconds()) / 1000.0,
 	}

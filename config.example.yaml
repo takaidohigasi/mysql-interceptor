@@ -1,5 +1,6 @@
 proxy:
   listen_addr: "0.0.0.0:3307"
+  metrics_addr: "127.0.0.1:9090"   # "" to disable; exposes /healthz, /metrics, /debug/vars
   max_connections: 1000
   shutdown_timeout: 30s
 
@@ -24,6 +25,7 @@ logging:
   enabled: true
   output_dir: "./logs"
   file_prefix: "queries"
+  redact_args: false       # set true to replace prepared-stmt bind values with <redacted>
   rotation:
     max_size_mb: 100
     max_age_days: 7
@@ -33,12 +35,16 @@ logging:
 replay:
   mode: "disabled"    # "disabled" | "shadow" | "offline"
   shadow:
+    enabled: true           # hot-reloadable: set false to pause shadow sending
     target_addr: "127.0.0.1:3307"
     target_user: "root"
     target_password: ""
+    tls:
+      enabled: false
+      ca_file: ""
+      skip_verify: false
     readonly: true          # always enforced — non-SELECT queries are never replayed
-    async: true
-    timeout: 5s
+    timeout: 5s             # per-query timeout; slow shadows are abandoned
     max_concurrent: 100
   offline:
     input_dir: "./logs"
@@ -46,6 +52,10 @@ replay:
     target_addr: "127.0.0.1:3308"
     target_user: "root"
     target_password: ""
+    tls:
+      enabled: false
+      ca_file: ""
+      skip_verify: false
     speed_factor: 1.0
     concurrency: 10
     checkpoint_file: "./logs/.replay-checkpoint.json"
@@ -55,6 +65,20 @@ comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at", "created_at"]
   time_threshold_ms: 100
+  # Queries that match any of these case-insensitive regexes are still
+  # recorded in the diff report but marked "ignored" instead of counted
+  # as differences. Use for queries that read server-local state and
+  # always diverge between MySQL instances.
+  ignore_queries:
+    - "@@server_uuid"
+    - "@@hostname"
+    - "@@server_id"
+    - "CONNECTION_ID\\s*\\("
+    - "LAST_INSERT_ID\\s*\\("
+    - "\\bNOW\\s*\\("
+    - "\\bCURRENT_TIMESTAMP\\b"
+    - "\\bUUID\\s*\\("
+    - "\\bRAND\\s*\\("
 
 bench:
   queries:

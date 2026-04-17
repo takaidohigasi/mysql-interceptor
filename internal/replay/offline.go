@@ -2,13 +2,15 @@ package replay
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
@@ -16,6 +18,12 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/logging"
 )
+
+// checkpointSaveInterval is how often the replayer persists its progress
+// count. SELECT replay is idempotent, so on restart an in-progress file is
+// simply restarted from the beginning — but the checkpoint still gives
+// operators a live view of replay progress.
+const checkpointSaveInterval = 5 * time.Second
 
 type OfflineReplayer struct {
 	cfg         config.OfflineConfig
@@ -34,7 +42,7 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 			User:     cfg.TargetUser,
 			Password: cfg.TargetPassword,
 		},
-		config.BackendSideTLSConfig{},
+		cfg.TLS,
 		cfg.Concurrency,
 	)
 
@@ -43,9 +51,15 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		ignoreColumns[col] = true
 	}
 
+	ignoreRegexes, err := compare.CompileIgnoreQueries(compareCfg.IgnoreQueries)
+	if err != nil {
+		return nil, fmt.Errorf("compiling ignore_queries: %w", err)
+	}
+
 	engine := compare.NewEngine(compare.EngineConfig{
-		IgnoreColumns:   ignoreColumns,
-		TimeThresholdMs: compareCfg.TimeThresholdMs,
+		IgnoreColumns:    ignoreColumns,
+		TimeThresholdMs:  compareCfg.TimeThresholdMs,
+		IgnoreQueryRegex: ignoreRegexes,
 	})
 
 	reporter, err := compare.NewReporter(compareCfg.OutputFile)
@@ -69,7 +83,11 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 	}, nil
 }
 
-func (r *OfflineReplayer) Run() error {
+// Run replays all matching log files. On context cancellation the
+// replayer stops at the next safe point (between files or between per-
+// session queries), persists the current checkpoint, and returns
+// context.Canceled so callers can distinguish "interrupted" from "error".
+func (r *OfflineReplayer) Run(ctx context.Context) error {
 	defer r.pool.Close()
 	defer r.reporter.Close()
 
@@ -79,32 +97,43 @@ func (r *OfflineReplayer) Run() error {
 	}
 
 	if len(files) == 0 {
-		log.Println("no log files found to replay")
+		slog.Info("no log files found to replay")
 		return nil
 	}
 
-	log.Printf("found %d log files to replay", len(files))
+	slog.Info("replaying log files", "count", len(files))
 
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			slog.Info("replay interrupted, stopping before next file",
+				"file", filepath.Base(file))
+			return err
+		}
+
 		basename := filepath.Base(file)
 		if r.checkpoint.IsCompleted(basename) {
-			log.Printf("skipping completed file: %s", basename)
+			slog.Info("skipping completed file", "file", basename)
 			continue
 		}
 
-		log.Printf("replaying file: %s", basename)
-		if err := r.replayFile(file); err != nil {
+		slog.Info("replaying file", "file", basename)
+		if err := r.replayFile(ctx, file); err != nil {
+			// If the context was cancelled mid-file, the checkpoint was
+			// already saved by the periodic saver; propagate cancel up.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return fmt.Errorf("replaying %s: %w", file, err)
 		}
 
 		if r.cfg.AutoDeleteCompleted {
 			if err := r.checkpoint.RemoveCompleted(r.cfg.InputDir); err != nil {
-				log.Printf("warning: failed to remove completed files: %v", err)
+				slog.Warn("failed to remove completed files", "err", err)
 			}
 		}
 	}
 
-	log.Println(r.reporter.Summary())
+	slog.Info("replay run complete", "summary", r.reporter.Summary())
 	return nil
 }
 
@@ -118,8 +147,25 @@ func (r *OfflineReplayer) findLogFiles() ([]string, error) {
 	return files, nil
 }
 
-func (r *OfflineReplayer) replayFile(filePath string) error {
+func (r *OfflineReplayer) replayFile(ctx context.Context, filePath string) error {
 	basename := filepath.Base(filePath)
+
+	// If this file was in_progress from a previous run, restart from the
+	// beginning. Mid-file resume is not safe under concurrent session replay
+	// (queries from different sessions interleave), so we rely on SELECT
+	// idempotency and re-run the whole file.
+	if progress := r.checkpoint.GetProgress(basename); progress != nil && progress.Status == "in_progress" {
+		slog.Info("restarting in_progress file from beginning",
+			"file", basename,
+			"previous_processed", progress.LinesReplayed)
+	}
+
+	// Mark file in_progress and persist immediately, so a crash before
+	// completion leaves a visible marker.
+	r.checkpoint.SetProgress(basename, 0)
+	if err := r.checkpoint.Save(); err != nil {
+		return fmt.Errorf("saving initial checkpoint: %w", err)
+	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -127,59 +173,57 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 	}
 	defer f.Close()
 
-	// Resume from checkpoint if available
-	var startOffset int64
-	var startLine int64
-	if progress := r.checkpoint.GetProgress(basename); progress != nil && progress.Status == "in_progress" {
-		startOffset = progress.ByteOffset
-		startLine = progress.LinesReplayed
-		if _, err := f.Seek(startOffset, 0); err != nil {
-			return fmt.Errorf("seeking to checkpoint offset: %w", err)
-		}
-		log.Printf("resuming from line %d (byte offset %d)", startLine, startOffset)
-	}
-
-	// Group entries by session for ordered replay
 	type sessionEntry struct {
-		entry  logging.LogEntry
-		offset int64
-		line   int64
+		entry logging.LogEntry
+		line  int64
 	}
 	sessions := make(map[uint64][]sessionEntry)
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
-	lineNum := startLine
-	currentOffset := startOffset
-
+	var lineNum int64
 	for scanner.Scan() {
 		lineNum++
-		lineBytes := scanner.Bytes()
-		currentOffset += int64(len(lineBytes)) + 1 // +1 for newline
-
 		var entry logging.LogEntry
-		if err := json.Unmarshal(lineBytes, &entry); err != nil {
-			log.Printf("skipping malformed line %d: %v", lineNum, err)
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			slog.Warn("skipping malformed line", "line", lineNum, "err", err)
 			continue
 		}
-
 		sessions[entry.SessionID] = append(sessions[entry.SessionID], sessionEntry{
-			entry:  entry,
-			offset: currentOffset,
-			line:   lineNum,
+			entry: entry,
+			line:  lineNum,
 		})
 	}
-
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scanning file: %w", err)
 	}
 
-	// Replay sessions concurrently
+	// Periodic checkpoint saver: every checkpointSaveInterval, persist the
+	// current processed count so operators have a live view of progress
+	// (and so a crash leaves meaningful state for post-mortem).
+	var processed atomic.Int64
+	stopSaver := make(chan struct{})
+	saverDone := make(chan struct{})
+	go func() {
+		defer close(saverDone)
+		ticker := time.NewTicker(checkpointSaveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopSaver:
+				return
+			case <-ticker.C:
+				r.checkpoint.SetProgress(basename, processed.Load())
+				if err := r.checkpoint.Save(); err != nil {
+					slog.Warn("periodic checkpoint save failed", "err", err)
+				}
+			}
+		}
+	}()
+
+	// Replay sessions concurrently.
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, r.cfg.Concurrency)
-	var lastLine int64
-	var lastOffset int64
-	var mu sync.Mutex
 
 	for sessionID, entries := range sessions {
 		wg.Add(1)
@@ -191,35 +235,42 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 			conn, err := r.pool.Get()
 			if err != nil {
-				log.Printf("[replay:session:%d] failed to get connection: %v", sid, err)
+				slog.Error("replay: failed to get connection",
+					"session_id", sid, "err", err)
 				return
 			}
 			defer r.pool.Put(conn)
 
 			var prevTimestamp time.Time
 			for _, se := range entries {
+				if ctx.Err() != nil {
+					return
+				}
 				// Safety: never replay DML/DDL against the target server.
 				if !IsReadOnly(se.entry.Query) {
 					continue
 				}
 
-				// Respect timing gaps (scaled by speed factor)
 				if !prevTimestamp.IsZero() && r.speedFactor > 0 {
 					gap := se.entry.Timestamp.Sub(prevTimestamp)
 					scaledGap := time.Duration(float64(gap) / r.speedFactor)
 					if scaledGap > 0 && scaledGap < 10*time.Second {
-						time.Sleep(scaledGap)
+						select {
+						case <-time.After(scaledGap):
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 				prevTimestamp = se.entry.Timestamp
 
-				replayResult, err := ExecuteAndCapture(conn, se.entry.Query)
+				replayResult, err := ExecuteAndCapture(conn, se.entry.Query, se.entry.Args...)
 				if err != nil {
-					log.Printf("[replay:session:%d] execution error: %v", sid, err)
+					slog.Error("replay: execution error",
+						"session_id", sid, "err", err)
 					continue
 				}
 
-				// Build original result from log entry for comparison
 				origResult := &compare.CapturedResult{
 					AffectedRows: se.entry.RowsAffected,
 					Error:        se.entry.Error,
@@ -228,27 +279,23 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 				cmpResult := r.engine.Compare(origResult, replayResult, se.entry.Query, sid)
 				r.reporter.Record(cmpResult)
-
-				mu.Lock()
-				if se.line > lastLine {
-					lastLine = se.line
-					lastOffset = se.offset
-				}
-				mu.Unlock()
+				processed.Add(1)
 			}
 		}(sessionID, entries)
 	}
 
 	wg.Wait()
+	close(stopSaver)
+	<-saverDone
 
-	// Mark file as completed
 	r.checkpoint.MarkCompleted(basename, lineNum)
 	if err := r.checkpoint.Save(); err != nil {
 		return fmt.Errorf("saving checkpoint: %w", err)
 	}
 
-	_ = lastOffset // used for intermediate checkpointing if needed in the future
-
-	log.Printf("completed replaying %s: %d lines processed", basename, lineNum-startLine)
+	slog.Info("completed replaying file",
+		"file", basename,
+		"lines_read", lineNum,
+		"queries_replayed", processed.Load())
 	return nil
 }

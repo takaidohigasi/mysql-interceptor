@@ -53,3 +53,134 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  bench:
+    name: Benchmark and append to release
+    needs: release
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: bench_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -prootpass"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Wait for MySQL to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpass --silent 2>/dev/null; then
+              echo "MySQL is ready"
+              break
+            fi
+            echo "Waiting for MySQL... ($i/30)"
+            sleep 2
+          done
+
+      - name: Seed benchmark data
+        run: |
+          mysql -h 127.0.0.1 -P 3306 -u root -prootpass bench_db <<'SQL'
+          CREATE TABLE IF NOT EXISTS users (
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            name VARCHAR(255) NOT NULL,
+            email VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          INSERT INTO users (name, email)
+          SELECT CONCAT('user_', n), CONCAT('user_', n, '@example.com')
+          FROM (
+            SELECT a.N + b.N * 10 + c.N * 100 AS n
+            FROM (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                  UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+                 (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                  UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+                 (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                  UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c
+          ) numbers;
+          SQL
+
+      - name: Build mysql-interceptor
+        run: make build
+
+      - name: Write bench config
+        run: |
+          cat > /tmp/bench-config.yaml <<'YAML'
+          proxy:
+            listen_addr: "127.0.0.1:3307"
+          backend:
+            addr: "127.0.0.1:3306"
+            user: "root"
+            password: "rootpass"
+            db: "bench_db"
+          logging:
+            enabled: false
+          replay:
+            mode: "disabled"
+          bench:
+            queries:
+              - "SELECT 1"
+              - "SELECT * FROM users WHERE id = 42"
+              - "SELECT id, name, email FROM users ORDER BY id LIMIT 100"
+              - "SELECT COUNT(*) FROM users"
+            concurrency: 4
+            iterations: 500
+            warmup_iterations: 50
+          YAML
+
+      - name: Start proxy in background
+        run: |
+          ./bin/mysql-interceptor serve --config /tmp/bench-config.yaml > /tmp/proxy.log 2>&1 &
+          echo "PROXY_PID=$!" >> $GITHUB_ENV
+          # Wait for proxy to be listening.
+          for i in $(seq 1 20); do
+            if mysqladmin ping -h 127.0.0.1 -P 3307 -u root -prootpass --silent 2>/dev/null; then
+              echo "Proxy is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run benchmark
+        run: |
+          ./bin/mysql-interceptor bench --config /tmp/bench-config.yaml --markdown-out /tmp/bench.md
+
+      - name: Append bench to proxy log on failure
+        if: failure()
+        run: cat /tmp/proxy.log
+
+      - name: Stop proxy
+        if: always()
+        run: |
+          if [ -n "${PROXY_PID:-}" ]; then
+            kill $PROXY_PID || true
+          fi
+
+      - name: Append benchmark results to release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Fetch existing release body, append bench markdown, and update.
+          EXISTING=$(gh release view "$TAG" --json body --jq '.body' || echo "")
+          {
+            echo "$EXISTING"
+            echo ""
+            echo "---"
+            echo ""
+            cat /tmp/bench.md
+            echo ""
+            echo "_Benchmarked on \`ubuntu-latest\` GitHub Actions runner against MySQL 8.0; 500 iterations, 4 concurrent workers, 50 warmup._"
+          } > /tmp/release-body.md
+          gh release edit "$TAG" --notes-file /tmp/release-body.md

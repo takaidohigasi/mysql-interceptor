@@ -4,20 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 type Reporter struct {
-	writer      io.WriteCloser
-	mu          sync.Mutex
-	enc         *json.Encoder
-	totalCount  atomic.Int64
-	matchCount  atomic.Int64
-	diffCount   atomic.Int64
-	digestStats *DigestStats
+	writer       io.WriteCloser
+	mu           sync.Mutex
+	enc          *json.Encoder
+	totalCount   atomic.Int64
+	matchCount   atomic.Int64
+	diffCount    atomic.Int64
+	ignoredCount atomic.Int64
+	digestStats  *DigestStats
 }
 
 func NewReporter(outputFile string) (*Reporter, error) {
@@ -44,10 +47,17 @@ func NewReporter(outputFile string) (*Reporter, error) {
 
 func (r *Reporter) Record(result *CompareResult) {
 	r.totalCount.Add(1)
-	if result.Match {
+	metrics.Global.ComparisonsTotal.Add(1)
+	switch {
+	case result.Ignored:
+		r.ignoredCount.Add(1)
+		metrics.Global.ComparisonsIgnored.Add(1)
+	case result.Match:
 		r.matchCount.Add(1)
-	} else {
+		metrics.Global.ComparisonsMatched.Add(1)
+	default:
 		r.diffCount.Add(1)
+		metrics.Global.ComparisonsDiffered.Add(1)
 	}
 
 	r.digestStats.Record(result)
@@ -56,7 +66,7 @@ func (r *Reporter) Record(result *CompareResult) {
 	defer r.mu.Unlock()
 
 	if err := r.enc.Encode(result); err != nil {
-		log.Printf("failed to write comparison result: %v", err)
+		slog.Error("failed to write comparison result", "err", err)
 	}
 }
 
@@ -64,8 +74,10 @@ func (r *Reporter) Summary() string {
 	total := r.totalCount.Load()
 	matched := r.matchCount.Load()
 	diffed := r.diffCount.Load()
+	ignored := r.ignoredCount.Load()
 
-	s := fmt.Sprintf("Comparison summary: total=%d matched=%d different=%d", total, matched, diffed)
+	s := fmt.Sprintf("Comparison summary: total=%d matched=%d different=%d ignored=%d",
+		total, matched, diffed, ignored)
 	s += r.digestStats.PrintSummary()
 	return s
 }

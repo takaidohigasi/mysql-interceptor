@@ -3,7 +3,8 @@ package bench
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"math"
 	"sort"
 	"sync"
@@ -22,10 +23,10 @@ type Config struct {
 }
 
 type Result struct {
-	Label    string
-	Query    string
-	Timings  []time.Duration
-	Errors   int
+	Label   string
+	Query   string
+	Timings []time.Duration
+	Errors  int
 }
 
 type BenchmarkReport struct {
@@ -69,21 +70,18 @@ func Run(cfg Config) (*BenchmarkReport, error) {
 	report := &BenchmarkReport{}
 
 	for _, query := range cfg.Queries {
-		log.Printf("benchmarking query: %s", truncateQuery(query, 80))
+		slog.Info("benchmarking query", "query", truncateQuery(query, 80))
 
-		// Warmup
-		log.Printf("  warming up (%d iterations)...", cfg.WarmupIters)
+		slog.Info("warmup", "iterations", cfg.WarmupIters)
 		runQuery(directDB, query, cfg.WarmupIters, 1)
 		runQuery(proxyDB, query, cfg.WarmupIters, 1)
 
-		// Benchmark direct
-		log.Printf("  direct: %d iterations, concurrency %d", cfg.Iterations, cfg.Concurrency)
+		slog.Info("bench direct", "iterations", cfg.Iterations, "concurrency", cfg.Concurrency)
 		directResult := runQuery(directDB, query, cfg.Iterations, cfg.Concurrency)
 		directResult.Label = "direct"
 		directResult.Query = query
 
-		// Benchmark proxy
-		log.Printf("  proxy:  %d iterations, concurrency %d", cfg.Iterations, cfg.Concurrency)
+		slog.Info("bench proxy", "iterations", cfg.Iterations, "concurrency", cfg.Concurrency)
 		proxyResult := runQuery(proxyDB, query, cfg.Iterations, cfg.Concurrency)
 		proxyResult.Label = "proxy"
 		proxyResult.Query = query
@@ -138,6 +136,66 @@ func runQuery(db *sql.DB, query string, iterations, concurrency int) Result {
 
 	wg.Wait()
 	return result
+}
+
+// WriteMarkdown writes a GitHub-flavored Markdown table of the benchmark
+// results, suitable for pasting into release notes or a PR description.
+func (r *BenchmarkReport) WriteMarkdown(w io.Writer) error {
+	fmt.Fprintln(w, "## Benchmark results")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Latency with and without the proxy in the path.")
+	fmt.Fprintln(w)
+
+	for i := range r.DirectResults {
+		direct := r.DirectResults[i]
+		proxy := r.ProxyResults[i]
+
+		fmt.Fprintf(w, "### `%s`\n\n", truncateQuery(direct.Query, 100))
+		fmt.Fprintln(w, "| Path | avg | p50 | p95 | p99 | min | max | stddev | errors |")
+		fmt.Fprintln(w, "|---|---|---|---|---|---|---|---|---|")
+		writeRow(w, "Direct", direct)
+		writeRow(w, "Proxy", proxy)
+
+		if len(direct.Timings) > 0 && len(proxy.Timings) > 0 {
+			directP50 := percentile(direct.Timings, 50)
+			proxyP50 := percentile(proxy.Timings, 50)
+			directP99 := percentile(direct.Timings, 99)
+			proxyP99 := percentile(proxy.Timings, 99)
+			fmt.Fprintln(w)
+			fmt.Fprintf(w, "**Overhead:** p50 %+.1f%% (%v → %v), p99 %+.1f%% (%v → %v)\n\n",
+				float64(proxyP50-directP50)/float64(directP50)*100,
+				directP50.Round(time.Microsecond),
+				proxyP50.Round(time.Microsecond),
+				float64(proxyP99-directP99)/float64(directP99)*100,
+				directP99.Round(time.Microsecond),
+				proxyP99.Round(time.Microsecond),
+			)
+		}
+	}
+	return nil
+}
+
+func writeRow(w io.Writer, label string, r Result) {
+	if len(r.Timings) == 0 {
+		fmt.Fprintf(w, "| %s | — | — | — | — | — | — | — | %d |\n", label, r.Errors)
+		return
+	}
+	sorted := make([]time.Duration, len(r.Timings))
+	copy(sorted, r.Timings)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	avg := mean(sorted)
+	fmt.Fprintf(w, "| %s | %v | %v | %v | %v | %v | %v | %v | %d |\n",
+		label,
+		avg.Round(time.Microsecond),
+		percentile(sorted, 50).Round(time.Microsecond),
+		percentile(sorted, 95).Round(time.Microsecond),
+		percentile(sorted, 99).Round(time.Microsecond),
+		sorted[0].Round(time.Microsecond),
+		sorted[len(sorted)-1].Round(time.Microsecond),
+		stddev(sorted, avg).Round(time.Microsecond),
+		r.Errors,
+	)
 }
 
 func (r *BenchmarkReport) Print() {

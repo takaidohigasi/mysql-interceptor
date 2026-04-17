@@ -2,7 +2,6 @@ package backend
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
@@ -12,7 +11,6 @@ type Pool struct {
 	cfg    config.BackendConfig
 	tlsCfg config.BackendSideTLSConfig
 	conns  chan *client.Conn
-	mu     sync.Mutex
 }
 
 func NewPool(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig, size int) *Pool {
