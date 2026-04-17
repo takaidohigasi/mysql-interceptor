@@ -200,10 +200,19 @@ func runReplay() {
 
 func runBench() {
 	configPath := "config.yaml"
+	markdownOut := ""
 	for i := 2; i < len(os.Args); i++ {
-		if os.Args[i] == "--config" && i+1 < len(os.Args) {
-			configPath = os.Args[i+1]
-			i++
+		switch os.Args[i] {
+		case "--config":
+			if i+1 < len(os.Args) {
+				configPath = os.Args[i+1]
+				i++
+			}
+		case "--markdown-out":
+			if i+1 < len(os.Args) {
+				markdownOut = os.Args[i+1]
+				i++
+			}
 		}
 	}
 
@@ -236,4 +245,16 @@ func runBench() {
 	}
 
 	report.Print()
+
+	if markdownOut != "" {
+		f, err := os.Create(markdownOut)
+		if err != nil {
+			fatal("failed to open markdown output", "path", markdownOut, "err", err)
+		}
+		defer f.Close()
+		if err := report.WriteMarkdown(f); err != nil {
+			fatal("failed to write markdown", "err", err)
+		}
+		slog.Info("wrote benchmark markdown", "path", markdownOut)
+	}
 }
