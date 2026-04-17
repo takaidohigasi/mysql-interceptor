@@ -1,0 +1,61 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gofmt
+    - goimports
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+
+linters-settings:
+  errcheck:
+    # APIs whose error returns are often intentionally dropped. Close/Fprint
+    # on stderr-bound writers have no meaningful recovery path.
+    exclude-functions:
+      - (io.Closer).Close
+      - (net.Conn).Close
+      - (net.Listener).Close
+      - fmt.Fprintln
+      - fmt.Fprintf
+      - fmt.Fprint
+  gosec:
+    excludes:
+      - G404 # use of weak rng is fine for reservoir sampling (non-crypto)
+      - G101 # password-shaped field names are false positives in config
+  revive:
+    rules:
+      - name: var-naming
+      - name: exported
+      - name: error-return
+      - name: error-strings
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: time-naming
+
+issues:
+  exclude-rules:
+    # Tests are allowed to drop cleanup error returns.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+    # These exported type names intentionally "stutter" — renaming would
+    # break the JSON output schema (CompareResult) and user-facing log
+    # identifiers (ProxyServer, ProxyHandler in tracebacks).
+    - text: "ProxyHandler|ProxyServer|CompareResult"
+      linters:
+        - revive
+    # Deliberately retained API methods used across packages and tests.
+    - text: "SetProgress|IsEnabled|Skipped|Dropped"
+      linters:
+        - unused

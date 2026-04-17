@@ -74,7 +74,7 @@ func (cp *Checkpoint) Save() error {
 
 	// Write atomically: write to temp file, then rename
 	tmpPath := cp.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return fmt.Errorf("writing checkpoint: %w", err)
 	}
 	if err := os.Rename(tmpPath, cp.path); err != nil {

@@ -38,8 +38,11 @@ func Connect(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*cli
 }
 
 func buildBackendTLSConfig(cfg config.BackendSideTLSConfig) (*tls.Config, error) {
+	// InsecureSkipVerify is a deliberate opt-in escape hatch controlled by
+	// the operator via config; the default is false.
 	tc := &tls.Config{
-		InsecureSkipVerify: cfg.SkipVerify,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: cfg.SkipVerify, //nolint:gosec // see above
 	}
 
 	if cfg.CAFile != "" {

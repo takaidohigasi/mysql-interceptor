@@ -272,6 +272,7 @@ func buildClientSideTLSConfig(cfg config.ClientSideTLSConfig) (*tls.Config, erro
 	}
 
 	tc := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{cert},
 	}
 

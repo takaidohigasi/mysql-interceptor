@@ -23,10 +23,10 @@ type Config struct {
 }
 
 type Result struct {
-	Label    string
-	Query    string
-	Timings  []time.Duration
-	Errors   int
+	Label   string
+	Query   string
+	Timings []time.Duration
+	Errors  int
 }
 
 type BenchmarkReport struct {
