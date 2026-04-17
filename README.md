@@ -156,13 +156,23 @@ comparison:
   time_threshold_ms: 100
 ```
 
-**Shadow filter evaluation** (per query):
+**Shadow filter evaluation** (per query, in order):
 
-1. If `shadow.enabled: false` → skipped (counter: `shadow_disabled`)
-2. If source IP matches any `excluded_source_cidrs` → filtered (counter: `shadow_filtered_by_cidr`)
-3. If `allowed_source_cidrs` is non-empty and source IP doesn't match → filtered (same counter)
-4. Non-SELECT query → skipped (counter: `shadow_skipped`)
-5. Otherwise → enqueued for replay
+1. `shadow.enabled: false` → skipped (counter: `shadow_disabled`)
+2. `shadow.sample_rate` roll fails → skipped (counter: `shadow_sampled_out`)
+3. Source IP matches any `excluded_source_cidrs` → filtered (counter: `shadow_filtered_by_cidr`)
+4. `allowed_source_cidrs` is non-empty and source IP doesn't match → filtered (same counter)
+5. Non-SELECT query → skipped (counter: `shadow_skipped`)
+6. Queue full → dropped (counter: `shadow_dropped`)
+7. Otherwise → enqueued for replay
+
+**Throttling under load:** `sample_rate` is a simple way to cap shadow overhead. `0.1` sends ~10% of queries to the shadow server. Combined with hot-reload, you can dial it down during high-traffic windows:
+
+```bash
+yq -i '.replay.shadow.sample_rate = 0.1' config.yaml   # cut shadow to 10%
+# later:
+yq -i '.replay.shadow.sample_rate = 1.0' config.yaml   # back to full
+```
 
 All four filter stages are observable via `/metrics`, so you can verify that a CIDR change is actually rejecting the intended traffic before trusting it.
 
@@ -277,7 +287,7 @@ Endpoints:
   - **Sessions:** `active_sessions`, `total_sessions`
   - **Queries:** `queries_handled`, `query_errors`
   - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
-  - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
+  - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
   - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`
 - `GET /debug/vars` — Go runtime stats via expvar
 

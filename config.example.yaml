@@ -26,6 +26,7 @@ logging:
   output_dir: "./logs"
   file_prefix: "queries"
   redact_args: false       # set true to replace prepared-stmt bind values with <redacted>
+  queue_size: 10000        # async log buffer; overflow → logger_dropped counter
   rotation:
     max_size_mb: 100
     max_age_days: 7
@@ -46,6 +47,8 @@ replay:
     readonly: true          # always enforced — non-SELECT queries are never replayed
     timeout: 5s             # per-query timeout; slow shadows are abandoned
     max_concurrent: 100
+    queue_size: 10000       # shadow queue buffer; overflow → shadow_dropped counter
+    sample_rate: 1.0        # fraction of queries to shadow (0.0–1.0); cap overhead under load
     # CIDR filters (hot-reloadable). Empty lists mean "no restriction".
     # Evaluation: exclude wins over allow — a source IP matching any
     # excluded_source_cidrs is never shadowed. If allowed_source_cidrs is
@@ -71,6 +74,7 @@ replay:
     concurrency: 10
     checkpoint_file: "./logs/.replay-checkpoint.json"
     auto_delete_completed: false
+    scanner_buffer_size_bytes: 1048576  # max single log-line length; bump if queries are huge
 
 comparison:
   output_file: "./logs/diff-report.jsonl"

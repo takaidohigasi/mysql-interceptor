@@ -113,6 +113,7 @@ func runServe() {
 			Enabled:    cfg.Logging.Enabled,
 			OutputDir:  cfg.Logging.OutputDir,
 			FilePrefix: cfg.Logging.FilePrefix,
+			QueueSize:  cfg.Logging.QueueSize,
 			MaxSizeMB:  cfg.Logging.Rotation.MaxSizeMB,
 			MaxAgeDays: cfg.Logging.Rotation.MaxAgeDays,
 			MaxBackups: cfg.Logging.Rotation.MaxBackups,
@@ -135,6 +136,7 @@ func runServe() {
 		slog.Info("shadow traffic initialized",
 			"target", cfg.Replay.Shadow.TargetAddr,
 			"enabled", shadowSender.IsEnabled(),
+			"sample_rate", shadowSender.SampleRate(),
 			"readonly_enforced", true)
 		if shadowSender.IsEnabled() {
 			metrics.Global.ShadowEnabledGauge.Store(1)
@@ -155,6 +157,11 @@ func runServe() {
 			if shadowSender != nil {
 				if newCfg.Replay.Shadow.Enabled != nil {
 					shadowSender.SetEnabled(*newCfg.Replay.Shadow.Enabled)
+				}
+				if newCfg.Replay.Shadow.SampleRate != nil {
+					if err := shadowSender.SetSampleRate(*newCfg.Replay.Shadow.SampleRate); err != nil {
+						slog.Warn("failed to update shadow sample_rate", "err", err)
+					}
 				}
 				if err := shadowSender.SetCIDRs(
 					newCfg.Replay.Shadow.AllowedSourceCIDRs,

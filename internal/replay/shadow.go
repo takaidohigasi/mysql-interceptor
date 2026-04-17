@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -26,16 +28,20 @@ type ShadowQuery struct {
 }
 
 type ShadowSender struct {
-	pool     *backend.Pool
-	queryCh  chan ShadowQuery
-	engine   *compare.Engine
-	reporter *compare.Reporter
-	timeout  time.Duration
-	dropped  atomic.Int64
-	skipped  atomic.Int64
-	disabled atomic.Int64 // counter for sends rejected because enabled=false
-	filtered atomic.Int64 // counter for sends rejected by CIDR filter
-	enabled  atomic.Bool
+	pool       *backend.Pool
+	queryCh    chan ShadowQuery
+	engine     *compare.Engine
+	reporter   *compare.Reporter
+	timeout    time.Duration
+	dropped    atomic.Int64
+	skipped    atomic.Int64
+	disabled   atomic.Int64 // counter for sends rejected because enabled=false
+	filtered   atomic.Int64 // counter for sends rejected by CIDR filter
+	sampledOut atomic.Int64 // counter for sends dropped by sample_rate
+	enabled    atomic.Bool
+	// sampleRateBits stores the float64 sample rate (in [0.0, 1.0]) via
+	// atomic uint64 bits. 1.0 = shadow all queries (default).
+	sampleRateBits atomic.Uint64
 	// allowedCIDRs and excludedCIDRs are atomic pointers to slices so
 	// the CIDR lists can be hot-reloaded without locking the Send path.
 	allowedCIDRs  atomic.Pointer[[]*net.IPNet]
@@ -81,9 +87,13 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	queueSize := cfg.QueueSize
+	if queueSize <= 0 {
+		queueSize = 10000
+	}
 	s := &ShadowSender{
 		pool:     pool,
-		queryCh:  make(chan ShadowQuery, 10000),
+		queryCh:  make(chan ShadowQuery, queueSize),
 		engine:   engine,
 		reporter: reporter,
 		timeout:  cfg.Timeout,
@@ -109,6 +119,13 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 	s.allowedCIDRs.Store(&allowed)
 	s.excludedCIDRs.Store(&excluded)
 
+	// Default sample rate is 1.0 (shadow everything) when nil.
+	initialRate := 1.0
+	if cfg.SampleRate != nil {
+		initialRate = *cfg.SampleRate
+	}
+	s.sampleRateBits.Store(math.Float64bits(initialRate))
+
 	for i := 0; i < cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
 		go s.worker()
@@ -125,6 +142,17 @@ func (s *ShadowSender) Send(sq ShadowQuery) {
 	if !s.enabled.Load() {
 		s.disabled.Add(1)
 		metrics.Global.ShadowDisabled.Add(1)
+		return
+	}
+
+	// Sample-rate check: a random fraction of queries can be dropped
+	// here to cap shadow overhead under high primary load. Evaluated
+	// before the more expensive CIDR/readonly checks so the sampling
+	// itself is cheap.
+	rate := math.Float64frombits(s.sampleRateBits.Load())
+	if rate < 1.0 && (rate <= 0.0 || rand.Float64() >= rate) {
+		s.sampledOut.Add(1)
+		metrics.Global.ShadowSampledOut.Add(1)
 		return
 	}
 
@@ -191,6 +219,29 @@ func (s *ShadowSender) IsEnabled() bool {
 // Filtered returns the count of sends rejected by the CIDR filter.
 func (s *ShadowSender) Filtered() int64 {
 	return s.filtered.Load()
+}
+
+// SampledOut returns the count of sends dropped by sample_rate.
+func (s *ShadowSender) SampledOut() int64 {
+	return s.sampledOut.Load()
+}
+
+// SampleRate returns the currently active sample rate.
+func (s *ShadowSender) SampleRate() float64 {
+	return math.Float64frombits(s.sampleRateBits.Load())
+}
+
+// SetSampleRate updates the fraction of primary queries forwarded to the
+// shadow. Must be in [0.0, 1.0]. Hot-reloadable.
+func (s *ShadowSender) SetSampleRate(rate float64) error {
+	if rate < 0.0 || rate > 1.0 {
+		return fmt.Errorf("sample_rate must be in [0.0, 1.0], got %v", rate)
+	}
+	prev := math.Float64frombits(s.sampleRateBits.Swap(math.Float64bits(rate)))
+	if prev != rate {
+		slog.Info("shadow sample rate updated", "rate", rate)
+	}
+	return nil
 }
 
 // SetCIDRs replaces the allow and exclude CIDR lists atomically.

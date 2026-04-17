@@ -67,8 +67,12 @@ type LoggingConfig struct {
 	// with "<redacted>" so they never hit disk. Useful when queries may
 	// bind passwords, tokens, or other PII. The query text (with ?
 	// placeholders) is still recorded.
-	RedactArgs bool           `yaml:"redact_args"`
-	Rotation   RotationConfig `yaml:"rotation"`
+	RedactArgs bool `yaml:"redact_args"`
+	// QueueSize bounds the async log channel. Larger = more burst tolerance
+	// but higher memory ceiling. Entries beyond the buffer are dropped
+	// (counted as logger_dropped). Default 10000.
+	QueueSize int            `yaml:"queue_size"`
+	Rotation  RotationConfig `yaml:"rotation"`
 }
 
 type RotationConfig struct {
@@ -107,6 +111,17 @@ type ShadowConfig struct {
 	ReadOnly      bool          `yaml:"readonly"`
 	Timeout       time.Duration `yaml:"timeout"`
 	MaxConcurrent int           `yaml:"max_concurrent"`
+	// QueueSize bounds the shadow query channel. Larger = more burst
+	// tolerance but higher memory ceiling. Sends beyond the buffer are
+	// counted as shadow_dropped. Default 10000.
+	QueueSize int `yaml:"queue_size"`
+	// SampleRate is the fraction of primary queries to forward to shadow,
+	// in [0.0, 1.0]. 1.0 = shadow all queries (default). 0.1 = shadow ~10%.
+	// Use to cap shadow overhead under high primary load; queries that
+	// don't get sampled are counted as shadow_sampled_out. Hot-reloadable.
+	// A pointer is used so "not set" (nil) can be distinguished from an
+	// explicit 0.0 (shadow nothing).
+	SampleRate *float64 `yaml:"sample_rate,omitempty"`
 }
 
 type OfflineConfig struct {
@@ -120,6 +135,10 @@ type OfflineConfig struct {
 	Concurrency         int                  `yaml:"concurrency"`
 	CheckpointFile      string               `yaml:"checkpoint_file"`
 	AutoDeleteCompleted bool                 `yaml:"auto_delete_completed"`
+	// ScannerBufferSizeBytes is the maximum line length the JSONL reader
+	// will accept. Lines longer than this are logged as malformed and
+	// skipped. Default 1 MiB.
+	ScannerBufferSizeBytes int `yaml:"scanner_buffer_size_bytes"`
 }
 
 type ComparisonConfig struct {
@@ -181,6 +200,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Logging.Rotation.MaxBackups == 0 {
 		cfg.Logging.Rotation.MaxBackups = 5
 	}
+	if cfg.Logging.QueueSize == 0 {
+		cfg.Logging.QueueSize = 10000
+	}
 	if cfg.Replay.Mode == "" {
 		cfg.Replay.Mode = "disabled"
 	}
@@ -190,12 +212,20 @@ func applyDefaults(cfg *Config) {
 	if cfg.Replay.Shadow.MaxConcurrent == 0 {
 		cfg.Replay.Shadow.MaxConcurrent = 100
 	}
+	if cfg.Replay.Shadow.QueueSize == 0 {
+		cfg.Replay.Shadow.QueueSize = 10000
+	}
 	// Shadow is enabled by default; only an explicit `enabled: false`
 	// disables it. We use *bool so "not set" is distinguishable from
 	// "set to false".
 	if cfg.Replay.Shadow.Enabled == nil {
 		t := true
 		cfg.Replay.Shadow.Enabled = &t
+	}
+	// Same rationale for sample_rate: nil → default 1.0 (shadow all).
+	if cfg.Replay.Shadow.SampleRate == nil {
+		r := 1.0
+		cfg.Replay.Shadow.SampleRate = &r
 	}
 	// Read-only filter is always applied. Setting the default to true here
 	// makes the behavior explicit for anyone inspecting the effective config.
@@ -205,6 +235,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Replay.Offline.Concurrency == 0 {
 		cfg.Replay.Offline.Concurrency = 10
+	}
+	if cfg.Replay.Offline.ScannerBufferSizeBytes == 0 {
+		cfg.Replay.Offline.ScannerBufferSizeBytes = 1024 * 1024 // 1 MiB
 	}
 	if cfg.Bench.Concurrency == 0 {
 		cfg.Bench.Concurrency = 1
@@ -237,6 +270,12 @@ func (c *Config) Validate() error {
 	for i, pat := range c.Comparison.IgnoreQueries {
 		if _, err := regexp.Compile("(?i)" + pat); err != nil {
 			return fmt.Errorf("comparison.ignore_queries[%d] invalid regex %q: %w", i, pat, err)
+		}
+	}
+	if c.Replay.Shadow.SampleRate != nil {
+		r := *c.Replay.Shadow.SampleRate
+		if r < 0.0 || r > 1.0 {
+			return fmt.Errorf("replay.shadow.sample_rate must be in [0.0, 1.0], got %v", r)
 		}
 	}
 	for i, cidr := range c.Replay.Shadow.AllowedSourceCIDRs {
