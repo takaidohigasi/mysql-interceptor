@@ -23,8 +23,8 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Unit tests
-        run: go test -v -count=1 ./internal/...
+      - name: Unit tests (with race detector)
+        run: go test -v -race -count=1 ./internal/...
 
   integration-test:
     name: Integration Tests (2 MySQL servers)
@@ -100,11 +100,11 @@ jobs:
           echo "=== Secondary: orders (should fail) ==="
           mysql -h 127.0.0.1 -P 3307 -u root -prootpass test_db -e "SELECT COUNT(*) FROM orders;" 2>&1 || echo "Expected: orders table does not exist on secondary"
 
-      - name: Run integration tests
+      - name: Run integration tests (with race detector)
         env:
           MYSQL1_ADDR: "127.0.0.1:3306"
           MYSQL2_ADDR: "127.0.0.1:3307"
-        run: go test -v -count=1 -timeout=120s ./test/...
+        run: go test -v -race -count=1 -timeout=120s ./test/...
 
   docker-build:
     name: Docker Build
