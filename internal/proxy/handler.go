@@ -54,13 +54,13 @@ func (h *ProxyHandler) HandleQuery(query string) (*mysql.Result, error) {
 	result, err := h.backend.Execute(query)
 	duration := time.Since(start)
 
-	h.afterExecute("query", query, nil, result, err, duration)
+	h.afterExecute("query", query, nil, start, duration, result, err)
 	return result, err
 }
 
 // afterExecute handles the post-execution bookkeeping (logging + shadow
 // forwarding) common to HandleQuery and HandleStmtExecute.
-func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{}, result *mysql.Result, err error, duration time.Duration) {
+func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{}, start time.Time, duration time.Duration, result *mysql.Result, err error) {
 	metrics.Global.QueriesHandled.Add(1)
 	if err != nil {
 		metrics.Global.QueryErrors.Add(1)
@@ -68,7 +68,7 @@ func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{},
 
 	if h.logQuery != nil {
 		evt := QueryEvent{
-			Timestamp: time.Now().Add(-duration),
+			Timestamp: start,
 			SessionID: h.sessionID,
 			QueryType: queryType,
 			Query:     query,
@@ -149,7 +149,7 @@ func (h *ProxyHandler) HandleStmtExecute(ctx interface{}, query string, args []i
 	result, err := ps.backend.Execute(args...)
 	duration := time.Since(start)
 
-	h.afterExecute("execute", ps.query, args, result, err, duration)
+	h.afterExecute("execute", ps.query, args, start, duration, result, err)
 	return result, err
 }
 

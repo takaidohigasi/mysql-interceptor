@@ -91,7 +91,6 @@ type ShadowConfig struct {
 	// ReadOnly is always enforced regardless of this flag — kept for backward
 	// compatibility and to make the safety behavior explicit in config files.
 	ReadOnly      bool          `yaml:"readonly"`
-	Async         bool          `yaml:"async"`
 	Timeout       time.Duration `yaml:"timeout"`
 	MaxConcurrent int           `yaml:"max_concurrent"`
 }

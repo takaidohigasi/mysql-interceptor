@@ -25,7 +25,7 @@ func TestCheckpoint_SaveAndLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cp.SetProgress("queries-001.jsonl", 500, 102400)
+	cp.SetProgress("queries-001.jsonl", 500)
 	cp.MarkCompleted("queries-000.jsonl", 1000)
 
 	if err := cp.Save(); err != nil {
@@ -49,8 +49,8 @@ func TestCheckpoint_SaveAndLoad(t *testing.T) {
 	if prog == nil {
 		t.Fatal("expected progress for queries-001.jsonl")
 	}
-	if prog.LinesReplayed != 500 || prog.ByteOffset != 102400 {
-		t.Errorf("expected 500 lines / 102400 offset, got %d / %d", prog.LinesReplayed, prog.ByteOffset)
+	if prog.LinesReplayed != 500 {
+		t.Errorf("expected 500 lines, got %d", prog.LinesReplayed)
 	}
 }
 

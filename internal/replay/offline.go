@@ -146,7 +146,7 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 	// Mark file in_progress and persist immediately, so a crash before
 	// completion leaves a visible marker.
-	r.checkpoint.SetProgress(basename, 0, 0)
+	r.checkpoint.SetProgress(basename, 0)
 	if err := r.checkpoint.Save(); err != nil {
 		return fmt.Errorf("saving initial checkpoint: %w", err)
 	}
@@ -197,7 +197,7 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 			case <-stopSaver:
 				return
 			case <-ticker.C:
-				r.checkpoint.SetProgress(basename, processed.Load(), 0)
+				r.checkpoint.SetProgress(basename, processed.Load())
 				if err := r.checkpoint.Save(); err != nil {
 					slog.Warn("periodic checkpoint save failed", "err", err)
 				}

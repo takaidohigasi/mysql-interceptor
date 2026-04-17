@@ -30,14 +30,17 @@ type DigestEntry struct {
 	ErrorCount  int    `json:"error_count"`
 
 	// Exact running sums for accurate mean regardless of reservoir size.
-	OriginalSum   float64
-	OriginalCount int
-	ReplaySum     float64
-	ReplayCount   int
+	// These are internal-only: the public JSON output uses DigestSummary
+	// which exposes avg/p95/p99 derived from these.
+	OriginalSum   float64 `json:"-"`
+	OriginalCount int     `json:"-"`
+	ReplaySum     float64 `json:"-"`
+	ReplayCount   int     `json:"-"`
 
-	// Bounded reservoirs for percentile estimation.
-	OriginalTimes []float64
-	ReplayTimes   []float64
+	// Bounded reservoirs for percentile estimation. Up to maxReservoirSize
+	// floats each — never marshaled directly.
+	OriginalTimes []float64 `json:"-"`
+	ReplayTimes   []float64 `json:"-"`
 }
 
 type DigestSummary struct {

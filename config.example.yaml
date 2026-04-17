@@ -43,8 +43,7 @@ replay:
       ca_file: ""
       skip_verify: false
     readonly: true          # always enforced — non-SELECT queries are never replayed
-    async: true
-    timeout: 5s
+    timeout: 5s             # per-query timeout; slow shadows are abandoned
     max_concurrent: 100
   offline:
     input_dir: "./logs"

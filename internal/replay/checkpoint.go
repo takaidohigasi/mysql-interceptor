@@ -15,9 +15,8 @@ type Checkpoint struct {
 }
 
 type FileProgress struct {
-	Status       string `json:"status"` // "in_progress", "completed"
+	Status        string `json:"status"` // "in_progress", "completed"
 	LinesReplayed int64  `json:"lines_replayed"`
-	ByteOffset   int64  `json:"byte_offset"`
 }
 
 func LoadCheckpoint(path string) (*Checkpoint, error) {
@@ -46,11 +45,10 @@ func (cp *Checkpoint) GetProgress(filename string) *FileProgress {
 	return cp.Files[filename]
 }
 
-func (cp *Checkpoint) SetProgress(filename string, linesReplayed int64, byteOffset int64) {
+func (cp *Checkpoint) SetProgress(filename string, linesReplayed int64) {
 	cp.Files[filename] = &FileProgress{
 		Status:        "in_progress",
 		LinesReplayed: linesReplayed,
-		ByteOffset:    byteOffset,
 	}
 }
 
