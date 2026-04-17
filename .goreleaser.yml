@@ -1,0 +1,77 @@
+version: 2
+
+project_name: mysql-interceptor
+
+builds:
+  - id: mysql-interceptor
+    main: ./cmd/mysql-interceptor
+    binary: mysql-interceptor
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.CommitDate}}
+
+archives:
+  - format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+      - config.example.yaml
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+dockers:
+  - image_templates:
+      - "ghcr.io/takaidohigasi/mysql-interceptor:{{ .Tag }}"
+      - "ghcr.io/takaidohigasi/mysql-interceptor:latest"
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+
+release:
+  github:
+    owner: takaidohigasi
+    name: mysql-interceptor
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
+
+changelog:
+  use: git
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^.*?(fix|bug)(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Performance
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^chore:"
+      - "^test:"
+      - "^docs:"
+      - Merge pull request
+      - Merge branch

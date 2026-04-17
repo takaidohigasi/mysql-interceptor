@@ -14,6 +14,12 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -27,6 +33,8 @@ func main() {
 		runReplay()
 	case "bench":
 		runBench()
+	case "version":
+		fmt.Printf("mysql-interceptor %s (commit: %s, built: %s)\n", version, commit, date)
 	default:
 		printUsage()
 		os.Exit(1)
@@ -39,6 +47,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  serve    Start the MySQL proxy server")
 	fmt.Fprintln(os.Stderr, "  replay   Replay recorded queries from log files")
 	fmt.Fprintln(os.Stderr, "  bench    Run benchmarks comparing direct vs proxy performance")
+	fmt.Fprintln(os.Stderr, "  version  Print version information")
 	fmt.Fprintln(os.Stderr, "\nOptions:")
 	fmt.Fprintln(os.Stderr, "  --config <path>   Path to config file (default: config.yaml)")
 }

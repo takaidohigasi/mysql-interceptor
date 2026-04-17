@@ -1,0 +1,8 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates
+
+COPY mysql-interceptor /usr/local/bin/mysql-interceptor
+
+ENTRYPOINT ["mysql-interceptor"]
+CMD ["serve", "--config", "/etc/mysql-interceptor/config.yaml"]
