@@ -1,6 +1,7 @@
 package compare
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +140,43 @@ func TestDigestStats_PrintSummary(t *testing.T) {
 	}
 	if !strings.Contains(output, "select * from users where id = ?") {
 		t.Errorf("expected normalized digest in output, got:\n%s", output)
+	}
+}
+
+func TestDigestStats_ReservoirBounded(t *testing.T) {
+	ds := NewDigestStats()
+
+	// Record far more than maxReservoirSize to ensure the reservoir caps.
+	const n = maxReservoirSize * 3
+	for i := 1; i <= n; i++ {
+		ds.Record(&CompareResult{
+			Query:          "SELECT 1",
+			Match:          true,
+			OriginalTimeMs: float64(i),
+			ReplayTimeMs:   float64(i) * 1.1,
+		})
+	}
+
+	ds.mu.Lock()
+	entry := ds.digests["select ?"]
+	ds.mu.Unlock()
+
+	if entry == nil {
+		t.Fatal("expected digest entry to exist")
+	}
+	if len(entry.OriginalTimes) != maxReservoirSize {
+		t.Errorf("expected reservoir capped at %d, got %d", maxReservoirSize, len(entry.OriginalTimes))
+	}
+	if entry.OriginalCount != n {
+		t.Errorf("expected exact count %d, got %d", n, entry.OriginalCount)
+	}
+
+	// Avg must be exact — computed from running sum, not the reservoir.
+	// avg of 1..n = (n+1)/2
+	summaries := ds.Summaries()
+	expectedAvg := float64(n+1) / 2
+	if math.Abs(summaries[0].OriginalAvg-expectedAvg) > 0.01 {
+		t.Errorf("expected exact avg %.2f, got %.2f", expectedAvg, summaries[0].OriginalAvg)
 	}
 }
 

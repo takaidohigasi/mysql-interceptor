@@ -5,9 +5,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"sort"
 	"sync"
 )
+
+// maxReservoirSize bounds the per-digest timing sample size. With a
+// uniform reservoir of this size, p99 estimates are backed by ~100
+// samples — enough for stable tail-latency numbers — while memory per
+// digest stays O(10k floats) regardless of how long the process runs.
+const maxReservoirSize = 10000
 
 type DigestStats struct {
 	mu      sync.Mutex
@@ -15,32 +22,40 @@ type DigestStats struct {
 }
 
 type DigestEntry struct {
-	Digest        string    `json:"digest"`
-	SampleQuery   string    `json:"sample_query"`
-	Count         int       `json:"count"`
-	MatchCount    int       `json:"match_count"`
-	DiffCount     int       `json:"diff_count"`
-	ErrorCount    int       `json:"error_count"`
-	OriginalTimes []float64 `json:"-"`
-	ReplayTimes   []float64 `json:"-"`
+	Digest      string `json:"digest"`
+	SampleQuery string `json:"sample_query"`
+	Count       int    `json:"count"`
+	MatchCount  int    `json:"match_count"`
+	DiffCount   int    `json:"diff_count"`
+	ErrorCount  int    `json:"error_count"`
+
+	// Exact running sums for accurate mean regardless of reservoir size.
+	OriginalSum   float64
+	OriginalCount int
+	ReplaySum     float64
+	ReplayCount   int
+
+	// Bounded reservoirs for percentile estimation.
+	OriginalTimes []float64
+	ReplayTimes   []float64
 }
 
 type DigestSummary struct {
-	Digest       string  `json:"digest"`
-	SampleQuery  string  `json:"sample_query"`
-	Count        int     `json:"count"`
-	MatchCount   int     `json:"match_count"`
-	DiffCount    int     `json:"diff_count"`
-	ErrorCount   int     `json:"error_count"`
-	OriginalAvg  float64 `json:"original_avg_ms"`
-	OriginalP95  float64 `json:"original_p95_ms"`
-	OriginalP99  float64 `json:"original_p99_ms"`
-	ReplayAvg    float64 `json:"replay_avg_ms"`
-	ReplayP95    float64 `json:"replay_p95_ms"`
-	ReplayP99    float64 `json:"replay_p99_ms"`
-	OverheadAvg  float64 `json:"overhead_avg_ms"`
-	OverheadP95  float64 `json:"overhead_p95_ms"`
-	OverheadP99  float64 `json:"overhead_p99_ms"`
+	Digest      string  `json:"digest"`
+	SampleQuery string  `json:"sample_query"`
+	Count       int     `json:"count"`
+	MatchCount  int     `json:"match_count"`
+	DiffCount   int     `json:"diff_count"`
+	ErrorCount  int     `json:"error_count"`
+	OriginalAvg float64 `json:"original_avg_ms"`
+	OriginalP95 float64 `json:"original_p95_ms"`
+	OriginalP99 float64 `json:"original_p99_ms"`
+	ReplayAvg   float64 `json:"replay_avg_ms"`
+	ReplayP95   float64 `json:"replay_p95_ms"`
+	ReplayP99   float64 `json:"replay_p99_ms"`
+	OverheadAvg float64 `json:"overhead_avg_ms"`
+	OverheadP95 float64 `json:"overhead_p95_ms"`
+	OverheadP99 float64 `json:"overhead_p99_ms"`
 }
 
 func NewDigestStats() *DigestStats {
@@ -78,8 +93,31 @@ func (ds *DigestStats) Record(result *CompareResult) {
 		}
 	}
 
-	entry.OriginalTimes = append(entry.OriginalTimes, result.OriginalTimeMs)
-	entry.ReplayTimes = append(entry.ReplayTimes, result.ReplayTimeMs)
+	// Running sums stay exact.
+	entry.OriginalSum += result.OriginalTimeMs
+	entry.OriginalCount++
+	entry.ReplaySum += result.ReplayTimeMs
+	entry.ReplayCount++
+
+	// Bounded reservoir for percentile estimates.
+	entry.OriginalTimes = reservoirAdd(entry.OriginalTimes, result.OriginalTimeMs, entry.OriginalCount)
+	entry.ReplayTimes = reservoirAdd(entry.ReplayTimes, result.ReplayTimeMs, entry.ReplayCount)
+}
+
+// reservoirAdd implements Vitter's Algorithm R: the first maxReservoirSize
+// samples fill the reservoir; subsequent samples replace a random slot with
+// probability maxReservoirSize/n, preserving a uniform sample of all
+// observations seen so far. n is the 1-indexed count of the current value.
+func reservoirAdd(reservoir []float64, v float64, n int) []float64 {
+	if len(reservoir) < maxReservoirSize {
+		return append(reservoir, v)
+	}
+	// With probability k/n, replace a random slot.
+	j := rand.IntN(n)
+	if j < maxReservoirSize {
+		reservoir[j] = v
+	}
+	return reservoir
 }
 
 func (ds *DigestStats) Summaries() []DigestSummary {
@@ -97,25 +135,24 @@ func (ds *DigestStats) Summaries() []DigestSummary {
 			ErrorCount:  entry.ErrorCount,
 		}
 
-		if len(entry.OriginalTimes) > 0 {
-			s.OriginalAvg = mean64(entry.OriginalTimes)
+		if entry.OriginalCount > 0 {
+			s.OriginalAvg = round2(entry.OriginalSum / float64(entry.OriginalCount))
 			s.OriginalP95 = percentile64(entry.OriginalTimes, 95)
 			s.OriginalP99 = percentile64(entry.OriginalTimes, 99)
 		}
-		if len(entry.ReplayTimes) > 0 {
-			s.ReplayAvg = mean64(entry.ReplayTimes)
+		if entry.ReplayCount > 0 {
+			s.ReplayAvg = round2(entry.ReplaySum / float64(entry.ReplayCount))
 			s.ReplayP95 = percentile64(entry.ReplayTimes, 95)
 			s.ReplayP99 = percentile64(entry.ReplayTimes, 99)
 		}
 
-		s.OverheadAvg = s.ReplayAvg - s.OriginalAvg
-		s.OverheadP95 = s.ReplayP95 - s.OriginalP95
-		s.OverheadP99 = s.ReplayP99 - s.OriginalP99
+		s.OverheadAvg = round2(s.ReplayAvg - s.OriginalAvg)
+		s.OverheadP95 = round2(s.ReplayP95 - s.OriginalP95)
+		s.OverheadP99 = round2(s.ReplayP99 - s.OriginalP99)
 
 		summaries = append(summaries, s)
 	}
 
-	// Sort by count descending (most frequent digests first)
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].Count > summaries[j].Count
 	})
@@ -161,17 +198,6 @@ func (ds *DigestStats) WriteJSON(w io.Writer) error {
 		}
 	}
 	return nil
-}
-
-func mean64(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, v := range values {
-		sum += v
-	}
-	return round2(sum / float64(len(values)))
 }
 
 func percentile64(values []float64, p float64) float64 {
