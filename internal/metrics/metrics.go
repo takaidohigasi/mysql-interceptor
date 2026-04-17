@@ -18,22 +18,24 @@ import (
 // Counters holds the metrics the server exposes. Fields are pointers to
 // atomic Int64 so handlers can observe them without a mutex.
 type Counters struct {
-	ActiveSessions        atomic.Int64
-	TotalSessions         atomic.Int64
-	QueriesHandled        atomic.Int64
-	QueryErrors           atomic.Int64
-	LoggerDropped         atomic.Int64
-	ShadowDropped         atomic.Int64
-	ShadowSkipped         atomic.Int64
-	ShadowDisabled        atomic.Int64 // sends rejected because shadow.enabled=false
-	ShadowSampledOut      atomic.Int64 // sends dropped by sample_rate roll
-	ShadowFilteredByCIDR  atomic.Int64 // sends rejected by CIDR allow/exclude filter
-	ShadowEnabledGauge    atomic.Int64 // 0 or 1; current toggle state
-	ShadowQueriesReplayed atomic.Int64
-	ComparisonsTotal      atomic.Int64
-	ComparisonsMatched    atomic.Int64
-	ComparisonsDiffered   atomic.Int64
-	ComparisonsIgnored    atomic.Int64
+	ActiveSessions         atomic.Int64
+	TotalSessions          atomic.Int64
+	QueriesHandled         atomic.Int64
+	QueryErrors            atomic.Int64
+	LoggerDropped          atomic.Int64
+	ShadowDropped          atomic.Int64
+	ShadowSkipped          atomic.Int64
+	ShadowDisabled         atomic.Int64 // sends rejected because shadow.enabled=false
+	ShadowSampledOut       atomic.Int64 // sends dropped by sample_rate roll
+	ShadowFilteredByCIDR   atomic.Int64 // sends rejected by CIDR allow/exclude filter
+	ShadowEnabledGauge     atomic.Int64 // 0 or 1; current toggle state
+	ShadowQueriesReplayed  atomic.Int64
+	ComparisonsTotal       atomic.Int64
+	ComparisonsMatched     atomic.Int64
+	ComparisonsDiffered    atomic.Int64
+	ComparisonsIgnored     atomic.Int64
+	ComparisonsDigestOver  atomic.Int64 // new digests dropped because cap hit
+	ComparisonsDigestCount atomic.Int64 // current unique digests tracked (gauge)
 }
 
 // Global is the singleton counter set. Components increment fields on it
@@ -99,22 +101,24 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	snap := map[string]int64{
-		"active_sessions":         Global.ActiveSessions.Load(),
-		"total_sessions":          Global.TotalSessions.Load(),
-		"queries_handled":         Global.QueriesHandled.Load(),
-		"query_errors":            Global.QueryErrors.Load(),
-		"logger_dropped":          Global.LoggerDropped.Load(),
-		"shadow_dropped":          Global.ShadowDropped.Load(),
-		"shadow_skipped":          Global.ShadowSkipped.Load(),
-		"shadow_disabled":         Global.ShadowDisabled.Load(),
-		"shadow_sampled_out":      Global.ShadowSampledOut.Load(),
-		"shadow_filtered_by_cidr": Global.ShadowFilteredByCIDR.Load(),
-		"shadow_enabled":          Global.ShadowEnabledGauge.Load(),
-		"shadow_queries_replayed": Global.ShadowQueriesReplayed.Load(),
-		"comparisons_total":       Global.ComparisonsTotal.Load(),
-		"comparisons_matched":     Global.ComparisonsMatched.Load(),
-		"comparisons_differed":    Global.ComparisonsDiffered.Load(),
-		"comparisons_ignored":     Global.ComparisonsIgnored.Load(),
+		"active_sessions":             Global.ActiveSessions.Load(),
+		"total_sessions":              Global.TotalSessions.Load(),
+		"queries_handled":             Global.QueriesHandled.Load(),
+		"query_errors":                Global.QueryErrors.Load(),
+		"logger_dropped":              Global.LoggerDropped.Load(),
+		"shadow_dropped":              Global.ShadowDropped.Load(),
+		"shadow_skipped":              Global.ShadowSkipped.Load(),
+		"shadow_disabled":             Global.ShadowDisabled.Load(),
+		"shadow_sampled_out":          Global.ShadowSampledOut.Load(),
+		"shadow_filtered_by_cidr":     Global.ShadowFilteredByCIDR.Load(),
+		"shadow_enabled":              Global.ShadowEnabledGauge.Load(),
+		"shadow_queries_replayed":     Global.ShadowQueriesReplayed.Load(),
+		"comparisons_total":           Global.ComparisonsTotal.Load(),
+		"comparisons_matched":         Global.ComparisonsMatched.Load(),
+		"comparisons_differed":        Global.ComparisonsDiffered.Load(),
+		"comparisons_ignored":         Global.ComparisonsIgnored.Load(),
+		"comparisons_digest_overflow": Global.ComparisonsDigestOver.Load(),
+		"comparisons_digest_count":    Global.ComparisonsDigestCount.Load(),
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

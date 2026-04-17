@@ -62,7 +62,7 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		IgnoreQueryRegex: ignoreRegexes,
 	})
 
-	reporter, err := compare.NewReporter(compareCfg.OutputFile)
+	reporter, err := compare.NewReporterWithDigestCap(compareCfg.OutputFile, compareCfg.MaxUniqueDigests)
 	if err != nil {
 		return nil, fmt.Errorf("creating reporter: %w", err)
 	}

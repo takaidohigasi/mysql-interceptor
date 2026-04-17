@@ -80,6 +80,8 @@ comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at", "created_at"]
   time_threshold_ms: 100
+  max_unique_digests: 10000    # cap on unique query patterns tracked
+                               # (each entry ≤ ~160 KB; overflow → counter)
   # Queries that match any of these case-insensitive regexes are still
   # recorded in the diff report but marked "ignored" instead of counted
   # as differences. Use for queries that read server-local state and

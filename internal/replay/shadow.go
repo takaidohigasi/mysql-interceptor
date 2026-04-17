@@ -80,7 +80,7 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		IgnoreQueryRegex: ignoreRegexes,
 	})
 
-	reporter, err := compare.NewReporter(compareCfg.OutputFile)
+	reporter, err := compare.NewReporterWithDigestCap(compareCfg.OutputFile, compareCfg.MaxUniqueDigests)
 	if err != nil {
 		return nil, fmt.Errorf("creating shadow reporter: %w", err)
 	}

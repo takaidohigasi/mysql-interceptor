@@ -156,6 +156,14 @@ type ComparisonConfig struct {
 	//   - "LAST_INSERT_ID\\s*\\("
 	//   - "\\bNOW\\s*\\("
 	IgnoreQueries []string `yaml:"ignore_queries"`
+	// MaxUniqueDigests caps the number of distinct query patterns tracked
+	// in the per-digest stats map. Once reached, new digests are dropped
+	// (counted as comparisons_digest_overflow) while existing ones keep
+	// updating. Each tracked digest can hold up to ~160 KB of timing
+	// samples, so the worst-case memory ceiling is cap × 160 KB. Typical
+	// apps have 50–500 digests; ad-hoc analytical workloads may need
+	// this higher. Default 10000.
+	MaxUniqueDigests int `yaml:"max_unique_digests"`
 }
 
 func Load(path string) (*Config, error) {
@@ -247,6 +255,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Bench.WarmupIters == 0 {
 		cfg.Bench.WarmupIters = 10
+	}
+	if cfg.Comparison.MaxUniqueDigests == 0 {
+		cfg.Comparison.MaxUniqueDigests = 10000
 	}
 }
 

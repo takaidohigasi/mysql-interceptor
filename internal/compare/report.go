@@ -24,6 +24,13 @@ type Reporter struct {
 }
 
 func NewReporter(outputFile string) (*Reporter, error) {
+	return NewReporterWithDigestCap(outputFile, 0)
+}
+
+// NewReporterWithDigestCap constructs a Reporter with a bound on the
+// number of unique query digests tracked in the stats map. 0 or negative
+// falls back to DefaultMaxUniqueDigests.
+func NewReporterWithDigestCap(outputFile string, maxUniqueDigests int) (*Reporter, error) {
 	var w io.WriteCloser
 	if outputFile == "" || outputFile == "-" {
 		w = os.Stdout
@@ -41,7 +48,7 @@ func NewReporter(outputFile string) (*Reporter, error) {
 	return &Reporter{
 		writer:      w,
 		enc:         enc,
-		digestStats: NewDigestStats(),
+		digestStats: NewDigestStatsWithCap(maxUniqueDigests),
 	}, nil
 }
 

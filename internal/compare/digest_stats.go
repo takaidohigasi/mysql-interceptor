@@ -4,10 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"sort"
 	"sync"
+	"sync/atomic"
+
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 // maxReservoirSize bounds the per-digest timing sample size. With a
@@ -16,9 +20,17 @@ import (
 // digest stays O(10k floats) regardless of how long the process runs.
 const maxReservoirSize = 10000
 
+// DefaultMaxUniqueDigests is the fallback cap when NewDigestStats is
+// called with 0 (typically from tests that don't go through config).
+// Matches the default in config.ComparisonConfig.
+const DefaultMaxUniqueDigests = 10000
+
 type DigestStats struct {
-	mu      sync.Mutex
-	digests map[string]*DigestEntry
+	mu             sync.Mutex
+	digests        map[string]*DigestEntry
+	maxDigests     int
+	overflow       atomic.Int64 // count of new digests dropped due to cap
+	overflowWarned atomic.Bool  // one-time log on first overflow
 }
 
 type DigestEntry struct {
@@ -62,8 +74,20 @@ type DigestSummary struct {
 }
 
 func NewDigestStats() *DigestStats {
+	return NewDigestStatsWithCap(DefaultMaxUniqueDigests)
+}
+
+// NewDigestStatsWithCap constructs a DigestStats that tracks at most
+// maxDigests unique query digests. Once reached, new digests are dropped
+// (counted via Overflow()) but existing digests keep updating. A cap of
+// 0 or negative is treated as DefaultMaxUniqueDigests.
+func NewDigestStatsWithCap(maxDigests int) *DigestStats {
+	if maxDigests <= 0 {
+		maxDigests = DefaultMaxUniqueDigests
+	}
 	return &DigestStats{
-		digests: make(map[string]*DigestEntry),
+		digests:    make(map[string]*DigestEntry),
+		maxDigests: maxDigests,
 	}
 }
 
@@ -75,11 +99,26 @@ func (ds *DigestStats) Record(result *CompareResult) {
 
 	entry, ok := ds.digests[digest]
 	if !ok {
+		// New digest: honor the cap. We drop the new digest entirely
+		// rather than evicting an existing one so operators with stable
+		// query patterns see no surprises; overflow is visible via the
+		// metric and a one-time warning log.
+		if len(ds.digests) >= ds.maxDigests {
+			ds.overflow.Add(1)
+			metrics.Global.ComparisonsDigestOver.Add(1)
+			if ds.overflowWarned.CompareAndSwap(false, true) {
+				slog.Warn("digest stats cap reached; new query patterns are being dropped",
+					"cap", ds.maxDigests,
+					"hint", "tune comparison.max_unique_digests up or investigate high-cardinality query patterns")
+			}
+			return
+		}
 		entry = &DigestEntry{
 			Digest:      digest,
 			SampleQuery: result.Query,
 		}
 		ds.digests[digest] = entry
+		metrics.Global.ComparisonsDigestCount.Store(int64(len(ds.digests)))
 	}
 
 	entry.Count++
@@ -121,6 +160,13 @@ func reservoirAdd(reservoir []float64, v float64, n int) []float64 {
 		reservoir[j] = v
 	}
 	return reservoir
+}
+
+// Overflow returns the number of new digests dropped because the cap
+// was reached. Mostly useful for tests; operators should read the
+// comparisons_digest_overflow metric instead.
+func (ds *DigestStats) Overflow() int64 {
+	return ds.overflow.Load()
 }
 
 func (ds *DigestStats) Summaries() []DigestSummary {
