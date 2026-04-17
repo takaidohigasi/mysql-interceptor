@@ -5,10 +5,15 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 )
+
+// DefaultConnectTimeout caps how long we wait for a backend handshake before
+// giving up, so an unreachable backend can't pin sessions indefinitely.
+const DefaultConnectTimeout = 10 * time.Second
 
 func Connect(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error) {
 	var opts []client.Option
@@ -24,7 +29,7 @@ func Connect(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*cli
 		})
 	}
 
-	conn, err := client.Connect(cfg.Addr, cfg.User, cfg.Password, cfg.DB, opts...)
+	conn, err := client.ConnectWithTimeout(cfg.Addr, cfg.User, cfg.Password, cfg.DB, DefaultConnectTimeout, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to backend %s: %w", cfg.Addr, err)
 	}
