@@ -35,6 +35,7 @@ logging:
 replay:
   mode: "disabled"    # "disabled" | "shadow" | "offline"
   shadow:
+    enabled: true           # hot-reloadable: set false to pause shadow sending
     target_addr: "127.0.0.1:3307"
     target_user: "root"
     target_password: ""

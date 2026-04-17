@@ -123,18 +123,6 @@ func runServe() {
 		}
 	}
 
-	cfgWatcher, err := config.NewWatcher(configPath)
-	if err != nil {
-		slog.Warn("failed to watch config file", "err", err)
-	} else {
-		defer cfgWatcher.Close()
-		cfgWatcher.OnChange(func(newCfg *config.Config) {
-			if queryLogger != nil {
-				queryLogger.SetEnabled(newCfg.Logging.Enabled)
-			}
-		})
-	}
-
 	var shadowSender *replay.ShadowSender
 	if cfg.Replay.Mode == "shadow" {
 		shadowSender, err = replay.NewShadowSender(cfg.Replay.Shadow, cfg.Comparison)
@@ -144,9 +132,30 @@ func runServe() {
 		// Read-only enforcement is always applied regardless of the
 		// readonly: field. Surface this up-front so operators don't expect
 		// DML replay if they set readonly: false.
-		slog.Info("shadow traffic enabled",
+		slog.Info("shadow traffic initialized",
 			"target", cfg.Replay.Shadow.TargetAddr,
+			"enabled", shadowSender.IsEnabled(),
 			"readonly_enforced", true)
+		if shadowSender.IsEnabled() {
+			metrics.Global.ShadowEnabledGauge.Store(1)
+		}
+	}
+
+	// Register hot-reload callbacks after both logger and shadowSender
+	// exist so they can be captured by the OnChange closure.
+	cfgWatcher, err := config.NewWatcher(configPath)
+	if err != nil {
+		slog.Warn("failed to watch config file", "err", err)
+	} else {
+		defer cfgWatcher.Close()
+		cfgWatcher.OnChange(func(newCfg *config.Config) {
+			if queryLogger != nil {
+				queryLogger.SetEnabled(newCfg.Logging.Enabled)
+			}
+			if shadowSender != nil && newCfg.Replay.Shadow.Enabled != nil {
+				shadowSender.SetEnabled(*newCfg.Replay.Shadow.Enabled)
+			}
+		})
 	}
 
 	srv, err := proxy.NewProxyServer(cfg, queryLogger, shadowSender)

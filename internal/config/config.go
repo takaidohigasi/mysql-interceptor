@@ -59,9 +59,9 @@ type BackendSideTLSConfig struct {
 }
 
 type LoggingConfig struct {
-	Enabled    bool           `yaml:"enabled"`
-	OutputDir  string         `yaml:"output_dir"`
-	FilePrefix string         `yaml:"file_prefix"`
+	Enabled    bool   `yaml:"enabled"`
+	OutputDir  string `yaml:"output_dir"`
+	FilePrefix string `yaml:"file_prefix"`
 	// RedactArgs replaces prepared-statement bind values in logged entries
 	// with "<redacted>" so they never hit disk. Useful when queries may
 	// bind passwords, tokens, or other PII. The query text (with ?
@@ -88,6 +88,11 @@ type ShadowConfig struct {
 	TargetUser     string               `yaml:"target_user"`
 	TargetPassword string               `yaml:"target_password"`
 	TLS            BackendSideTLSConfig `yaml:"tls"`
+	// Enabled gates whether live queries are forwarded to the shadow
+	// server. Hot-reloadable: set false in config to pause shadow sending
+	// without restarting the proxy (e.g. during shadow-server maintenance).
+	// Defaults to true when mode is "shadow".
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// ReadOnly is always enforced regardless of this flag — kept for backward
 	// compatibility and to make the safety behavior explicit in config files.
 	ReadOnly      bool          `yaml:"readonly"`
@@ -175,6 +180,13 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Replay.Shadow.MaxConcurrent == 0 {
 		cfg.Replay.Shadow.MaxConcurrent = 100
+	}
+	// Shadow is enabled by default; only an explicit `enabled: false`
+	// disables it. We use *bool so "not set" is distinguishable from
+	// "set to false".
+	if cfg.Replay.Shadow.Enabled == nil {
+		t := true
+		cfg.Replay.Shadow.Enabled = &t
 	}
 	// Read-only filter is always applied. Setting the default to true here
 	// makes the behavior explicit for anyone inspecting the effective config.

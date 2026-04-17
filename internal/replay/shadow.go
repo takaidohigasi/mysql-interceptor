@@ -31,6 +31,8 @@ type ShadowSender struct {
 	timeout  time.Duration
 	dropped  atomic.Int64
 	skipped  atomic.Int64
+	disabled atomic.Int64 // counter for sends rejected because enabled=false
+	enabled  atomic.Bool
 	closed   atomic.Bool
 	wg       sync.WaitGroup
 	once     sync.Once
@@ -81,6 +83,13 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		ctx:      ctx,
 		cancel:   cancel,
 	}
+	// Default to enabled when *bool is nil (e.g. tests constructing
+	// ShadowConfig directly without going through config.applyDefaults).
+	initiallyEnabled := true
+	if cfg.Enabled != nil {
+		initiallyEnabled = *cfg.Enabled
+	}
+	s.enabled.Store(initiallyEnabled)
 
 	for i := 0; i < cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
@@ -91,6 +100,16 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 }
 
 func (s *ShadowSender) Send(sq ShadowQuery) {
+	// Fast-path: shadow paused via config toggle. Don't count against
+	// dropped (dropped means "tried to send but queue full"); use a
+	// separate disabled counter so the operator can see how many were
+	// intentionally skipped.
+	if !s.enabled.Load() {
+		s.disabled.Add(1)
+		metrics.Global.ShadowDisabled.Add(1)
+		return
+	}
+
 	// Always enforce read-only: never replay DML/DDL to shadow server.
 	if !IsReadOnly(sq.Query) {
 		s.skipped.Add(1)
@@ -122,6 +141,25 @@ func (s *ShadowSender) Dropped() int64 {
 
 func (s *ShadowSender) Skipped() int64 {
 	return s.skipped.Load()
+}
+
+// SetEnabled toggles whether incoming queries are forwarded to the shadow
+// server. When disabled, Send() short-circuits and queries are counted
+// under shadow_disabled rather than replayed. Hot-reloadable.
+func (s *ShadowSender) SetEnabled(enabled bool) {
+	prev := s.enabled.Swap(enabled)
+	if prev != enabled {
+		slog.Info("shadow traffic toggled", "enabled", enabled)
+		if enabled {
+			metrics.Global.ShadowEnabledGauge.Store(1)
+		} else {
+			metrics.Global.ShadowEnabledGauge.Store(0)
+		}
+	}
+}
+
+func (s *ShadowSender) IsEnabled() bool {
+	return s.enabled.Load()
 }
 
 func (s *ShadowSender) Close() {
