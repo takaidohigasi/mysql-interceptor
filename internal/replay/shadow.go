@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,9 +25,9 @@ type ShadowSender struct {
 	queryCh  chan ShadowQuery
 	engine   *compare.Engine
 	reporter *compare.Reporter
-	readonly bool
 	timeout  time.Duration
 	dropped  atomic.Int64
+	skipped  atomic.Int64
 	wg       sync.WaitGroup
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -67,7 +66,6 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		queryCh:  make(chan ShadowQuery, 10000),
 		engine:   engine,
 		reporter: reporter,
-		readonly: cfg.ReadOnly,
 		timeout:  cfg.Timeout,
 		ctx:      ctx,
 		cancel:   cancel,
@@ -82,7 +80,9 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 }
 
 func (s *ShadowSender) Send(sq ShadowQuery) {
-	if s.readonly && !isReadOnly(sq.Query) {
+	// Always enforce read-only: never replay DML/DDL to shadow server.
+	if !IsReadOnly(sq.Query) {
+		s.skipped.Add(1)
 		return
 	}
 
@@ -97,13 +97,18 @@ func (s *ShadowSender) Dropped() int64 {
 	return s.dropped.Load()
 }
 
+func (s *ShadowSender) Skipped() int64 {
+	return s.skipped.Load()
+}
+
 func (s *ShadowSender) Close() {
 	s.cancel()
 	close(s.queryCh)
 	s.wg.Wait()
 	s.reporter.Close()
 	s.pool.Close()
-	log.Printf("Shadow sender closed. %s", s.reporter.Summary())
+	log.Printf("Shadow sender closed. Skipped non-SELECT queries: %d. Dropped (queue full): %d. %s",
+		s.skipped.Load(), s.dropped.Load(), s.reporter.Summary())
 }
 
 func (s *ShadowSender) worker() {
@@ -137,11 +142,3 @@ func (s *ShadowSender) worker() {
 	}
 }
 
-func isReadOnly(query string) bool {
-	q := strings.TrimSpace(strings.ToUpper(query))
-	return strings.HasPrefix(q, "SELECT") ||
-		strings.HasPrefix(q, "SHOW") ||
-		strings.HasPrefix(q, "DESCRIBE") ||
-		strings.HasPrefix(q, "DESC") ||
-		strings.HasPrefix(q, "EXPLAIN")
-}

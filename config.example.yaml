@@ -36,7 +36,7 @@ replay:
     target_addr: "127.0.0.1:3307"
     target_user: "root"
     target_password: ""
-    readonly: true
+    readonly: true          # always enforced — non-SELECT queries are never replayed
     async: true
     timeout: 5s
     max_concurrent: 100

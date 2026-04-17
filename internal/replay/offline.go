@@ -198,6 +198,11 @@ func (r *OfflineReplayer) replayFile(filePath string) error {
 
 			var prevTimestamp time.Time
 			for _, se := range entries {
+				// Safety: never replay DML/DDL against the target server.
+				if !IsReadOnly(se.entry.Query) {
+					continue
+				}
+
 				// Respect timing gaps (scaled by speed factor)
 				if !prevTimestamp.IsZero() && r.speedFactor > 0 {
 					gap := se.entry.Timestamp.Sub(prevTimestamp)

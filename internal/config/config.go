@@ -80,10 +80,12 @@ type ShadowConfig struct {
 	TargetAddr     string        `yaml:"target_addr"`
 	TargetUser     string        `yaml:"target_user"`
 	TargetPassword string        `yaml:"target_password"`
-	ReadOnly       bool          `yaml:"readonly"`
-	Async          bool          `yaml:"async"`
-	Timeout        time.Duration `yaml:"timeout"`
-	MaxConcurrent  int           `yaml:"max_concurrent"`
+	// ReadOnly is always enforced regardless of this flag — kept for backward
+	// compatibility and to make the safety behavior explicit in config files.
+	ReadOnly      bool          `yaml:"readonly"`
+	Async         bool          `yaml:"async"`
+	Timeout       time.Duration `yaml:"timeout"`
+	MaxConcurrent int           `yaml:"max_concurrent"`
 }
 
 type OfflineConfig struct {
@@ -155,6 +157,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Replay.Shadow.MaxConcurrent == 0 {
 		cfg.Replay.Shadow.MaxConcurrent = 100
 	}
+	// Read-only filter is always applied. Setting the default to true here
+	// makes the behavior explicit for anyone inspecting the effective config.
+	cfg.Replay.Shadow.ReadOnly = true
 	if cfg.Replay.Offline.SpeedFactor == 0 {
 		cfg.Replay.Offline.SpeedFactor = 1.0
 	}
