@@ -9,9 +9,12 @@ import (
 	"context"
 	"encoding/json"
 	"expvar"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -57,7 +60,13 @@ func NewServer(addr string) *Server {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/metrics", handleMetrics)
+	// /metrics serves Prometheus/OpenMetrics text format — the industry
+	// convention, and what Datadog's openmetrics check and Prometheus
+	// scrapers expect by default.
+	mux.HandleFunc("/metrics", handlePrometheus)
+	// /metrics.json keeps the JSON view for human debugging or scrapers
+	// that prefer structured data.
+	mux.HandleFunc("/metrics.json", handleJSONMetrics)
 	// expvar's default handler exposes Go runtime stats at /debug/vars
 	mux.Handle("/debug/vars", expvar.Handler())
 
@@ -99,49 +108,93 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-func handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+// metric holds one gauge/counter value with the metadata needed to
+// render it in Prometheus exposition format.
+type metric struct {
+	name  string
+	typ   string // "counter" or "gauge"
+	help  string
+	value float64
+}
 
-	// Runtime gauges are read live, not accumulated. ReadMemStats briefly
-	// pauses the world, but scrape intervals of 10s+ make this negligible.
+// snapshot returns the current values of every exposed metric. Runtime
+// gauges are read live via runtime.ReadMemStats each call.
+func snapshot() []metric {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
+	ng := runtime.NumGoroutine()
 
-	// Mixed types: application counters are int64 (from atomic.Int64),
-	// runtime gauges are uint64 (from runtime.MemStats). JSON-encodes
-	// both as numbers; scrapers that parse them don't care.
-	snap := map[string]any{
-		// Application counters
-		"active_sessions":             Global.ActiveSessions.Load(),
-		"total_sessions":              Global.TotalSessions.Load(),
-		"queries_handled":             Global.QueriesHandled.Load(),
-		"query_errors":                Global.QueryErrors.Load(),
-		"logger_dropped":              Global.LoggerDropped.Load(),
-		"shadow_dropped":              Global.ShadowDropped.Load(),
-		"shadow_skipped":              Global.ShadowSkipped.Load(),
-		"shadow_disabled":             Global.ShadowDisabled.Load(),
-		"shadow_sampled_out":          Global.ShadowSampledOut.Load(),
-		"shadow_filtered_by_cidr":     Global.ShadowFilteredByCIDR.Load(),
-		"shadow_enabled":              Global.ShadowEnabledGauge.Load(),
-		"shadow_queries_replayed":     Global.ShadowQueriesReplayed.Load(),
-		"comparisons_total":           Global.ComparisonsTotal.Load(),
-		"comparisons_matched":         Global.ComparisonsMatched.Load(),
-		"comparisons_differed":        Global.ComparisonsDiffered.Load(),
-		"comparisons_ignored":         Global.ComparisonsIgnored.Load(),
-		"comparisons_digest_overflow": Global.ComparisonsDigestOver.Load(),
-		"comparisons_digest_count":    Global.ComparisonsDigestCount.Load(),
+	return []metric{
+		// Sessions
+		{"active_sessions", "gauge", "Current number of active client sessions", float64(Global.ActiveSessions.Load())},
+		{"total_sessions", "counter", "Total client sessions accepted since start", float64(Global.TotalSessions.Load())},
 
-		// Runtime gauges (uint64 from runtime.MemStats)
-		"heap_alloc_bytes":  ms.HeapAlloc,   // currently allocated on heap
-		"heap_inuse_bytes":  ms.HeapInuse,   // bytes in in-use spans
-		"heap_idle_bytes":   ms.HeapIdle,    // idle spans (may return to OS)
-		"heap_sys_bytes":    ms.HeapSys,     // heap obtained from OS
-		"heap_objects":      ms.HeapObjects, // live objects
-		"stack_inuse_bytes": ms.StackInuse,  // stack bytes in use
-		"sys_bytes":         ms.Sys,         // total mem obtained from OS
-		"num_goroutines":    runtime.NumGoroutine(),
-		"gc_cycles_total":   ms.NumGC,        // completed GC cycles
-		"gc_pause_ns_total": ms.PauseTotalNs, // cumulative STW pause time
+		// Query pipeline
+		{"queries_handled", "counter", "Total queries forwarded to the backend", float64(Global.QueriesHandled.Load())},
+		{"query_errors", "counter", "Queries that returned an error from the backend", float64(Global.QueryErrors.Load())},
+
+		// Logger
+		{"logger_dropped", "counter", "SQL log entries dropped because the async buffer was full", float64(Global.LoggerDropped.Load())},
+
+		// Shadow
+		{"shadow_enabled", "gauge", "1 when shadow traffic is enabled, 0 when paused via config toggle", float64(Global.ShadowEnabledGauge.Load())},
+		{"shadow_queries_replayed", "counter", "Shadow queries successfully executed against the shadow server", float64(Global.ShadowQueriesReplayed.Load())},
+		{"shadow_disabled", "counter", "Sends rejected because shadow.enabled=false", float64(Global.ShadowDisabled.Load())},
+		{"shadow_sampled_out", "counter", "Sends dropped by shadow.sample_rate", float64(Global.ShadowSampledOut.Load())},
+		{"shadow_filtered_by_cidr", "counter", "Sends rejected by the CIDR allow/exclude filter", float64(Global.ShadowFilteredByCIDR.Load())},
+		{"shadow_skipped", "counter", "Sends skipped because the query was not read-only", float64(Global.ShadowSkipped.Load())},
+		{"shadow_dropped", "counter", "Sends dropped because the queue was full or the connection timed out", float64(Global.ShadowDropped.Load())},
+
+		// Comparisons
+		{"comparisons_total", "counter", "Total comparison results recorded", float64(Global.ComparisonsTotal.Load())},
+		{"comparisons_matched", "counter", "Comparisons where primary and shadow agreed", float64(Global.ComparisonsMatched.Load())},
+		{"comparisons_differed", "counter", "Comparisons with a content or error divergence", float64(Global.ComparisonsDiffered.Load())},
+		{"comparisons_ignored", "counter", "Comparisons that matched a configured ignore pattern", float64(Global.ComparisonsIgnored.Load())},
+		{"comparisons_digest_count", "gauge", "Current number of unique query digests being tracked", float64(Global.ComparisonsDigestCount.Load())},
+		{"comparisons_digest_overflow", "counter", "New digests dropped because the max_unique_digests cap was reached", float64(Global.ComparisonsDigestOver.Load())},
+
+		// Runtime
+		{"heap_alloc_bytes", "gauge", "Bytes currently allocated on the Go heap", float64(ms.HeapAlloc)},
+		{"heap_inuse_bytes", "gauge", "Bytes in heap in-use spans", float64(ms.HeapInuse)},
+		{"heap_idle_bytes", "gauge", "Bytes in heap idle spans (may be returned to OS)", float64(ms.HeapIdle)},
+		{"heap_sys_bytes", "gauge", "Bytes of heap memory obtained from the OS", float64(ms.HeapSys)},
+		{"heap_objects", "gauge", "Live heap object count", float64(ms.HeapObjects)},
+		{"stack_inuse_bytes", "gauge", "Bytes in stack memory currently in use", float64(ms.StackInuse)},
+		{"sys_bytes", "gauge", "Total bytes obtained from the OS for the Go runtime", float64(ms.Sys)},
+		{"num_goroutines", "gauge", "Number of live goroutines", float64(ng)},
+		{"gc_cycles_total", "counter", "Completed GC cycles since process start", float64(ms.NumGC)},
+		{"gc_pause_ns_total", "counter", "Cumulative STW pause time in nanoseconds", float64(ms.PauseTotalNs)},
+	}
+}
+
+// handlePrometheus serves the /metrics endpoint in Prometheus/OpenMetrics
+// text exposition format. Compatible with Datadog's openmetrics check and
+// any Prometheus scraper.
+func handlePrometheus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	writePrometheus(w, snapshot())
+}
+
+func writePrometheus(w io.Writer, metrics []metric) {
+	// Sort by name for a stable output order — helpful when diffing
+	// scrape output across versions.
+	sort.Slice(metrics, func(i, j int) bool { return metrics[i].name < metrics[j].name })
+	for _, m := range metrics {
+		fmt.Fprintf(w, "# HELP %s %s\n", m.name, m.help)
+		fmt.Fprintf(w, "# TYPE %s %s\n", m.name, m.typ)
+		// %g for floats, %d for integer-valued gauges would be nicer but
+		// complicates the type table; Prometheus accepts scientific notation.
+		fmt.Fprintf(w, "%s %g\n", m.name, m.value)
+	}
+}
+
+// handleJSONMetrics serves /metrics.json for human debugging or scrapers
+// that prefer structured data.
+func handleJSONMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	snap := make(map[string]float64, 40)
+	for _, m := range snapshot() {
+		snap[m.name] = m.value
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

@@ -283,14 +283,38 @@ proxy:
 
 Endpoints:
 - `GET /healthz` — 200 OK (liveness)
-- `GET /metrics` — JSON counters:
+- `GET /metrics` — Prometheus/OpenMetrics text format (compatible with Datadog `openmetrics` check and Prometheus scrapers)
+- `GET /metrics.json` — same metrics, JSON format, for human debugging
+- `GET /debug/vars` — Go runtime stats via expvar
+
+Available metrics:
   - **Sessions:** `active_sessions`, `total_sessions`
   - **Queries:** `queries_handled`, `query_errors`
   - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
   - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
   - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`, `comparisons_digest_count` (gauge), `comparisons_digest_overflow`
   - **Runtime (gauges):** `heap_alloc_bytes`, `heap_inuse_bytes`, `heap_idle_bytes`, `heap_sys_bytes`, `heap_objects`, `stack_inuse_bytes`, `sys_bytes`, `num_goroutines`, `gc_cycles_total`, `gc_pause_ns_total`
-- `GET /debug/vars` — Go runtime stats via expvar
+
+### Datadog integration
+
+On Kubernetes, the Datadog agent can auto-discover the proxy via pod annotations:
+
+```yaml
+metadata:
+  annotations:
+    ad.datadoghq.com/mysql-interceptor.check_names: '["openmetrics"]'
+    ad.datadoghq.com/mysql-interceptor.init_configs: '[{}]'
+    ad.datadoghq.com/mysql-interceptor.instances: |
+      [
+        {
+          "openmetrics_endpoint": "http://%%host%%:9090/metrics",
+          "namespace": "mysql_interceptor",
+          "metrics": [".*"]
+        }
+      ]
+```
+
+(Replace `mysql-interceptor` with your container name. Port 9090 matches the default `proxy.metrics_addr`.)
 
 Operational logs go to stderr via Go's `slog`:
 
