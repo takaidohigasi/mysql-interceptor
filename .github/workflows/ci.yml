@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -v -count=1 ./internal/...
+
+  integration-test:
+    name: Integration Tests (2 MySQL servers)
+    runs-on: ubuntu-latest
+
+    services:
+      mysql-primary:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: test_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -prootpass"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      mysql-secondary:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: test_db
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -prootpass"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Wait for MySQL to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpass --silent 2>/dev/null; then
+              echo "MySQL primary is ready"
+              break
+            fi
+            echo "Waiting for MySQL primary... ($i/30)"
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3307 -u root -prootpass --silent 2>/dev/null; then
+              echo "MySQL secondary is ready"
+              break
+            fi
+            echo "Waiting for MySQL secondary... ($i/30)"
+            sleep 2
+          done
+
+      - name: Initialize primary MySQL (with orders table)
+        run: mysql -h 127.0.0.1 -P 3306 -u root -prootpass test_db < test/testdata/schema_primary.sql
+
+      - name: Initialize secondary MySQL (without orders table)
+        run: mysql -h 127.0.0.1 -P 3307 -u root -prootpass test_db < test/testdata/schema_secondary.sql
+
+      - name: Verify schema divergence
+        run: |
+          echo "=== Primary: tables ==="
+          mysql -h 127.0.0.1 -P 3306 -u root -prootpass test_db -e "SHOW TABLES;"
+          echo "=== Secondary: tables ==="
+          mysql -h 127.0.0.1 -P 3307 -u root -prootpass test_db -e "SHOW TABLES;"
+          echo "=== Primary: orders count ==="
+          mysql -h 127.0.0.1 -P 3306 -u root -prootpass test_db -e "SELECT COUNT(*) FROM orders;"
+          echo "=== Secondary: orders (should fail) ==="
+          mysql -h 127.0.0.1 -P 3307 -u root -prootpass test_db -e "SELECT COUNT(*) FROM orders;" 2>&1 || echo "Expected: orders table does not exist on secondary"
+
+      - name: Run integration tests
+        env:
+          MYSQL1_ADDR: "127.0.0.1:3306"
+          MYSQL2_ADDR: "127.0.0.1:3307"
+        run: go test -v -count=1 -timeout=120s ./test/...
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: mysql-interceptor:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify container runs
+        run: |
+          docker build -t mysql-interceptor:test .
+          docker run --rm mysql-interceptor:test --help || true
