@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -112,6 +113,17 @@ type ComparisonConfig struct {
 	OutputFile      string   `yaml:"output_file"`
 	IgnoreColumns   []string `yaml:"ignore_columns"`
 	TimeThresholdMs float64  `yaml:"time_threshold_ms"`
+	// IgnoreQueries is a list of case-insensitive regular expressions.
+	// If the query text matches any pattern, the comparison result is
+	// marked Ignored=true and doesn't contribute to the diff count.
+	// Use this for queries that read server-local state and therefore
+	// always diverge between instances:
+	//   - "@@server_uuid"
+	//   - "@@hostname"
+	//   - "CONNECTION_ID\\s*\\("
+	//   - "LAST_INSERT_ID\\s*\\("
+	//   - "\\bNOW\\s*\\("
+	IgnoreQueries []string `yaml:"ignore_queries"`
 }
 
 func Load(path string) (*Config, error) {
@@ -200,6 +212,11 @@ func (c *Config) Validate() error {
 	if c.TLS.ClientSide.Enabled {
 		if c.TLS.ClientSide.CertFile == "" || c.TLS.ClientSide.KeyFile == "" {
 			return fmt.Errorf("tls.client_side.cert_file and key_file are required when TLS is enabled")
+		}
+	}
+	for i, pat := range c.Comparison.IgnoreQueries {
+		if _, err := regexp.Compile("(?i)" + pat); err != nil {
+			return fmt.Errorf("comparison.ignore_queries[%d] invalid regex %q: %w", i, pat, err)
 		}
 	}
 	return nil

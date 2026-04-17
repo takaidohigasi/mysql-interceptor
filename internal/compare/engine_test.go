@@ -205,6 +205,65 @@ func TestCompare_DifferentAffectedRows(t *testing.T) {
 	}
 }
 
+func TestCompare_IgnoreQueryPattern(t *testing.T) {
+	regexes, err := CompileIgnoreQueries([]string{
+		"@@server_uuid",
+		"\\bNOW\\s*\\(",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	engine := NewEngine(EngineConfig{IgnoreQueryRegex: regexes})
+
+	original := &CapturedResult{
+		Columns: []string{"uuid"},
+		Rows:    [][]string{{"aaa-bbb"}},
+	}
+	replay := &CapturedResult{
+		Columns: []string{"uuid"},
+		Rows:    [][]string{{"ccc-ddd"}},
+	}
+
+	// Different cell values, but query matches ignore pattern — still
+	// reported with the diff details, but Ignored=true.
+	result := engine.Compare(original, replay, "SELECT @@server_uuid", 1)
+	if !result.Ignored {
+		t.Error("expected Ignored=true for @@server_uuid query")
+	}
+	// The diff is still captured for audit purposes.
+	foundCellDiff := false
+	for _, d := range result.Differences {
+		if d.Type == "cell_value" {
+			foundCellDiff = true
+		}
+	}
+	if !foundCellDiff {
+		t.Error("expected cell_value diff to still be recorded on ignored results")
+	}
+
+	// NOW() with whitespace — regex boundary check.
+	result2 := engine.Compare(original, replay, "select now()", 2)
+	if !result2.Ignored {
+		t.Error("expected Ignored=true for NOW() query")
+	}
+
+	// A query NOT in the ignore list — normal mismatch behavior.
+	result3 := engine.Compare(original, replay, "SELECT name FROM users", 3)
+	if result3.Ignored {
+		t.Error("expected Ignored=false for non-matching query")
+	}
+	if result3.Match {
+		t.Error("expected Match=false for non-matching query with cell diff")
+	}
+}
+
+func TestCompileIgnoreQueries_InvalidRegex(t *testing.T) {
+	_, err := CompileIgnoreQueries([]string{"[unclosed"})
+	if err == nil {
+		t.Error("expected error for invalid regex")
+	}
+}
+
 func TestCompare_DifferentColumnCount(t *testing.T) {
 	engine := NewEngine(EngineConfig{})
 

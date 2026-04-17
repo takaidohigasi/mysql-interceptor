@@ -50,9 +50,15 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		ignoreColumns[col] = true
 	}
 
+	ignoreRegexes, err := compare.CompileIgnoreQueries(compareCfg.IgnoreQueries)
+	if err != nil {
+		return nil, fmt.Errorf("compiling ignore_queries: %w", err)
+	}
+
 	engine := compare.NewEngine(compare.EngineConfig{
-		IgnoreColumns:   ignoreColumns,
-		TimeThresholdMs: compareCfg.TimeThresholdMs,
+		IgnoreColumns:    ignoreColumns,
+		TimeThresholdMs:  compareCfg.TimeThresholdMs,
+		IgnoreQueryRegex: ignoreRegexes,
 	})
 
 	reporter, err := compare.NewReporter(compareCfg.OutputFile)

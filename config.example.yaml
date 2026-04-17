@@ -65,6 +65,20 @@ comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at", "created_at"]
   time_threshold_ms: 100
+  # Queries that match any of these case-insensitive regexes are still
+  # recorded in the diff report but marked "ignored" instead of counted
+  # as differences. Use for queries that read server-local state and
+  # always diverge between MySQL instances.
+  ignore_queries:
+    - "@@server_uuid"
+    - "@@hostname"
+    - "@@server_id"
+    - "CONNECTION_ID\\s*\\("
+    - "LAST_INSERT_ID\\s*\\("
+    - "\\bNOW\\s*\\("
+    - "\\bCURRENT_TIMESTAMP\\b"
+    - "\\bUUID\\s*\\("
+    - "\\bRAND\\s*\\("
 
 bench:
   queries:
