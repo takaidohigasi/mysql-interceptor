@@ -156,15 +156,26 @@ comparison:
   time_threshold_ms: 100
 ```
 
-**Shadow filter evaluation** (per query, in order):
+**Session-pinned shadow:** each primary session gets its own dedicated shadow connection. Queries flow serially from the primary session to its own shadow queue and execute in order on the pinned connection. This means session-scoped state — temporary tables, session variables, transactions — is preserved:
+
+```sql
+-- All three statements go to the same shadow connection:
+CREATE TEMPORARY TABLE scratch (id INT);     -- tracked in the session
+INSERT INTO scratch VALUES (1);              -- forwarded (target is a tracked temp)
+SELECT * FROM scratch;                       -- forwarded, sees the data
+```
+
+The handler tracks temporary tables the primary creates and, for DML/DDL against them, forwards the mutation to the shadow. Writes to *persistent* tables are still rejected.
+
+**Filter evaluation** (per query, in order):
 
 1. `shadow.enabled: false` → skipped (counter: `shadow_disabled`)
 2. `shadow.sample_rate` roll fails → skipped (counter: `shadow_sampled_out`)
 3. Source IP matches any `excluded_source_cidrs` → filtered (counter: `shadow_filtered_by_cidr`)
 4. `allowed_source_cidrs` is non-empty and source IP doesn't match → filtered (same counter)
-5. Non-SELECT query → skipped (counter: `shadow_skipped`)
+5. Query category is not session-safe (DML/DDL against a non-temp table, GRANT, CALL, LOAD DATA, etc.) → skipped (counter: `shadow_skipped`)
 6. Queue full → dropped (counter: `shadow_dropped`)
-7. Otherwise → enqueued for replay
+7. Otherwise → enqueued on the pinned shadow session for execution
 
 **Throttling under load:** `sample_rate` is a simple way to cap shadow overhead. `0.1` sends ~10% of queries to the shadow server. Combined with hot-reload, you can dial it down during high-traffic windows:
 
@@ -291,7 +302,7 @@ Available metrics:
   - **Sessions:** `active_sessions`, `total_sessions`
   - **Queries:** `queries_handled`, `query_errors`
   - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
-  - **Shadow:** `shadow_enabled` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (non-SELECT), `shadow_dropped` (queue full or connection timeout)
+  - **Shadow:** `shadow_enabled` (gauge), `shadow_active_sessions` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (not session-safe), `shadow_dropped` (queue full or connection timeout)
   - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`, `comparisons_digest_count` (gauge), `comparisons_digest_overflow`
   - **Runtime (gauges):** `heap_alloc_bytes`, `heap_inuse_bytes`, `heap_idle_bytes`, `heap_sys_bytes`, `heap_objects`, `stack_inuse_bytes`, `sys_bytes`, `num_goroutines`, `gc_cycles_total`, `gc_pause_ns_total`
 
