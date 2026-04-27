@@ -7,8 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
-<a id="unreleased"></a>
-## Unreleased
+<a id="v0.0.4"></a>
+## v0.0.4
+
+_Released 2026-04-27._
+
+### Highlights
+
+- **Multi-user authentication.** The proxy now accepts a list of
+  `(username, password)` pairs in `proxy.users` and reuses the matched
+  credentials for the outbound backend (and shadow) connection, so
+  per-user GRANTs apply consistently and the SQL log records the actual
+  authenticated user. `proxy.users` is **required** — single-user mode
+  via `backend.user` / `backend.password` has been removed.
+- **Env-var interpolation in config.** Any `${VAR}` in `config.yaml` is
+  expanded at load time (and on each hot-reload), so credentials can
+  live in env vars / Secret Manager.
+- **`proxy.max_session_lifetime`** — hot-reloadable cap on session
+  age, with ±10% jitter, that closes sessions at the next safe boundary
+  (between commands, only when the backend is not in a transaction).
+  Lets the client reconnect and rebalance onto the current backend pool
+  after the backend autoscales.
 
 ### Added
 
@@ -52,6 +71,18 @@ minor versions).
   +    - username: "${MYSQL_USER}"
   +      password: "${MYSQL_PASSWORD}"
   ```
+
+### Notes for operators
+
+- This is a breaking change for any deployment relying on
+  `backend.user` / `backend.password`. Update `config.yaml` to set
+  `proxy.users` before upgrading.
+- The `${VAR}` expansion combines naturally with the new `proxy.users`:
+  store credentials in env vars / Secret Manager and reference them
+  from `users:` entries.
+- `proxy.max_session_lifetime` is **off by default**. Enable it (e.g.
+  `1h`) when the backend autoscales and you want existing sessions to
+  rebalance onto new nodes without a restart.
 
 <a id="v0.0.3"></a>
 ## v0.0.3
