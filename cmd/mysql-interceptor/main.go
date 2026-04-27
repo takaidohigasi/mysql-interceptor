@@ -279,10 +279,15 @@ func runBench() {
 		proxyAddr = "127.0.0.1" + strings.TrimPrefix(proxyAddr, "0.0.0.0")
 	}
 
+	// The bench connects to both the direct backend and the proxy with
+	// the same credentials. Use the first proxy.users entry — config.Validate
+	// guarantees there is at least one, and the proxy will only accept
+	// clients that authenticate as one of its configured users.
+	benchUser := cfg.Proxy.Users[0]
 	directDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
-		cfg.Backend.User, cfg.Backend.Password, cfg.Backend.Addr, cfg.Backend.DB)
+		benchUser.Username, benchUser.Password, cfg.Backend.Addr, cfg.Backend.DB)
 	proxyDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
-		cfg.Backend.User, cfg.Backend.Password, proxyAddr, cfg.Backend.DB)
+		benchUser.Username, benchUser.Password, proxyAddr, cfg.Backend.DB)
 
 	slog.Info("benchmarking", "direct", cfg.Backend.Addr, "proxy", proxyAddr)
 
