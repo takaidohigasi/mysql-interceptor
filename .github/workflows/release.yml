@@ -119,10 +119,11 @@ jobs:
           cat > /tmp/bench-config.yaml <<'YAML'
           proxy:
             listen_addr: "127.0.0.1:3307"
+            users:
+              - username: "root"
+                password: "rootpass"
           backend:
             addr: "127.0.0.1:3306"
-            user: "root"
-            password: "rootpass"
             db: "bench_db"
           logging:
             enabled: false
