@@ -128,6 +128,44 @@ proxy:
       password: "${MYSQL_REPLICATION_PASSWORD}"
 ```
 
+### Session lifetime cap (autoscale rebalance)
+
+The proxy keeps one dedicated backend connection per client session for
+the entire session lifetime, which means existing sessions stay pinned
+to whichever backend the LB chose at connect time. When the backend
+pool changes (autoscaling), only new sessions land on the new nodes.
+
+`proxy.max_session_lifetime` makes the proxy gracefully close
+long-lived sessions so clients reconnect and rebalance onto the
+current backend pool:
+
+```yaml
+proxy:
+  max_session_lifetime: 1h   # hot-reloadable; 0 (default) disables
+```
+
+Behavior:
+
+- Each session gets a per-session deadline of `cap × (1 ± 10%)`
+  — the random jitter prevents thundering-herd reconnects when the
+  cap is changed via hot-reload.
+- After every command, if the deadline has passed **and** the backend
+  is not in a transaction (`SERVER_STATUS_IN_TRANS = 0`), the proxy
+  closes the session.
+- Long-running queries are not interrupted: the check happens between
+  commands, not mid-query.
+- In-progress transactions delay the close until `COMMIT` / `ROLLBACK`.
+  The deferred check is observable via the `sessions_lifetime_postponed`
+  metric.
+
+Two metrics expose the behavior:
+
+- `sessions_closed_max_lifetime` — counter; how many sessions were
+  closed by the cap.
+- `sessions_lifetime_postponed` — counter; how often a check was
+  deferred because the session was mid-transaction.
+
+
 ### TLS
 
 TLS is configurable independently on both sides:

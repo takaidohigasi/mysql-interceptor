@@ -143,8 +143,13 @@ func runServe() {
 		}
 	}
 
-	// Register hot-reload callbacks after both logger and shadowSender
-	// exist so they can be captured by the OnChange closure.
+	srv, err := proxy.NewProxyServer(cfg, queryLogger, shadowSender)
+	if err != nil {
+		fatal("failed to create proxy server", "err", err)
+	}
+
+	// Register hot-reload callbacks after the proxy and its dependencies
+	// are constructed so they can all be captured by the OnChange closure.
 	cfgWatcher, err := config.NewWatcher(configPath)
 	if err != nil {
 		slog.Warn("failed to watch config file", "err", err)
@@ -170,12 +175,8 @@ func runServe() {
 					slog.Warn("failed to update shadow CIDR filters", "err", err)
 				}
 			}
+			srv.SetMaxSessionLifetime(newCfg.Proxy.MaxSessionLifetime)
 		})
-	}
-
-	srv, err := proxy.NewProxyServer(cfg, queryLogger, shadowSender)
-	if err != nil {
-		fatal("failed to create proxy server", "err", err)
 	}
 
 	metricsSrv := metrics.NewServer(cfg.Proxy.MetricsAddr)

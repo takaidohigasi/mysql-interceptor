@@ -25,6 +25,15 @@ minor versions).
   when shadow mode is on) so per-user GRANTs on the backend apply
   consistently, and the SQL log records the actual authenticated
   username instead of a single shared one.
+- **`proxy.max_session_lifetime`** — caps how long a client session may
+  remain open, with ±10% per-session jitter. After the deadline elapses
+  the proxy closes the session at the next safe boundary (between
+  commands, only when the backend is not in a transaction), letting the
+  client reconnect and rebalance onto the current backend pool. Useful
+  when the backend autoscales and existing pinned connections would
+  otherwise concentrate load on the older nodes. Hot-reloadable; 0
+  (default) disables. New metrics `sessions_closed_max_lifetime` and
+  `sessions_lifetime_postponed` expose the close decisions.
 
 ### Removed
 

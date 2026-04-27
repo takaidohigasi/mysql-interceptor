@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"os"
 	"sync"
@@ -34,6 +35,14 @@ type ProxyServer struct {
 	// use it to authenticate the session's outbound backend connection.
 	authHandler   *server.InMemoryAuthenticationHandler
 	userPasswords map[string]string
+
+	// maxSessionLifetime holds the configured cap. The underlying
+	// time.Duration is stored as int64 only because atomic.Int64 is the
+	// type the stdlib provides; the YAML accepts human-readable durations
+	// (e.g. "30m", "1h"). 0 means disabled. SetMaxSessionLifetime updates
+	// it without restarting the proxy; sessions read it on every loop
+	// iteration and apply per-session ±10% jitter.
+	maxSessionLifetime atomic.Int64
 
 	// sessions tracks active client connections so they can be closed on
 	// shutdown. The mutex guards insertion/deletion and final drain iteration.
@@ -82,6 +91,7 @@ func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *re
 	}
 
 	ps.serverConf = svr
+	ps.maxSessionLifetime.Store(int64(cfg.Proxy.MaxSessionLifetime))
 
 	if len(cfg.Proxy.Users) == 0 {
 		// config.Validate already enforces this, so the only way to hit
@@ -103,6 +113,25 @@ func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *re
 	ps.userPasswords = passwords
 
 	return ps, nil
+}
+
+// SetMaxSessionLifetime atomically updates the cap. 0 (or negative)
+// disables the cap entirely. The change applies to the per-iteration
+// check in handleConnection, so existing sessions pick it up after their
+// next command completes — no restart needed.
+func (ps *ProxyServer) SetMaxSessionLifetime(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	prev := ps.maxSessionLifetime.Swap(int64(d))
+	if prev != int64(d) {
+		slog.Info("max_session_lifetime updated", "lifetime", d)
+	}
+}
+
+// MaxSessionLifetime returns the currently configured cap (mostly for tests).
+func (ps *ProxyServer) MaxSessionLifetime() time.Duration {
+	return time.Duration(ps.maxSessionLifetime.Load())
 }
 
 func (ps *ProxyServer) Serve() error {
@@ -278,12 +307,52 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 		}
 	}
 
+	// Per-session lifetime jitter, computed once at session start. The
+	// cap itself is read atomically every iteration so SetMaxSessionLifetime
+	// takes effect on the next loop turn for existing sessions; the jitter
+	// factor stays fixed so a session can't oscillate around the deadline.
+	sessionStart := time.Now()
+	jitterFactor := 1.0 + (rand.Float64()*0.2 - 0.1) // [-10%, +10%]
+
 	for {
 		if err := serverConn.HandleCommand(); err != nil {
 			sessionLog.Debug("session closed", "err", err)
 			return
 		}
+		if ps.shouldCloseForLifetime(backendConn, sessionStart, jitterFactor, sessionLog) {
+			return
+		}
 	}
+}
+
+// shouldCloseForLifetime returns true when the session has exceeded its
+// per-session deadline AND the backend is not in a transaction. When the
+// deadline has passed but a transaction is open, the check is postponed
+// (counted in metrics) and the session continues.
+func (ps *ProxyServer) shouldCloseForLifetime(
+	backendConn interface{ IsInTransaction() bool },
+	start time.Time,
+	jitter float64,
+	sessionLog *slog.Logger,
+) bool {
+	cap := time.Duration(ps.maxSessionLifetime.Load())
+	if cap <= 0 {
+		return false
+	}
+	deadline := time.Duration(float64(cap) * jitter)
+	if time.Since(start) < deadline {
+		return false
+	}
+	if backendConn.IsInTransaction() {
+		metrics.Global.SessionsLifetimePostponed.Add(1)
+		sessionLog.Debug("session past max_lifetime but in transaction; postponing close",
+			"age", time.Since(start), "deadline", deadline)
+		return false
+	}
+	metrics.Global.SessionsClosedMaxLifetime.Add(1)
+	sessionLog.Info("closing session for max_session_lifetime",
+		"age", time.Since(start), "deadline", deadline)
+	return true
 }
 
 // Shutdown gracefully stops the proxy: stops accepting new connections,
