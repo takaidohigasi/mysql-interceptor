@@ -22,25 +22,27 @@ import (
 // Counters holds the metrics the server exposes. Fields are pointers to
 // atomic Int64 so handlers can observe them without a mutex.
 type Counters struct {
-	ActiveSessions         atomic.Int64
-	TotalSessions          atomic.Int64
-	QueriesHandled         atomic.Int64
-	QueryErrors            atomic.Int64
-	LoggerDropped          atomic.Int64
-	ShadowDropped          atomic.Int64
-	ShadowSkipped          atomic.Int64
-	ShadowDisabled         atomic.Int64 // sends rejected because shadow.enabled=false
-	ShadowSampledOut       atomic.Int64 // sends dropped by sample_rate roll
-	ShadowFilteredByCIDR   atomic.Int64 // sends rejected by CIDR allow/exclude filter
-	ShadowEnabledGauge     atomic.Int64 // 0 or 1; current toggle state
-	ShadowActiveSessions   atomic.Int64 // current count of pinned shadow sessions
-	ShadowQueriesReplayed  atomic.Int64
-	ComparisonsTotal       atomic.Int64
-	ComparisonsMatched     atomic.Int64
-	ComparisonsDiffered    atomic.Int64
-	ComparisonsIgnored     atomic.Int64
-	ComparisonsDigestOver  atomic.Int64 // new digests dropped because cap hit
-	ComparisonsDigestCount atomic.Int64 // current unique digests tracked (gauge)
+	ActiveSessions            atomic.Int64
+	TotalSessions             atomic.Int64
+	SessionsClosedMaxLifetime atomic.Int64 // sessions closed because max_session_lifetime elapsed
+	SessionsLifetimePostponed atomic.Int64 // expiry checks deferred because backend was in a transaction
+	QueriesHandled            atomic.Int64
+	QueryErrors               atomic.Int64
+	LoggerDropped             atomic.Int64
+	ShadowDropped             atomic.Int64
+	ShadowSkipped             atomic.Int64
+	ShadowDisabled            atomic.Int64 // sends rejected because shadow.enabled=false
+	ShadowSampledOut          atomic.Int64 // sends dropped by sample_rate roll
+	ShadowFilteredByCIDR      atomic.Int64 // sends rejected by CIDR allow/exclude filter
+	ShadowEnabledGauge        atomic.Int64 // 0 or 1; current toggle state
+	ShadowActiveSessions      atomic.Int64 // current count of pinned shadow sessions
+	ShadowQueriesReplayed     atomic.Int64
+	ComparisonsTotal          atomic.Int64
+	ComparisonsMatched        atomic.Int64
+	ComparisonsDiffered       atomic.Int64
+	ComparisonsIgnored        atomic.Int64
+	ComparisonsDigestOver     atomic.Int64 // new digests dropped because cap hit
+	ComparisonsDigestCount    atomic.Int64 // current unique digests tracked (gauge)
 }
 
 // Global is the singleton counter set. Components increment fields on it
@@ -129,6 +131,8 @@ func snapshot() []metric {
 		// Sessions
 		{"active_sessions", "gauge", "Current number of active client sessions", float64(Global.ActiveSessions.Load())},
 		{"total_sessions", "counter", "Total client sessions accepted since start", float64(Global.TotalSessions.Load())},
+		{"sessions_closed_max_lifetime", "counter", "Sessions closed because proxy.max_session_lifetime elapsed", float64(Global.SessionsClosedMaxLifetime.Load())},
+		{"sessions_lifetime_postponed", "counter", "Expiry checks deferred because the backend was mid-transaction", float64(Global.SessionsLifetimePostponed.Load())},
 
 		// Query pipeline
 		{"queries_handled", "counter", "Total queries forwarded to the backend", float64(Global.QueriesHandled.Load())},

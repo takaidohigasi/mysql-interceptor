@@ -14,6 +14,13 @@ proxy:
       password: "app_pw"
     # - username: "ro_user"
     #   password: "ro_pw"
+  # Optional cap on session lifetime — useful for forcing periodic
+  # reconnects so existing sessions rebalance onto new backends after
+  # autoscaling. After the cap (with ±10% per-session jitter) elapses,
+  # the proxy closes the session at the next safe boundary (between
+  # commands, only when the backend is not in a transaction). 0 disables.
+  # Hot-reloadable.
+  # max_session_lifetime: 1h
 
 backend:
   addr: "127.0.0.1:3306"

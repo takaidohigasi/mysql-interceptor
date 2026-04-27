@@ -40,6 +40,19 @@ type ProxyConfig struct {
 	// GRANTs on the backend apply consistently. At least one entry is
 	// required; the proxy never synthesizes credentials of its own.
 	Users []UserConfig `yaml:"users"`
+	// MaxSessionLifetime caps how long any client session may stay open.
+	// At session start the proxy snapshots a per-session jittered deadline
+	// (configured value ±10%); after each command completes, if the
+	// session is past its deadline AND the backend connection is not in
+	// a transaction, the proxy closes both the client and backend
+	// connections. The client is expected to reconnect — useful for
+	// rebalancing onto new backends after autoscaling.
+	//
+	// Mid-query and mid-transaction sessions are never interrupted: the
+	// check happens only between commands and only when the backend
+	// reports SERVER_STATUS_IN_TRANS = false. 0 (the default) disables
+	// the cap entirely. Hot-reloadable.
+	MaxSessionLifetime time.Duration `yaml:"max_session_lifetime,omitempty"`
 }
 
 // UserConfig describes one user the proxy will accept. The same plaintext
@@ -364,6 +377,9 @@ func (c *Config) Validate() error {
 		if r < 0.0 || r > 1.0 {
 			return fmt.Errorf("replay.shadow.sample_rate must be in [0.0, 1.0], got %v", r)
 		}
+	}
+	if c.Proxy.MaxSessionLifetime < 0 {
+		return fmt.Errorf("proxy.max_session_lifetime must be non-negative, got %v", c.Proxy.MaxSessionLifetime)
 	}
 	for i, cidr := range c.Replay.Shadow.AllowedSourceCIDRs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {

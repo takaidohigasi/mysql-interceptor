@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 // TestMaxConnectionsCapacity verifies that NewProxyServer sizes the
@@ -84,6 +87,65 @@ func TestUsersWiring(t *testing.T) {
 			t.Error("unexpected user mallory in userPasswords")
 		}
 	})
+}
+
+// fakeBackend implements just the bit of *client.Conn that
+// shouldCloseForLifetime cares about, so we can test the close decision
+// without a real MySQL.
+type fakeBackend struct{ inTx bool }
+
+func (f fakeBackend) IsInTransaction() bool { return f.inTx }
+
+func TestShouldCloseForLifetime(t *testing.T) {
+	srv := &ProxyServer{}
+	logger := slog.Default()
+
+	// Cap disabled (0) → never close.
+	if srv.shouldCloseForLifetime(fakeBackend{}, time.Now().Add(-time.Hour), 1.0, logger) {
+		t.Error("disabled cap (0) should never trigger close")
+	}
+
+	srv.SetMaxSessionLifetime(time.Minute)
+
+	// Inside the deadline → don't close.
+	if srv.shouldCloseForLifetime(fakeBackend{}, time.Now().Add(-30*time.Second), 1.0, logger) {
+		t.Error("session inside deadline should not be closed")
+	}
+
+	// Past deadline, no transaction → close.
+	if !srv.shouldCloseForLifetime(fakeBackend{inTx: false}, time.Now().Add(-2*time.Minute), 1.0, logger) {
+		t.Error("session past deadline (no tx) should be closed")
+	}
+
+	// Past deadline, but in transaction → postpone (don't close).
+	postponedBefore := metrics.Global.SessionsLifetimePostponed.Load()
+	if srv.shouldCloseForLifetime(fakeBackend{inTx: true}, time.Now().Add(-2*time.Minute), 1.0, logger) {
+		t.Error("in-transaction session past deadline must not be closed")
+	}
+	if got := metrics.Global.SessionsLifetimePostponed.Load(); got != postponedBefore+1 {
+		t.Errorf("expected SessionsLifetimePostponed to increment by 1, got %d → %d", postponedBefore, got)
+	}
+
+	// Jitter widens the deadline. With jitter=1.10 the effective deadline
+	// is 66s, so a 65s-old session must not be closed.
+	if srv.shouldCloseForLifetime(fakeBackend{}, time.Now().Add(-65*time.Second), 1.10, logger) {
+		t.Error("session inside jittered deadline should not be closed")
+	}
+}
+
+func TestSetMaxSessionLifetime(t *testing.T) {
+	srv := &ProxyServer{}
+	if got := srv.MaxSessionLifetime(); got != 0 {
+		t.Errorf("default = %v, want 0", got)
+	}
+	srv.SetMaxSessionLifetime(5 * time.Minute)
+	if got := srv.MaxSessionLifetime(); got != 5*time.Minute {
+		t.Errorf("after set = %v, want 5m", got)
+	}
+	srv.SetMaxSessionLifetime(-1) // negative gets clamped to 0
+	if got := srv.MaxSessionLifetime(); got != 0 {
+		t.Errorf("after set(-1) = %v, want 0 (clamped)", got)
+	}
 }
 
 // TestRedactArgs verifies the local redact helper.
