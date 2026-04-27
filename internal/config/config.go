@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -172,8 +173,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
+	expanded, err := expandEnvVars(data)
+	if err != nil {
+		return nil, fmt.Errorf("expanding env vars in config: %w", err)
+	}
+
 	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	if err := yaml.Unmarshal(expanded, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
@@ -184,6 +190,39 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// envVarPattern matches ${VAR} references where VAR starts with a letter
+// or underscore and contains letters, digits, or underscores.
+//
+// The bash-style $VAR (without braces) is intentionally not matched: SQL
+// statements legitimately use $ (e.g. "SELECT $1") and we don't want to
+// silently mangle them.
+var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandEnvVars replaces every ${VAR} in data with the value of the
+// corresponding environment variable. References to unset env vars are
+// collected and returned as a single error so the operator can fix them
+// all in one go rather than discovering them one at a time.
+func expandEnvVars(data []byte) ([]byte, error) {
+	var missing []string
+	seen := map[string]bool{}
+	out := envVarPattern.ReplaceAllFunc(data, func(match []byte) []byte {
+		name := string(match[2 : len(match)-1])
+		val, ok := os.LookupEnv(name)
+		if !ok {
+			if !seen[name] {
+				seen[name] = true
+				missing = append(missing, name)
+			}
+			return match
+		}
+		return []byte(val)
+	})
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("unset env vars referenced in config: %s", strings.Join(missing, ", "))
+	}
+	return out, nil
 }
 
 func applyDefaults(cfg *Config) {

@@ -7,6 +7,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="unreleased"></a>
+## Unreleased
+
+### Added
+
+- **Environment variable interpolation in config** — any string in
+  `config.yaml` can now reference an env var as `${VAR}`, expanded at load
+  time and on each hot-reload. Lets operators keep credentials in env vars
+  / Secret Manager instead of committing them. Bare `$VAR` (no braces) is
+  intentionally left untouched so SQL fragments like `SELECT $1` survive
+  unchanged. Referencing an unset variable fails the load with all missing
+  names listed.
+
 <a id="v0.0.3"></a>
 ## v0.0.3
 

@@ -77,6 +77,32 @@ backend:
   password: "secret"
 ```
 
+### Environment variable interpolation
+
+Any string in the config file may reference an environment variable using
+`${VAR}` syntax. References are expanded at load time (and on each
+hot-reload), which lets you keep credentials in env vars / Secret Manager
+instead of committing them to the config file:
+
+```yaml
+backend:
+  addr: "tidb.internal.example:3306"
+  user: "${MYSQL_USER}"
+  password: "${MYSQL_PASSWORD}"
+
+replay:
+  shadow:
+    target_addr: "tidb-shadow.internal.example:3306"
+    target_user: "${MYSQL_USER}"
+    target_password: "${MYSQL_PASSWORD}"
+```
+
+Notes:
+- Only the `${VAR}` form is expanded. Bare `$VAR` is left as-is so SQL
+  fragments like `SELECT $1` or `SET @counter = ...` aren't mangled.
+- Referencing an unset variable causes `Load()` to fail with all missing
+  names listed at once.
+
 ### TLS
 
 TLS is configurable independently on both sides:
