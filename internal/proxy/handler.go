@@ -42,6 +42,16 @@ type preparedStmt struct {
 }
 
 func (h *ProxyHandler) UseDB(dbName string) error {
+	// Called during the inbound handshake when the client connects with
+	// CONNECT_WITH_DB; at that point the backend connection has not yet
+	// been opened (we need the authenticated user first). Record the
+	// requested database so handleConnection can pass it to
+	// backend.Connect, which brings the backend up already on this DB.
+	if h.backend == nil {
+		h.currentDB = dbName
+		return nil
+	}
+
 	start := time.Now()
 	_, err := h.backend.Execute("USE " + dbName)
 	if err != nil {

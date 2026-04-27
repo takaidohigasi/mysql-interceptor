@@ -33,13 +33,37 @@ type ProxyConfig struct {
 	MetricsAddr     string        `yaml:"metrics_addr"` // "" to disable; e.g. "127.0.0.1:9090"
 	MaxConnections  int           `yaml:"max_connections"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	// Users is the list of credentials the proxy will accept on the
+	// inbound handshake. The matched (username, password) pair is also
+	// used to authenticate the per-session outbound connection to the
+	// backend (and the shadow, when shadow mode is on), so per-user
+	// GRANTs on the backend apply consistently. At least one entry is
+	// required; the proxy never synthesizes credentials of its own.
+	Users []UserConfig `yaml:"users"`
 }
 
-type BackendConfig struct {
-	Addr     string `yaml:"addr"`
-	User     string `yaml:"user"`
+// UserConfig describes one user the proxy will accept. The same plaintext
+// password is used both to validate the inbound client handshake and to
+// authenticate the proxy's outbound connection to the backend (and shadow,
+// when shadow mode is on).
+type UserConfig struct {
+	Username string `yaml:"username"`
 	Password string `yaml:"password"`
-	DB       string `yaml:"db"`
+}
+
+// BackendConfig identifies the backend MySQL server the proxy talks to.
+// Only Addr (and optionally DB) are user-configurable in YAML; User and
+// Password are populated per-session from the matched ProxyConfig.Users
+// entry at handshake time and never read from config.
+type BackendConfig struct {
+	Addr string `yaml:"addr"`
+	DB   string `yaml:"db,omitempty"`
+
+	// User and Password are not yaml-bound: they're set at runtime from
+	// the matched ProxyConfig.Users entry. Kept on this struct so it can
+	// be passed straight to backend.Connect.
+	User     string `yaml:"-"`
+	Password string `yaml:"-"`
 }
 
 type TLSConfig struct {
@@ -304,8 +328,21 @@ func (c *Config) Validate() error {
 	if c.Backend.Addr == "" {
 		return fmt.Errorf("backend.addr is required")
 	}
-	if c.Backend.User == "" {
-		return fmt.Errorf("backend.user is required")
+	// proxy.users is the only way to authenticate clients. The proxy
+	// always opens its outbound backend connection using the inbound
+	// user's credentials, so at least one entry is required.
+	if len(c.Proxy.Users) == 0 {
+		return fmt.Errorf("proxy.users must contain at least one entry")
+	}
+	seen := make(map[string]bool, len(c.Proxy.Users))
+	for i, u := range c.Proxy.Users {
+		if u.Username == "" {
+			return fmt.Errorf("proxy.users[%d].username is required", i)
+		}
+		if seen[u.Username] {
+			return fmt.Errorf("proxy.users[%d].username %q is duplicated", i, u.Username)
+		}
+		seen[u.Username] = true
 	}
 	switch c.Replay.Mode {
 	case "disabled", "shadow", "offline":

@@ -70,12 +70,19 @@ See [config.example.yaml](config.example.yaml) for all options. Key sections:
 ```yaml
 proxy:
   listen_addr: "0.0.0.0:3307"
+  users:
+    - username: "app_user"
+      password: "app_pw"
 
 backend:
   addr: "127.0.0.1:3306"
-  user: "root"
-  password: "secret"
 ```
+
+`proxy.users` is required. Each session's backend connection is opened
+with the credentials the client logged in with, so per-user GRANTs on
+the backend apply consistently. There is no global `backend.user` /
+`backend.password` — those would be a single shared identity, which
+defeats the per-user model.
 
 ### Environment variable interpolation
 
@@ -102,6 +109,24 @@ Notes:
   fragments like `SELECT $1` or `SET @counter = ...` aren't mangled.
 - Referencing an unset variable causes `Load()` to fail with all missing
   names listed at once.
+
+### Multiple users
+
+Add as many `(username, password)` pairs to `proxy.users` as you need.
+Clients can authenticate as any of them, and each session's outbound
+backend (and shadow) connection uses the same credentials. The SQL log
+records the actual authenticated username.
+
+```yaml
+proxy:
+  users:
+    - username: "app_user"
+      password: "app_pw"
+    - username: "ro_user"
+      password: "ro_pw"
+    - username: "${MYSQL_REPLICATION_USER}"   # works with env-var expansion
+      password: "${MYSQL_REPLICATION_PASSWORD}"
+```
 
 ### TLS
 

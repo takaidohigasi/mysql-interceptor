@@ -142,7 +142,13 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 // should skip shadowing in that case. If the backend connection fails,
 // returns the error so the caller can decide whether to proceed without
 // shadow (recommended) or surface it.
-func (s *ShadowSender) StartSession(sessionID uint64, initialDB string) (*ShadowSession, error) {
+//
+// If user is non-empty, the shadow connection is opened with that user
+// and password instead of the configured shadow.target_user / target_password.
+// This is used in multi-user proxy mode so the shadow connection mirrors
+// the same identity the primary session used, preserving per-user GRANTs
+// on the shadow target.
+func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password string) (*ShadowSession, error) {
 	if s.closed.Load() {
 		return nil, fmt.Errorf("shadow sender is closed")
 	}
@@ -150,7 +156,12 @@ func (s *ShadowSender) StartSession(sessionID uint64, initialDB string) (*Shadow
 		return nil, nil
 	}
 
-	conn, err := backend.Connect(s.backendCfg, s.tlsCfg)
+	backendCfg := s.backendCfg
+	if user != "" {
+		backendCfg.User = user
+		backendCfg.Password = password
+	}
+	conn, err := backend.Connect(backendCfg, s.tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to shadow server: %w", err)
 	}

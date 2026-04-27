@@ -46,12 +46,13 @@ func startInProcessProxyWithShadow(t *testing.T) (proxyAddr string, shadow *repl
 		Proxy: config.ProxyConfig{
 			ListenAddr:      addr,
 			ShutdownTimeout: 5 * time.Second,
+			Users: []config.UserConfig{
+				{Username: "root", Password: "rootpass"},
+			},
 		},
 		Backend: config.BackendConfig{
-			Addr:     primaryAddr,
-			User:     "root",
-			Password: "rootpass",
-			DB:       "test_db",
+			Addr: primaryAddr,
+			DB:   "test_db",
 		},
 		Replay: config.ReplayConfig{
 			Mode: "shadow",

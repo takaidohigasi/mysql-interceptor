@@ -3,11 +3,20 @@ proxy:
   metrics_addr: "127.0.0.1:9090"   # "" to disable; exposes /healthz, /metrics, /debug/vars
   max_connections: 1000
   shutdown_timeout: 30s
+  # users defines the credentials the proxy will accept on the inbound
+  # handshake. The matched (username, password) pair is also used to
+  # authenticate the per-session outbound connection to the backend (and
+  # shadow, if shadow mode is on), so per-user GRANTs apply consistently.
+  # At least one entry is required; the proxy never synthesizes its own
+  # credentials.
+  users:
+    - username: "app_user"
+      password: "app_pw"
+    # - username: "ro_user"
+    #   password: "ro_pw"
 
 backend:
   addr: "127.0.0.1:3306"
-  user: "root"
-  password: ""
   db: ""
 
 tls:
