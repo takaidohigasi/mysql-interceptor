@@ -11,10 +11,11 @@ func TestLoad_ValidConfig(t *testing.T) {
 	content := `
 proxy:
   listen_addr: "0.0.0.0:3307"
+  users:
+    - username: "root"
+      password: "pass"
 backend:
   addr: "127.0.0.1:3306"
-  user: "root"
-  password: "pass"
 logging:
   enabled: true
   output_dir: "/tmp/logs"
@@ -67,7 +68,10 @@ func TestLoad_InvalidReplayMode(t *testing.T) {
 	content := `
 backend:
   addr: "127.0.0.1:3306"
-  user: "root"
+proxy:
+  users:
+    - username: "root"
+      password: "p"
 replay:
   mode: "invalid"
 `
@@ -81,11 +85,84 @@ replay:
 	}
 }
 
+func TestLoad_MultiUserMode(t *testing.T) {
+	// Each session opens its backend connection using the authenticated
+	// user's creds; backend.user is not used.
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "alice"
+      password: "alice-pw"
+    - username: "bob"
+      password: "bob-pw"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if len(cfg.Proxy.Users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(cfg.Proxy.Users))
+	}
+	if cfg.Proxy.Users[0].Username != "alice" || cfg.Proxy.Users[0].Password != "alice-pw" {
+		t.Errorf("user[0] = %+v, want {alice, alice-pw}", cfg.Proxy.Users[0])
+	}
+}
+
+func TestLoad_MultiUserDuplicateRejected(t *testing.T) {
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "alice"
+      password: "p1"
+    - username: "alice"
+      password: "p2"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	os.WriteFile(cfgPath, []byte(content), 0o644)
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Error("expected validation error for duplicate username")
+	}
+}
+
+func TestLoad_MultiUserMissingUsernameRejected(t *testing.T) {
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - password: "p1"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	os.WriteFile(cfgPath, []byte(content), 0o644)
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Error("expected validation error for missing username")
+	}
+}
+
 func TestLoad_TLSRequiresCertAndKey(t *testing.T) {
 	content := `
 backend:
   addr: "127.0.0.1:3306"
-  user: "root"
+proxy:
+  users:
+    - username: "root"
+      password: "p"
 tls:
   client_side:
     enabled: true
@@ -107,8 +184,10 @@ func TestLoad_ExpandsEnvVars(t *testing.T) {
 	content := `
 backend:
   addr: "127.0.0.1:3306"
-  user: "${MI_TEST_USER}"
-  password: "${MI_TEST_PASS}"
+proxy:
+  users:
+    - username: "${MI_TEST_USER}"
+      password: "${MI_TEST_PASS}"
 replay:
   mode: "shadow"
   shadow:
@@ -127,11 +206,11 @@ replay:
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	if cfg.Backend.User != "mercari_user" {
-		t.Errorf("expected backend.user=mercari_user, got %q", cfg.Backend.User)
+	if got := cfg.Proxy.Users[0].Username; got != "mercari_user" {
+		t.Errorf("expected proxy.users[0].username=mercari_user, got %q", got)
 	}
-	if cfg.Backend.Password != "s3cr3t" {
-		t.Errorf("expected backend.password=s3cr3t, got %q", cfg.Backend.Password)
+	if got := cfg.Proxy.Users[0].Password; got != "s3cr3t" {
+		t.Errorf("expected proxy.users[0].password=s3cr3t, got %q", got)
 	}
 	if cfg.Replay.Shadow.TargetUser != "mercari_user" {
 		t.Errorf("expected shadow.target_user=mercari_user, got %q", cfg.Replay.Shadow.TargetUser)
@@ -149,8 +228,10 @@ func TestLoad_UnsetEnvVarErrors(t *testing.T) {
 	content := `
 backend:
   addr: "127.0.0.1:3306"
-  user: "${MI_TEST_DEFINITELY_UNSET_1}"
-  password: "${MI_TEST_DEFINITELY_UNSET_2}"
+proxy:
+  users:
+    - username: "${MI_TEST_DEFINITELY_UNSET_1}"
+      password: "${MI_TEST_DEFINITELY_UNSET_2}"
 `
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "config.yaml")
@@ -179,7 +260,10 @@ func TestLoad_DoesNotExpandBareDollar(t *testing.T) {
 	content := `
 backend:
   addr: "127.0.0.1:3306"
-  user: "${MI_TEST_USER}"
+proxy:
+  users:
+    - username: "${MI_TEST_USER}"
+      password: "p"
 bench:
   queries:
     - "SELECT $1, $foo FROM dual"

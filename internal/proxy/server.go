@@ -28,6 +28,13 @@ type ProxyServer struct {
 	logger       *logging.Logger
 	shadowSender *replay.ShadowSender
 
+	// authHandler validates the inbound MySQL handshake against
+	// cfg.Proxy.Users. The same map keys are mirrored in userPasswords
+	// so we can recover the plaintext password after the handshake and
+	// use it to authenticate the session's outbound backend connection.
+	authHandler   *server.InMemoryAuthenticationHandler
+	userPasswords map[string]string
+
 	// sessions tracks active client connections so they can be closed on
 	// shutdown. The mutex guards insertion/deletion and final drain iteration.
 	sessionsMu sync.Mutex
@@ -75,6 +82,25 @@ func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *re
 	}
 
 	ps.serverConf = svr
+
+	if len(cfg.Proxy.Users) == 0 {
+		// config.Validate already enforces this, so the only way to hit
+		// this branch is constructing a Config struct directly in a test.
+		// Return an error rather than crashing later in handleConnection.
+		cancel()
+		return nil, fmt.Errorf("proxy.users must contain at least one entry")
+	}
+	ah := server.NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
+	passwords := make(map[string]string, len(cfg.Proxy.Users))
+	for _, u := range cfg.Proxy.Users {
+		if err := ah.AddUser(u.Username, u.Password); err != nil {
+			cancel()
+			return nil, fmt.Errorf("adding user %q: %w", u.Username, err)
+		}
+		passwords[u.Username] = u.Password
+	}
+	ps.authHandler = ah
+	ps.userPasswords = passwords
 
 	return ps, nil
 }
@@ -165,19 +191,52 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	sessionLog := slog.With("session_id", sessionID, "remote", remoteAddr)
 	sessionLog.Info("new connection")
 
-	backendConn, err := backend.Connect(ps.cfg.Backend, ps.cfg.TLS.BackendSide)
+	handler := &ProxyHandler{
+		sessionID: sessionID,
+		sourceIP:  sourceIP,
+	}
+
+	// Run the inbound handshake first; we need the authenticated user
+	// before we can open the per-session outbound backend connection.
+	serverConn, err := ps.serverConf.NewCustomizedConn(conn, ps.authHandler, handler)
 	if err != nil {
-		sessionLog.Error("backend connect error", "err", err)
+		sessionLog.Error("handshake error", "err", err)
+		return
+	}
+	backendUser := serverConn.GetUser()
+	backendPass, ok := ps.userPasswords[backendUser]
+	if !ok {
+		// Should not happen: authHandler approved a user we don't have a
+		// plaintext password for. Fail loudly so the missing entry gets
+		// noticed instead of silently falling back.
+		sessionLog.Error("authenticated user has no backend password mapping", "user", backendUser)
+		return
+	}
+
+	backendCfg := ps.cfg.Backend
+	backendCfg.User = backendUser
+	backendCfg.Password = backendPass
+	// If the client sent CONNECT_WITH_DB during the handshake,
+	// ProxyHandler.UseDB has already recorded it in handler.currentDB.
+	// Override the configured default so the backend connection comes up
+	// on the same DB the client expects.
+	if handler.currentDB != "" {
+		backendCfg.DB = handler.currentDB
+	}
+	backendConn, err := backend.Connect(backendCfg, ps.cfg.TLS.BackendSide)
+	if err != nil {
+		sessionLog.Error("backend connect error", "err", err, "user", backendUser)
 		return
 	}
 	defer backendConn.Close()
 
 	// Start a dedicated shadow session if shadow is configured. A failure
 	// here must never fail the primary — we just proceed without shadow
-	// for this session.
+	// for this session. The shadow connection uses the same credentials
+	// so per-user GRANTs apply consistently.
 	var shadowSession *replay.ShadowSession
 	if ps.shadowSender != nil {
-		ss, sErr := ps.shadowSender.StartSession(sessionID, backendConn.GetDB())
+		ss, sErr := ps.shadowSender.StartSession(sessionID, backendConn.GetDB(), backendUser, backendPass)
 		if sErr != nil {
 			sessionLog.Warn("shadow session start failed; continuing without shadow for this session",
 				"err", sErr)
@@ -187,13 +246,9 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 		}
 	}
 
-	handler := &ProxyHandler{
-		sessionID:     sessionID,
-		sourceIP:      sourceIP,
-		backend:       backendConn,
-		currentDB:     backendConn.GetDB(),
-		shadowSession: shadowSession,
-	}
+	handler.backend = backendConn
+	handler.currentDB = backendConn.GetDB()
+	handler.shadowSession = shadowSession
 
 	if ps.logger != nil {
 		redactArgs := ps.cfg.Logging.RedactArgs
@@ -210,7 +265,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 				Timestamp:    evt.Timestamp,
 				SessionID:    evt.SessionID,
 				SourceIP:     remoteAddr,
-				User:         ps.cfg.Backend.User,
+				User:         backendUser,
 				Database:     handler.currentDB,
 				QueryType:    evt.QueryType,
 				Query:        evt.Query,
@@ -221,12 +276,6 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 				Error:        errStr,
 			})
 		}
-	}
-
-	serverConn, err := ps.serverConf.NewConn(conn, ps.cfg.Backend.User, ps.cfg.Backend.Password, handler)
-	if err != nil {
-		sessionLog.Error("handshake error", "err", err)
-		return
 	}
 
 	for {

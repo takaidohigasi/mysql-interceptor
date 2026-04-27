@@ -33,12 +33,13 @@ func startInProcessProxy(t *testing.T) (string, func()) {
 		Proxy: config.ProxyConfig{
 			ListenAddr:      addr,
 			ShutdownTimeout: 5 * time.Second,
+			Users: []config.UserConfig{
+				{Username: "root", Password: "rootpass"},
+			},
 		},
 		Backend: config.BackendConfig{
-			Addr:     backendAddr,
-			User:     "root",
-			Password: "rootpass",
-			DB:       "test_db",
+			Addr: backendAddr,
+			DB:   "test_db",
 		},
 	}
 

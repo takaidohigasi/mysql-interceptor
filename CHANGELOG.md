@@ -19,6 +19,30 @@ minor versions).
   intentionally left untouched so SQL fragments like `SELECT $1` survive
   unchanged. Referencing an unset variable fails the load with all missing
   names listed.
+- **`proxy.users`** — the proxy now authenticates clients against a
+  configured `(username, password)` list. The matched credentials are
+  reused for the outbound backend connection (and the shadow connection,
+  when shadow mode is on) so per-user GRANTs on the backend apply
+  consistently, and the SQL log records the actual authenticated
+  username instead of a single shared one.
+
+### Removed
+
+- **Single-user mode.** `backend.user` / `backend.password` are no
+  longer read from YAML — they were a single shared identity for every
+  client, which defeated per-user GRANTs and per-user audit. `proxy.users`
+  is now required (at least one entry). To migrate:
+
+  ```diff
+   backend:
+     addr: "tidb.internal:3306"
+  -  user: "${MYSQL_USER}"
+  -  password: "${MYSQL_PASSWORD}"
+  +proxy:
+  +  users:
+  +    - username: "${MYSQL_USER}"
+  +      password: "${MYSQL_PASSWORD}"
+  ```
 
 <a id="v0.0.3"></a>
 ## v0.0.3
