@@ -62,7 +62,16 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		IgnoreQueryRegex: ignoreRegexes,
 	})
 
-	reporter, err := compare.NewReporterWithDigestCap(compareCfg.OutputFile, compareCfg.MaxUniqueDigests)
+	// Offline mode always emits every record to the report file: the
+	// file *is* the output, and operators run offline replay
+	// specifically to get a full diff report (including matched and
+	// ignored entries). LogMatches/HeartbeatInterval from config are
+	// shadow-mode tunables and are not honored here.
+	reporter, err := compare.NewReporterFromOptions(compare.ReporterOptions{
+		OutputFile:       compareCfg.OutputFile,
+		MaxUniqueDigests: compareCfg.MaxUniqueDigests,
+		LogMatches:       true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("creating reporter: %w", err)
 	}

@@ -214,6 +214,24 @@ type ComparisonConfig struct {
 	// be ahead of the per-digest table by a small number of in-flight
 	// records. This self-corrects on the next tick and at shutdown.
 	SummaryInterval time.Duration `yaml:"summary_interval"`
+
+	// LogMatches controls whether *every* comparison record is written
+	// to OutputFile, or only the differences. Shadow mode only —
+	// offline replay always writes a complete report regardless. When
+	// false (default), matched and ignored comparisons are suppressed
+	// inline and are represented only by the periodic heartbeat below.
+	// Set true if you need a full audit trail of every comparison
+	// (note: at high QPS this can be very noisy).
+	LogMatches bool `yaml:"log_matches"`
+
+	// HeartbeatInterval controls how often the reporter writes a
+	// "type":"heartbeat" line to OutputFile summarizing the previous
+	// window (matched / differed / ignored counts since the last
+	// heartbeat). Useful as a liveness signal when LogMatches is off
+	// and traffic is mostly clean — the absence of diff lines for a
+	// while otherwise looks indistinguishable from a stuck proxy. Only
+	// shadow mode emits heartbeats. Negative disables. Default 1m.
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
 }
 
 func Load(path string) (*Config, error) {
@@ -353,6 +371,11 @@ func applyDefaults(cfg *Config) {
 	// which the shadow sender treats as "do not start the loop".
 	if cfg.Comparison.SummaryInterval == 0 {
 		cfg.Comparison.SummaryInterval = time.Hour
+	}
+	// Same convention as SummaryInterval: 0 → default, negative →
+	// disabled.
+	if cfg.Comparison.HeartbeatInterval == 0 {
+		cfg.Comparison.HeartbeatInterval = time.Minute
 	}
 }
 
