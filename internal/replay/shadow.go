@@ -34,12 +34,13 @@ type ShadowQuery struct {
 // primary are faithfully mirrored on the shadow.
 type ShadowSender struct {
 	// Shared dependencies
-	backendCfg     config.BackendConfig
-	tlsCfg         config.BackendSideTLSConfig
-	engine         *compare.Engine
-	reporter       *compare.Reporter
-	timeout        time.Duration
-	sessionQueueSz int
+	backendCfg      config.BackendConfig
+	tlsCfg          config.BackendSideTLSConfig
+	engine          *compare.Engine
+	reporter        *compare.Reporter
+	timeout         time.Duration
+	sessionQueueSz  int
+	summaryInterval time.Duration // 0 falls back to 1h; negative disables periodic logging
 
 	// Aggregate counters (across all sessions)
 	dropped    atomic.Int64
@@ -101,14 +102,15 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 			User:     cfg.TargetUser,
 			Password: cfg.TargetPassword,
 		},
-		tlsCfg:         cfg.TLS,
-		engine:         engine,
-		reporter:       reporter,
-		timeout:        cfg.Timeout,
-		sessionQueueSz: queueSize,
-		sessions:       make(map[uint64]*ShadowSession),
-		ctx:            ctx,
-		cancel:         cancel,
+		tlsCfg:          cfg.TLS,
+		engine:          engine,
+		reporter:        reporter,
+		timeout:         cfg.Timeout,
+		sessionQueueSz:  queueSize,
+		summaryInterval: compareCfg.SummaryInterval,
+		sessions:        make(map[uint64]*ShadowSession),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	initiallyEnabled := true
@@ -134,7 +136,39 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 	}
 	s.sampleRateBits.Store(math.Float64bits(initialRate))
 
+	// applyDefaults already converts 0 → 1h, but tests construct
+	// ShadowSender via NewShadowSender directly with a hand-built
+	// ComparisonConfig that may leave SummaryInterval zero. Mirror the
+	// same fallback here so behavior matches the documented contract
+	// regardless of whether config.Load() ran.
+	interval := s.summaryInterval
+	if interval == 0 {
+		interval = time.Hour
+	}
+	if interval > 0 {
+		go s.runPeriodicSummary(interval)
+	}
+
 	return s, nil
+}
+
+// runPeriodicSummary logs the cumulative comparison summary on each
+// tick. The same summary is also logged once at Close(); the periodic
+// log is for long-running pods where waiting for shutdown isn't
+// practical. The loop exits when s.ctx is cancelled.
+func (s *ShadowSender) runPeriodicSummary(interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-t.C:
+			slog.Info("shadow comparison periodic summary",
+				"interval", interval,
+				"summary", s.reporter.Summary())
+		}
+	}
 }
 
 // StartSession opens a dedicated shadow connection for the given primary
