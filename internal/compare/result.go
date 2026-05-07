@@ -3,9 +3,9 @@ package compare
 import "time"
 
 type CompareResult struct {
-	Query       string    `json:"query"`
-	QueryDigest string    `json:"query_digest"`
-	SessionID   uint64    `json:"session_id"`
+	Query       string `json:"query"`
+	QueryDigest string `json:"query_digest"`
+	SessionID   uint64 `json:"session_id"`
 	// User identifies which authenticated MySQL user issued the query.
 	// Populated by the engine from whatever the caller passes; in shadow
 	// mode this is the user authenticated on the inbound proxy session,
