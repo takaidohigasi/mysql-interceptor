@@ -170,13 +170,11 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 	}
 
 	// Enforce per-query timeout. go-mysql's Execute has no native ctx
-	// parameter, so we race it against a timer. On timeout we close the
-	// connection (causing Execute to error out) and tear the session
-	// down — a stuck shadow connection is unrecoverable.
-	type execResult struct {
-		result *compare.CapturedResult
-		err    error
-	}
+	// parameter, so we race it against a timer. On timeout we abort the
+	// in-flight Execute by setting a past deadline on the underlying
+	// net.Conn, then drain the goroutine before closing — see the
+	// abortInFlightExec helper for why Close() can't race Execute
+	// directly.
 	done := make(chan execResult, 1)
 	go func() {
 		r, e := ExecuteAndCapture(ss.conn, sq.Query, sq.Args...)
@@ -210,12 +208,43 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 	case <-time.After(timeout):
 		slog.Warn("shadow: query timeout exceeded, tearing down session",
 			"session_id", ss.sessionID, "timeout", timeout, "query", sq.Query)
+		ss.abortInFlightExec(done)
 		ss.conn.Close()
 		metrics.Global.ShadowDropped.Add(1)
 		ss.cancel()
 	case <-ss.ctx.Done():
+		ss.abortInFlightExec(done)
 		ss.conn.Close()
 	}
+}
+
+// execResult carries the (result, err) pair from the per-query
+// Execute goroutine back to processQuery via a buffered channel.
+// Lifted out of processQuery so abortInFlightExec can name it in its
+// receiver-method signature.
+type execResult struct {
+	result *compare.CapturedResult
+	err    error
+}
+
+// abortInFlightExec poisons the shadow connection so the in-flight
+// Execute returns with an i/o-deadline error, then waits for the
+// Execute goroutine to drain `done`. After this returns it is safe
+// to call ss.conn.Close() without racing the Execute goroutine on
+// packet.Conn's buffered writer or Sequence field.
+//
+// We use net.Conn.SetDeadline (goroutine-safe per stdlib) instead of
+// ss.conn.Close() because go-mysql's *client.Conn isn't safe for
+// concurrent Close-while-Execute: Close clears packet.Conn.Sequence
+// at the same time Execute's writeCommand mutates it, which the race
+// detector flags. SetDeadline only touches the underlying net.Conn,
+// not Sequence, so the in-flight Execute returns cleanly.
+func (ss *ShadowSession) abortInFlightExec(done <-chan execResult) {
+	// A past deadline aborts both reads and writes on the underlying
+	// net.Conn. Reachable via method promotion: client.Conn embeds
+	// *packet.Conn, which embeds net.Conn.
+	_ = ss.conn.SetDeadline(time.Now().Add(-time.Second))
+	<-done
 }
 
 // startsWithKeyword is a case-insensitive prefix check after stripping
