@@ -139,7 +139,12 @@ func (ss *ShadowSession) Close() {
 	ss.sender.unregisterSession(ss.sessionID)
 }
 
-// run drains queryCh serially on ss.conn. Exits on ctx cancel.
+// run drains queryCh serially on ss.conn. On ctx cancel it makes a
+// best-effort pass to drain any already-enqueued queries before
+// exiting, so audit records aren't silently lost when the primary
+// session ends with queries still buffered. New queries arriving
+// after ctx is cancelled are dropped by the producer side
+// (ShadowSession.Send checks ss.closed first).
 func (ss *ShadowSession) run() {
 	defer close(ss.done)
 
@@ -149,9 +154,33 @@ func (ss *ShadowSession) run() {
 	for {
 		select {
 		case <-ss.ctx.Done():
+			ss.drainOnShutdown(engine, reporter)
 			return
 		case sq := <-ss.queryCh:
 			ss.processQuery(sq, engine, reporter)
+		}
+	}
+}
+
+// drainOnShutdown processes queries already buffered in queryCh after
+// ctx cancellation. We need this because Go's select picks among
+// ready cases pseudo-randomly: with ctx cancelled and queryCh
+// holding items, the outer loop in run() can exit via ctx.Done() and
+// silently lose every remaining query — operators tailing the diff
+// report would see audit records vanish at session boundaries.
+//
+// processQuery itself observes ctx.Done() inside its own select; the
+// drain goroutine still launches there, but if Execute already
+// completed before the cancel arrived, the result is recorded
+// normally (see the non-blocking peek at done in processQuery's
+// ctx-cancel arm).
+func (ss *ShadowSession) drainOnShutdown(engine *compare.Engine, reporter *compare.Reporter) {
+	for {
+		select {
+		case sq := <-ss.queryCh:
+			ss.processQuery(sq, engine, reporter)
+		default:
+			return
 		}
 	}
 }
@@ -188,23 +217,7 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 
 	select {
 	case res := <-done:
-		if res.err != nil {
-			slog.Debug("shadow: execution error",
-				"session_id", ss.sessionID, "err", res.err)
-			// Still record the error in the comparison report so it
-			// shows up as a divergence the operator can audit.
-			if sq.OrigResult != nil {
-				replayRes := &compare.CapturedResult{Error: res.err.Error()}
-				cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.User, sq.SessionID)
-				reporter.Record(cmpResult)
-			}
-			return
-		}
-		metrics.Global.ShadowQueriesReplayed.Add(1)
-		if sq.OrigResult != nil {
-			cmpResult := engine.Compare(sq.OrigResult, res.result, sq.Query, sq.User, sq.SessionID)
-			reporter.Record(cmpResult)
-		}
+		ss.recordResult(sq, res, engine, reporter)
 	case <-time.After(timeout):
 		slog.Warn("shadow: query timeout exceeded, tearing down session",
 			"session_id", ss.sessionID, "timeout", timeout, "query", sq.Query)
@@ -213,8 +226,42 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 		metrics.Global.ShadowDropped.Add(1)
 		ss.cancel()
 	case <-ss.ctx.Done():
-		ss.abortInFlightExec(done)
-		ss.conn.Close()
+		// If Execute already finished — common when ctx is cancelled
+		// at session teardown right after the goroutine returned —
+		// record the result so we don't silently lose audit lines.
+		// Only abort + drain when Execute is genuinely still in
+		// flight. We do NOT close ss.conn here: ShadowSession.Close()
+		// will close it once run() and drainOnShutdown have processed
+		// any queries the primary already enqueued.
+		select {
+		case res := <-done:
+			ss.recordResult(sq, res, engine, reporter)
+		default:
+			res := ss.abortInFlightExec(done)
+			ss.recordResult(sq, res, engine, reporter)
+		}
+	}
+}
+
+// recordResult writes the comparison record for one query's
+// (primary, shadow) result pair. Bumps ShadowQueriesReplayed on
+// success and turns shadow-side errors into "error" diff records so
+// operators see them in the audit log.
+func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *compare.Engine, reporter *compare.Reporter) {
+	if res.err != nil {
+		slog.Debug("shadow: execution error",
+			"session_id", ss.sessionID, "err", res.err)
+		if sq.OrigResult != nil {
+			replayRes := &compare.CapturedResult{Error: res.err.Error()}
+			cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.User, sq.SessionID)
+			reporter.Record(cmpResult)
+		}
+		return
+	}
+	metrics.Global.ShadowQueriesReplayed.Add(1)
+	if sq.OrigResult != nil {
+		cmpResult := engine.Compare(sq.OrigResult, res.result, sq.Query, sq.User, sq.SessionID)
+		reporter.Record(cmpResult)
 	}
 }
 
@@ -229,9 +276,11 @@ type execResult struct {
 
 // abortInFlightExec poisons the shadow connection so the in-flight
 // Execute returns with an i/o-deadline error, then waits for the
-// Execute goroutine to drain `done`. After this returns it is safe
-// to call ss.conn.Close() without racing the Execute goroutine on
-// packet.Conn's buffered writer or Sequence field.
+// Execute goroutine to drain `done`. Returns the (poisoned) result
+// so the caller can record it for audit instead of silently dropping
+// the query. After this returns it is safe to call ss.conn.Close()
+// without racing the Execute goroutine on packet.Conn's buffered
+// writer or Sequence field.
 //
 // We use net.Conn.SetDeadline (goroutine-safe per stdlib) instead of
 // ss.conn.Close() because go-mysql's *client.Conn isn't safe for
@@ -239,12 +288,12 @@ type execResult struct {
 // at the same time Execute's writeCommand mutates it, which the race
 // detector flags. SetDeadline only touches the underlying net.Conn,
 // not Sequence, so the in-flight Execute returns cleanly.
-func (ss *ShadowSession) abortInFlightExec(done <-chan execResult) {
+func (ss *ShadowSession) abortInFlightExec(done <-chan execResult) execResult {
 	// A past deadline aborts both reads and writes on the underlying
 	// net.Conn. Reachable via method promotion: client.Conn embeds
 	// *packet.Conn, which embeds net.Conn.
 	_ = ss.conn.SetDeadline(time.Now().Add(-time.Second))
-	<-done
+	return <-done
 }
 
 // startsWithKeyword is a case-insensitive prefix check after stripping
