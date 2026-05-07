@@ -59,6 +59,11 @@ type ShadowSender struct {
 	sessionsMu sync.Mutex
 	sessions   map[uint64]*ShadowSession
 
+	// Background goroutines started by NewShadowSender (currently just
+	// the periodic summary loop). Close() waits on this so any final
+	// log lines come before "shadow sender closed".
+	bgWG sync.WaitGroup
+
 	closed atomic.Bool
 	once   sync.Once
 	ctx    context.Context
@@ -146,6 +151,7 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		interval = time.Hour
 	}
 	if interval > 0 {
+		s.bgWG.Add(1)
 		go s.runPeriodicSummary(interval)
 	}
 
@@ -155,8 +161,11 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 // runPeriodicSummary logs the cumulative comparison summary on each
 // tick. The same summary is also logged once at Close(); the periodic
 // log is for long-running pods where waiting for shutdown isn't
-// practical. The loop exits when s.ctx is cancelled.
+// practical. The loop exits when s.ctx is cancelled, and Close() waits
+// on s.bgWG so a tick that fired just before cancellation cannot emit
+// after the "shadow sender closed" line.
 func (s *ShadowSender) runPeriodicSummary(interval time.Duration) {
+	defer s.bgWG.Done()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -371,6 +380,12 @@ func (s *ShadowSender) Close() {
 		for _, ss := range sessions {
 			ss.Close()
 		}
+
+		// Wait for the periodic summary loop (if running) to observe
+		// the cancellation and exit. Without this, a tick that already
+		// fired could log a periodic summary after the "shadow sender
+		// closed" line below.
+		s.bgWG.Wait()
 
 		s.reporter.Close()
 		slog.Info("shadow sender closed",

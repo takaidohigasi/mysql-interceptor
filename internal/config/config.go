@@ -165,10 +165,16 @@ type ComparisonConfig struct {
 	// this higher. Default 10000.
 	MaxUniqueDigests int `yaml:"max_unique_digests"`
 	// SummaryInterval controls how often the shadow sender logs a
-	// cumulative comparison summary (totals + per-digest avg/p95/p99) to
-	// stderr. The full summary is also logged once at shadow shutdown
-	// regardless of this setting. A negative value disables the periodic
+	// cumulative comparison summary (totals + per-digest avg/p95/p99)
+	// via slog. Only shadow mode honors this setting; offline replay
+	// prints its summary at completion regardless. The shadow shutdown
+	// summary always fires too. A negative value disables the periodic
 	// log and relies on the shutdown summary alone. Default 1h.
+	//
+	// Note: under load the periodic snapshot reads atomic totals
+	// independently of the per-digest map, so the top-line totals can
+	// be ahead of the per-digest table by a small number of in-flight
+	// records. This self-corrects on the next tick and at shutdown.
 	SummaryInterval time.Duration `yaml:"summary_interval"`
 }
 
