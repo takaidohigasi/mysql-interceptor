@@ -7,6 +7,134 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.5"></a>
+## v0.0.5
+
+_Released 2026-05-08._
+
+### Highlights
+
+- **Comparison output is now diff-focused.** Matched and ignored records
+  are suppressed inline by default (use `comparison.log_matches: true`
+  to keep the old "log every comparison" behavior). A new periodic
+  `"type":"heartbeat"` line, written through the same JSONL stream,
+  carries window counts so operators can still tell the proxy is alive
+  when traffic is mostly clean. In dev this drops pod-stdout volume
+  from ~100% of comparisons to ~6% mismatches plus one heartbeat per
+  minute.
+- **Per-digest latency summary on a timer.** The shadow sender already
+  collected per-digest avg/p95/p99 latency for primary vs. replay; it's
+  now logged via `slog` on a configurable cadence (`comparison.summary_interval`,
+  default `1h`) instead of only at shutdown — useful on long-running
+  pods where waiting for shutdown isn't practical.
+- **`cluster` label on metrics.** Set `proxy.cluster` and every line on
+  `/metrics` is rendered as `metric_name{cluster="<value>"} <value>`.
+  An importable Datadog dashboard with a `$cluster` template variable
+  ships in `dashboards/datadog-mysql-interceptor.json`.
+- **User identity on diff records.** When a comparison turns up a real
+  divergence, the JSONL line now carries `"user":"..."` so operators
+  can answer "whose query was that?" without cross-referencing the audit
+  log. Set only on `match=false && !ignored` records to keep the
+  output focused.
+- **`AGENTS.md` at the repo root.** Captures the verification checklist
+  that mirrors CI line-for-line, the repository map, conventions, and
+  a "Common Pitfalls" section so agents (Claude / Codex / etc.) don't
+  repeat past CI failures (gofmt re-alignment, heredoc escaping,
+  stacked-PR base mistakes).
+
+### Added
+
+- **`comparison.summary_interval`** — cadence at which the shadow sender
+  logs the cumulative per-digest summary via `slog`. Default `1h`.
+  Negative disables the periodic log; the existing shutdown summary
+  still fires regardless. Only shadow mode honors this setting; offline
+  replay prints its summary at completion as before. (#13)
+- **`comparison.log_matches`** — when `false` (default), only diffs are
+  written inline; matched and ignored comparisons are summarized by the
+  heartbeat instead of one line per query. Set `true` for a full audit
+  trail. Shadow mode only — offline replay always writes a complete
+  report regardless. (#14)
+- **`comparison.heartbeat_interval`** — cadence (default `1m`, negative
+  disables) at which the reporter writes a `"type":"heartbeat"` line to
+  `comparison.output_file` summarizing the previous window
+  (`window_total` / `window_matched` / `window_differed` /
+  `window_ignored` since the last tick, plus `cumulative_total` /
+  `cumulative_differed`). (#14)
+- **`proxy.cluster`** — optional config field. When set, every line on
+  `/metrics` is rendered as `metric_name{cluster="<value>"} <value>`,
+  so a single dashboard can break stats down per database cluster via a
+  template variable. Empty (default) emits unlabeled metrics —
+  byte-identical to the pre-change output for single-cluster
+  deployments. (#15)
+- **`dashboards/datadog-mysql-interceptor.json`** — importable Datadog
+  dashboard with a `$cluster` template variable. Panels: diff fraction,
+  comparison rate breakdown, throughput, sessions, shadow drops/skips,
+  errors, Go runtime. Metric prefix assumes `mysql_interceptor.`;
+  adjust if your scrape config uses a different namespace. (#15)
+- **User identity on diff records** — `CompareResult.User` is set from
+  the inbound handshake (shadow mode) or `LogEntry.User` (offline mode)
+  whenever the result is a real divergence (`match=false &&
+  !ignored`). Matched and ignored records leave it empty
+  (`json:"user,omitempty"` keeps the field out of the output). (#16)
+- **End-to-end shadow temp-table test** — verifies INSERTs against a
+  temporary table are forwarded to the shadow while INSERTs against
+  persistent tables are not. (#13)
+- **`AGENTS.md`** — repo-root agent guide modeled on the
+  [tidb AGENTS.md](https://github.com/pingcap/tidb/blob/master/AGENTS.md):
+  verification checklist mirroring CI, repository map, task→validation
+  matrix, conventions, PR rules, and an enumerated "Common Pitfalls"
+  section listing the actual CI failures hit during the v0.0.5 work.
+  (#17)
+
+### Changed
+
+- **Default comparison output is now diff-only.** Existing operators
+  who relied on every match landing in `output_file` should set
+  `comparison.log_matches: true` to keep prior behavior. The diff
+  stream is otherwise unchanged.
+- **`metrics.NewServer` signature** — now takes `metrics.Labels{}` as
+  a second argument. Internal-only API; the only call site
+  (`cmd/mysql-interceptor/main.go`) is updated. Single-cluster
+  deployments can pass `metrics.Labels{}` to keep byte-identical output.
+- **`compare.Engine.Compare` signature** — now takes a `user string`
+  parameter between `query` and `sessionID`. Internal-only API; pass
+  `""` if no user is known.
+- **Reporter constructor refactor** — new canonical
+  `compare.NewReporterFromOptions(ReporterOptions{...})`. The existing
+  `NewReporter(outputFile)` and `NewReporterWithDigestCap(outputFile,
+  cap)` keep working and delegate to it.
+
+### Fixed
+
+- **Shadow sender shutdown ordering** — the periodic summary and
+  heartbeat goroutines are now tracked on a `sync.WaitGroup`, and
+  `Close()` waits on it before emitting the final
+  `"shadow sender closed"` log line. Without this, a tick that fired
+  just before cancellation could log after shutdown. (#13 follow-up)
+- **Offline replay always writes a full report** — the new
+  `LogMatches=false` default suppresses matched/ignored entries from
+  shadow output, but offline replay's report file *is* the output.
+  `NewOfflineReplayer` now hard-codes `LogMatches=true` regardless of
+  config so the report stays complete. (#14 follow-up)
+
+### Migration notes
+
+If you currently scrape `/metrics` and were relying on the unlabeled
+output:
+
+- Leaving `proxy.cluster` unset preserves byte-identical output.
+- Setting `proxy.cluster: "<name>"` adds `{cluster="<name>"}` to every
+  line. Update Prometheus / Datadog queries to either ignore the new
+  tag or filter on it.
+
+If you were tailing `comparison.output_file` and counting JSONL lines
+as "comparisons":
+
+- After upgrading, mismatch lines are unchanged but matched/ignored
+  lines disappear by default. Filter heartbeat records with
+  `jq -c 'select(.type=="heartbeat")'` for window counts, or set
+  `comparison.log_matches: true` to restore the old behavior.
+
 <a id="v0.0.4"></a>
 ## v0.0.4
 
