@@ -3,6 +3,8 @@ package replay
 import (
 	"bytes"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -410,6 +412,55 @@ func TestShadowSender_PeriodicSummary(t *testing.T) {
 	final := buf.String()
 	mu.Unlock()
 	t.Fatalf("expected periodic summary log line within 2s, got:\n%s", final)
+}
+
+// TestShadowSender_HeartbeatFires confirms a running shadow sender
+// emits a heartbeat line through its reporter at the configured
+// interval. We point the reporter at a temp file and read it back
+// after Close() to assert at least one heartbeat record appeared.
+func TestShadowSender_HeartbeatFires(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "report.jsonl")
+
+	s, err := NewShadowSender(
+		config.ShadowConfig{
+			TargetAddr:    "127.0.0.1:1",
+			TargetUser:    "root",
+			MaxConcurrent: 1,
+		},
+		config.ComparisonConfig{
+			OutputFile:        out,
+			SummaryInterval:   -1,                    // suppress periodic-summary noise
+			HeartbeatInterval: 30 * time.Millisecond, // tick fast for the test
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+
+	// Wait for the heartbeat to land in the report file. The reporter
+	// flushes per-encode, so we don't need to Close() before reading.
+	deadline := time.Now().Add(2 * time.Second)
+	var found bool
+	for time.Now().Before(deadline) && !found {
+		time.Sleep(20 * time.Millisecond)
+		data, err := os.ReadFile(out)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, `"type":"heartbeat"`) {
+				found = true
+				break
+			}
+		}
+	}
+	s.Close()
+
+	if !found {
+		data, _ := os.ReadFile(out)
+		t.Fatalf("expected at least one heartbeat line within 2s, got file:\n%s", string(data))
+	}
 }
 
 // TestShadowSender_PeriodicSummaryDisabled confirms that a negative

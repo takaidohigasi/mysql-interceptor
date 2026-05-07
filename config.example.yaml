@@ -90,6 +90,16 @@ comparison:
                                # (e.g. -1s) to disable the periodic log;
                                # the shadow shutdown summary still fires
                                # either way.
+  log_matches: false           # when false (default), only diffs are
+                               # written inline; matched comparisons are
+                               # represented by the heartbeat below.
+                               # Set true to log every comparison
+                               # (high QPS = very noisy).
+  heartbeat_interval: 1m       # shadow-mode liveness line written to
+                               # output_file every tick. Includes
+                               # window_total / window_matched /
+                               # window_differed since the last
+                               # heartbeat. Negative disables.
   # Queries that match any of these case-insensitive regexes are still
   # recorded in the diff report but marked "ignored" instead of counted
   # as differences. Use for queries that read server-local state and

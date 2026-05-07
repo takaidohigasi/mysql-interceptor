@@ -40,7 +40,8 @@ type ShadowSender struct {
 	reporter        *compare.Reporter
 	timeout         time.Duration
 	sessionQueueSz  int
-	summaryInterval time.Duration // 0 falls back to 1h; negative disables periodic logging
+	summaryInterval   time.Duration // 0 falls back to 1h; negative disables periodic logging
+	heartbeatInterval time.Duration // 0 falls back to 1m; negative disables heartbeat lines
 
 	// Aggregate counters (across all sessions)
 	dropped    atomic.Int64
@@ -87,7 +88,11 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		IgnoreQueryRegex: ignoreRegexes,
 	})
 
-	reporter, err := compare.NewReporterWithDigestCap(compareCfg.OutputFile, compareCfg.MaxUniqueDigests)
+	reporter, err := compare.NewReporterFromOptions(compare.ReporterOptions{
+		OutputFile:       compareCfg.OutputFile,
+		MaxUniqueDigests: compareCfg.MaxUniqueDigests,
+		LogMatches:       compareCfg.LogMatches,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("creating shadow reporter: %w", err)
 	}
@@ -107,15 +112,16 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 			User:     cfg.TargetUser,
 			Password: cfg.TargetPassword,
 		},
-		tlsCfg:          cfg.TLS,
-		engine:          engine,
-		reporter:        reporter,
-		timeout:         cfg.Timeout,
-		sessionQueueSz:  queueSize,
-		summaryInterval: compareCfg.SummaryInterval,
-		sessions:        make(map[uint64]*ShadowSession),
-		ctx:             ctx,
-		cancel:          cancel,
+		tlsCfg:            cfg.TLS,
+		engine:            engine,
+		reporter:          reporter,
+		timeout:           cfg.Timeout,
+		sessionQueueSz:    queueSize,
+		summaryInterval:   compareCfg.SummaryInterval,
+		heartbeatInterval: compareCfg.HeartbeatInterval,
+		sessions:          make(map[uint64]*ShadowSession),
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 
 	initiallyEnabled := true
@@ -155,7 +161,38 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		go s.runPeriodicSummary(interval)
 	}
 
+	hbInterval := s.heartbeatInterval
+	if hbInterval == 0 {
+		hbInterval = time.Minute
+	}
+	if hbInterval > 0 {
+		s.bgWG.Add(1)
+		go s.runHeartbeat(hbInterval)
+	}
+
 	return s, nil
+}
+
+// runHeartbeat emits a single "type":"heartbeat" line to the
+// reporter's output on each tick, summarizing comparison activity in
+// the previous window. Pairs with LogMatches=false: when matched
+// comparisons aren't written inline, the heartbeat is the only signal
+// that the proxy is still seeing traffic. Stops when s.ctx is
+// cancelled; Close() waits on s.bgWG.
+func (s *ShadowSender) runHeartbeat(interval time.Duration) {
+	defer s.bgWG.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-t.C:
+			if err := s.reporter.WriteHeartbeat(interval); err != nil {
+				slog.Error("shadow heartbeat write failed", "err", err)
+			}
+		}
+	}
 }
 
 // runPeriodicSummary logs the cumulative comparison summary on each
