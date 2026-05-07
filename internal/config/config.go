@@ -178,11 +178,12 @@ type ComparisonConfig struct {
 	SummaryInterval time.Duration `yaml:"summary_interval"`
 
 	// LogMatches controls whether *every* comparison record is written
-	// to OutputFile, or only the differences. When false (default),
-	// matched and ignored comparisons are suppressed inline and are
-	// represented only by the periodic heartbeat below. Set true if you
-	// need a full audit trail of every comparison (note: at high QPS
-	// this can be very noisy).
+	// to OutputFile, or only the differences. Shadow mode only —
+	// offline replay always writes a complete report regardless. When
+	// false (default), matched and ignored comparisons are suppressed
+	// inline and are represented only by the periodic heartbeat below.
+	// Set true if you need a full audit trail of every comparison
+	// (note: at high QPS this can be very noisy).
 	LogMatches bool `yaml:"log_matches"`
 
 	// HeartbeatInterval controls how often the reporter writes a

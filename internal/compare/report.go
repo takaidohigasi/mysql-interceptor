@@ -131,15 +131,15 @@ func (r *Reporter) Record(result *CompareResult) {
 // carries a "type" field so consumers can distinguish heartbeats from
 // diff records (CompareResult lacks a "type" field).
 type HeartbeatRecord struct {
-	Type             string  `json:"type"`
-	Timestamp        string  `json:"timestamp"`
-	WindowSeconds    float64 `json:"window_seconds"`
-	WindowTotal      int64   `json:"window_total"`
-	WindowMatched    int64   `json:"window_matched"`
-	WindowDiffered   int64   `json:"window_differed"`
-	WindowIgnored    int64   `json:"window_ignored"`
-	CumulativeTotal  int64   `json:"cumulative_total"`
-	CumulativeDiff   int64   `json:"cumulative_differed"`
+	Type            string  `json:"type"`
+	Timestamp       string  `json:"timestamp"`
+	WindowSeconds   float64 `json:"window_seconds"`
+	WindowTotal     int64   `json:"window_total"`
+	WindowMatched   int64   `json:"window_matched"`
+	WindowDiffered  int64   `json:"window_differed"`
+	WindowIgnored   int64   `json:"window_ignored"`
+	CumulativeTotal int64   `json:"cumulative_total"`
+	CumulativeDiff  int64   `json:"cumulative_differed"`
 }
 
 // WriteHeartbeat emits a single line summarizing comparison activity

@@ -34,12 +34,12 @@ type ShadowQuery struct {
 // primary are faithfully mirrored on the shadow.
 type ShadowSender struct {
 	// Shared dependencies
-	backendCfg      config.BackendConfig
-	tlsCfg          config.BackendSideTLSConfig
-	engine          *compare.Engine
-	reporter        *compare.Reporter
-	timeout         time.Duration
-	sessionQueueSz  int
+	backendCfg        config.BackendConfig
+	tlsCfg            config.BackendSideTLSConfig
+	engine            *compare.Engine
+	reporter          *compare.Reporter
+	timeout           time.Duration
+	sessionQueueSz    int
 	summaryInterval   time.Duration // 0 falls back to 1h; negative disables periodic logging
 	heartbeatInterval time.Duration // 0 falls back to 1m; negative disables heartbeat lines
 
