@@ -7,6 +7,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.6"></a>
+## v0.0.6
+
+_Released 2026-05-08._
+
+Single-fix patch release for a data race exposed by the v0.0.5
+shadow E2E test under `-race`.
+
+### Fixed
+
+- **Data race in shadow session timeout / ctx-cancel paths.** When
+  the per-query timeout fired (or the session ctx was cancelled),
+  `ShadowSession.processQuery` called `ss.conn.Close()` while the
+  Execute goroutine was still inside `client.Conn.Execute`. go-mysql's
+  `*client.Conn` is not safe for concurrent Close-while-Execute —
+  `Close` clears `packet.Conn.Sequence` at the same time
+  `writeCommand` mutates it — and the race detector flagged this on
+  `TestShadowE2E_TempTableInsertForwardedPersistentInsertNot` after
+  the v0.0.5 release. The fix uses `net.Conn.SetDeadline`
+  (goroutine-safe per stdlib) to abort the in-flight Execute, drains
+  the per-query goroutine, and only then calls `Close`. The same
+  drain-before-close sequence also fixes a secondary race in
+  `ShadowSession.Close()` that codex review flagged: with every exit
+  path from `processQuery` now draining the Execute goroutine,
+  `<-ss.done` once again means "everything is quiet". Latent since
+  the shadow timeout feature shipped; surfaced by the v0.0.5 E2E
+  test. (#19)
+
 <a id="v0.0.5"></a>
 ## v0.0.5
 
