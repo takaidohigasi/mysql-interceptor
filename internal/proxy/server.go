@@ -242,6 +242,8 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 		return
 	}
 
+	handler.user = backendUser
+
 	backendCfg := ps.cfg.Backend
 	backendCfg.User = backendUser
 	backendCfg.Password = backendPass

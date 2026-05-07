@@ -197,14 +197,14 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 			// shows up as a divergence the operator can audit.
 			if sq.OrigResult != nil {
 				replayRes := &compare.CapturedResult{Error: res.err.Error()}
-				cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.SessionID)
+				cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.User, sq.SessionID)
 				reporter.Record(cmpResult)
 			}
 			return
 		}
 		metrics.Global.ShadowQueriesReplayed.Add(1)
 		if sq.OrigResult != nil {
-			cmpResult := engine.Compare(sq.OrigResult, res.result, sq.Query, sq.SessionID)
+			cmpResult := engine.Compare(sq.OrigResult, res.result, sq.Query, sq.User, sq.SessionID)
 			reporter.Record(cmpResult)
 		}
 	case <-time.After(timeout):

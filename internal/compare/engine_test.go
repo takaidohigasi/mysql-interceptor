@@ -1,6 +1,8 @@
 package compare
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -23,7 +25,7 @@ func TestCompare_BothSuccess_IdenticalResults(t *testing.T) {
 		Duration:     7 * time.Millisecond,
 	}
 
-	result := engine.Compare(original, replay, "SELECT id, name FROM users", 1)
+	result := engine.Compare(original, replay, "SELECT id, name FROM users", "", 1)
 
 	if !result.Match {
 		t.Errorf("expected match, got differences: %+v", result.Differences)
@@ -47,7 +49,7 @@ func TestCompare_OneError_OneSuccess(t *testing.T) {
 		Duration: 2 * time.Millisecond,
 	}
 
-	result := engine.Compare(original, replay, "SELECT id, name FROM users", 1)
+	result := engine.Compare(original, replay, "SELECT id, name FROM users", "", 1)
 
 	if result.Match {
 		t.Error("expected mismatch when one returns error and the other succeeds")
@@ -67,7 +69,7 @@ func TestCompare_BothError_SameError(t *testing.T) {
 	original := &CapturedResult{Error: errMsg, Duration: 1 * time.Millisecond}
 	replay := &CapturedResult{Error: errMsg, Duration: 2 * time.Millisecond}
 
-	result := engine.Compare(original, replay, "SELECT * FROM users", 1)
+	result := engine.Compare(original, replay, "SELECT * FROM users", "", 1)
 
 	if !result.Match {
 		t.Error("expected match when both return the same error")
@@ -86,7 +88,7 @@ func TestCompare_DifferentRowCount(t *testing.T) {
 		Rows:    [][]string{{"1"}, {"2"}},
 	}
 
-	result := engine.Compare(original, replay, "SELECT id FROM users", 1)
+	result := engine.Compare(original, replay, "SELECT id FROM users", "", 1)
 
 	if result.Match {
 		t.Error("expected mismatch for different row counts")
@@ -117,7 +119,7 @@ func TestCompare_DifferentCellValues(t *testing.T) {
 		Rows:    [][]string{{"1", "bob"}},
 	}
 
-	result := engine.Compare(original, replay, "SELECT id, name FROM users WHERE id=1", 1)
+	result := engine.Compare(original, replay, "SELECT id, name FROM users WHERE id=1", "", 1)
 
 	if result.Match {
 		t.Error("expected mismatch for different cell values")
@@ -150,7 +152,7 @@ func TestCompare_IgnoreColumns(t *testing.T) {
 		Rows:    [][]string{{"1", "alice", "2026-04-17"}},
 	}
 
-	result := engine.Compare(original, replay, "SELECT * FROM users WHERE id=1", 1)
+	result := engine.Compare(original, replay, "SELECT * FROM users WHERE id=1", "", 1)
 
 	if !result.Match {
 		t.Errorf("expected match when only ignored column differs, got: %+v", result.Differences)
@@ -173,7 +175,7 @@ func TestCompare_TimeThresholdExceeded(t *testing.T) {
 		Duration: 200 * time.Millisecond,
 	}
 
-	result := engine.Compare(original, replay, "SELECT 1", 1)
+	result := engine.Compare(original, replay, "SELECT 1", "", 1)
 
 	if !result.Match {
 		t.Error("timing difference should not affect content match")
@@ -189,7 +191,7 @@ func TestCompare_DifferentAffectedRows(t *testing.T) {
 	original := &CapturedResult{AffectedRows: 5, Duration: 1 * time.Millisecond}
 	replay := &CapturedResult{AffectedRows: 3, Duration: 1 * time.Millisecond}
 
-	result := engine.Compare(original, replay, "UPDATE users SET active=1", 1)
+	result := engine.Compare(original, replay, "UPDATE users SET active=1", "", 1)
 
 	if result.Match {
 		t.Error("expected mismatch for different affected rows")
@@ -226,7 +228,7 @@ func TestCompare_IgnoreQueryPattern(t *testing.T) {
 
 	// Different cell values, but query matches ignore pattern — still
 	// reported with the diff details, but Ignored=true.
-	result := engine.Compare(original, replay, "SELECT @@server_uuid", 1)
+	result := engine.Compare(original, replay, "SELECT @@server_uuid", "", 1)
 	if !result.Ignored {
 		t.Error("expected Ignored=true for @@server_uuid query")
 	}
@@ -242,13 +244,13 @@ func TestCompare_IgnoreQueryPattern(t *testing.T) {
 	}
 
 	// NOW() with whitespace — regex boundary check.
-	result2 := engine.Compare(original, replay, "select now()", 2)
+	result2 := engine.Compare(original, replay, "select now()", "", 2)
 	if !result2.Ignored {
 		t.Error("expected Ignored=true for NOW() query")
 	}
 
 	// A query NOT in the ignore list — normal mismatch behavior.
-	result3 := engine.Compare(original, replay, "SELECT name FROM users", 3)
+	result3 := engine.Compare(original, replay, "SELECT name FROM users", "", 3)
 	if result3.Ignored {
 		t.Error("expected Ignored=false for non-matching query")
 	}
@@ -276,9 +278,73 @@ func TestCompare_DifferentColumnCount(t *testing.T) {
 		Rows:    [][]string{{"1", "alice"}},
 	}
 
-	result := engine.Compare(original, replay, "SELECT * FROM users", 1)
+	result := engine.Compare(original, replay, "SELECT * FROM users", "", 1)
 
 	if result.Match {
 		t.Error("expected mismatch for different column counts")
 	}
+}
+
+// TestCompare_UserOnlyOnDiverging verifies the User field is set only
+// when the comparison represents an actual divergence (Match=false and
+// not in the ignore list). Matched results omit the user; ignored
+// results omit it too — operators only need user identity on the lines
+// they're going to investigate.
+func TestCompare_UserOnlyOnDiverging(t *testing.T) {
+	t.Run("diff: user is set", func(t *testing.T) {
+		engine := NewEngine(EngineConfig{})
+		original := &CapturedResult{Columns: []string{"id"}, Rows: [][]string{{"1"}}}
+		replay := &CapturedResult{Columns: []string{"id"}, Rows: [][]string{{"2"}}}
+
+		result := engine.Compare(original, replay, "SELECT id FROM users", "alice", 1)
+		if result.Match {
+			t.Fatal("expected Match=false for diverging cells")
+		}
+		if result.User != "alice" {
+			t.Errorf("expected User=alice on diverging result, got %q", result.User)
+		}
+		b, _ := json.Marshal(result)
+		if !strings.Contains(string(b), `"user":"alice"`) {
+			t.Errorf("expected JSON to contain user field, got: %s", b)
+		}
+	})
+
+	t.Run("match: user is omitted", func(t *testing.T) {
+		engine := NewEngine(EngineConfig{})
+		original := &CapturedResult{Columns: []string{"id"}, Rows: [][]string{{"1"}}}
+		replay := &CapturedResult{Columns: []string{"id"}, Rows: [][]string{{"1"}}}
+
+		result := engine.Compare(original, replay, "SELECT id FROM users", "alice", 1)
+		if !result.Match {
+			t.Fatal("expected Match=true for identical results")
+		}
+		if result.User != "" {
+			t.Errorf("expected User empty on matching result, got %q", result.User)
+		}
+		b, _ := json.Marshal(result)
+		if strings.Contains(string(b), `"user"`) {
+			t.Errorf("expected JSON to omit user on match, got: %s", b)
+		}
+	})
+
+	t.Run("ignored: user is omitted even when results diverge", func(t *testing.T) {
+		// "@@server_uuid" matches the configured ignore pattern, so the
+		// engine flags the result as Ignored. Even though the cells differ,
+		// User must not be attached.
+		ignoreRegexes, err := CompileIgnoreQueries([]string{"@@server_uuid"})
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		engine := NewEngine(EngineConfig{IgnoreQueryRegex: ignoreRegexes})
+		original := &CapturedResult{Columns: []string{"v"}, Rows: [][]string{{"a-1"}}}
+		replay := &CapturedResult{Columns: []string{"v"}, Rows: [][]string{{"a-2"}}}
+
+		result := engine.Compare(original, replay, "SELECT @@server_uuid", "alice", 1)
+		if !result.Ignored {
+			t.Fatal("expected Ignored=true for matching ignore pattern")
+		}
+		if result.User != "" {
+			t.Errorf("expected User empty on ignored result, got %q", result.User)
+		}
+	})
 }

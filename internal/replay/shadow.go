@@ -20,6 +20,7 @@ import (
 type ShadowQuery struct {
 	SessionID    uint64
 	SourceIP     string // client IP (without port) for CIDR filtering
+	User         string // authenticated MySQL user from the inbound handshake; recorded on the diff
 	Database     string // current DB at the time of the query (empty if none)
 	Query        string
 	Args         []interface{} // non-nil for prepared statement executions
