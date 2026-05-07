@@ -98,6 +98,14 @@ comparison:
   time_threshold_ms: 100
   max_unique_digests: 10000    # cap on unique query patterns tracked
                                # (each entry ≤ ~160 KB; overflow → counter)
+  summary_interval: 1h         # shadow-mode periodic summary cadence
+                               # (totals + per-digest avg/p95/p99),
+                               # logged via slog. Offline replay ignores
+                               # this; it prints its summary at
+                               # completion regardless. Set negative
+                               # (e.g. -1s) to disable the periodic log;
+                               # the shadow shutdown summary still fires
+                               # either way.
   # Queries that match any of these case-insensitive regexes are still
   # recorded in the diff report but marked "ignored" instead of counted
   # as differences. Use for queries that read server-local state and

@@ -1,10 +1,40 @@
 package replay
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 )
+
+// captureSlog redirects the default slog logger into the returned buffer
+// for the duration of the test. Restoring is the caller's responsibility
+// (use t.Cleanup or the returned restore func).
+func captureSlog(t *testing.T) (*bytes.Buffer, *sync.Mutex) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	mu := &sync.Mutex{}
+	h := slog.NewTextHandler(&lockedWriter{buf: buf, mu: mu}, nil)
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf, mu
+}
+
+type lockedWriter struct {
+	buf *bytes.Buffer
+	mu  *sync.Mutex
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
 
 // TestShadowSender_EnableDisable verifies that Send() respects the
 // enabled flag and that toggling via SetEnabled flips behavior without
@@ -342,5 +372,74 @@ func TestShadowSender_SetCIDRs_HotReload(t *testing.T) {
 	// Reject invalid CIDR.
 	if err := s.SetCIDRs([]string{"not-a-cidr"}, nil); err == nil {
 		t.Error("expected error for invalid CIDR")
+	}
+}
+
+// TestShadowSender_PeriodicSummary confirms the configured interval
+// causes the cumulative comparison summary to be logged at runtime,
+// not just at shutdown.
+func TestShadowSender_PeriodicSummary(t *testing.T) {
+	buf, mu := captureSlog(t)
+
+	s, err := NewShadowSender(
+		config.ShadowConfig{
+			TargetAddr:    "127.0.0.1:1",
+			TargetUser:    "root",
+			MaxConcurrent: 1,
+		},
+		config.ComparisonConfig{
+			SummaryInterval: 30 * time.Millisecond,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+	defer s.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		out := buf.String()
+		mu.Unlock()
+		if strings.Contains(out, "shadow comparison periodic summary") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	final := buf.String()
+	mu.Unlock()
+	t.Fatalf("expected periodic summary log line within 2s, got:\n%s", final)
+}
+
+// TestShadowSender_PeriodicSummaryDisabled confirms that a negative
+// interval suppresses the periodic log entirely. We can't prove a
+// negative absolutely, but a generous wait without seeing the line is
+// strong enough evidence the loop never started.
+func TestShadowSender_PeriodicSummaryDisabled(t *testing.T) {
+	buf, mu := captureSlog(t)
+
+	s, err := NewShadowSender(
+		config.ShadowConfig{
+			TargetAddr:    "127.0.0.1:1",
+			TargetUser:    "root",
+			MaxConcurrent: 1,
+		},
+		config.ComparisonConfig{
+			SummaryInterval: -1, // any negative value disables
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+	defer s.Close()
+
+	time.Sleep(150 * time.Millisecond)
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	if strings.Contains(out, "shadow comparison periodic summary") {
+		t.Fatalf("expected no periodic summary when interval<0, got:\n%s", out)
 	}
 }
