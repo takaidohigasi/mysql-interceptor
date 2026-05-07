@@ -12,8 +12,8 @@ minor versions).
 
 _Released 2026-05-08._
 
-Single-fix patch release for a data race exposed by the v0.0.5
-shadow E2E test under `-race`.
+Patch release for two latent shadow-session bugs that the v0.0.5
+shadow E2E test surfaced under `-race`.
 
 ### Fixed
 
@@ -34,6 +34,23 @@ shadow E2E test under `-race`.
   `<-ss.done` once again means "everything is quiet". Latent since
   the shadow timeout feature shipped; surfaced by the v0.0.5 E2E
   test. (#19)
+- **Dropped queries on shadow session shutdown.** Two loss paths in
+  `ShadowSession`: (1) `run()`'s outer `select` could exit via
+  `<-ctx.Done()` while `queryCh` still held buffered queries — Go's
+  `select` is pseudo-random over ready cases — silently losing every
+  remaining audit record; (2) `processQuery`'s ctx-cancel arm
+  unconditionally aborted the Execute goroutine even when Execute
+  had already finished, throwing the result away. The fix adds a
+  non-blocking `drainOnShutdown` pass in `run()` after `ctx.Done()`,
+  and a non-blocking peek at `done` in `processQuery`'s ctx-cancel
+  arm so completed-but-not-yet-recorded results are preserved.
+  `abortInFlightExec` now returns the (deadline-induced) result so
+  in-flight queries that get aborted are recorded as error diff
+  lines instead of silently dropped. Latent since the shadow session
+  machinery shipped; #19's drain-before-close shifted timing enough
+  to make the flake visible on
+  `TestShadowE2E_TempTableInsertForwardedPersistentInsertNot`
+  post-merge. (#21)
 
 <a id="v0.0.5"></a>
 ## v0.0.5
