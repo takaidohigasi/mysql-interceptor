@@ -108,7 +108,7 @@ func TestReplayDivergentResponses_ErrorVsSuccess(t *testing.T) {
 
 	// Step 3: Compare results
 	engine := compare.NewEngine(compare.EngineConfig{})
-	cmpResult := engine.Compare(primaryResult, secondaryResult, "SELECT * FROM orders WHERE user_id = 1", 1)
+	cmpResult := engine.Compare(primaryResult, secondaryResult, "SELECT * FROM orders WHERE user_id = 1", "", 1)
 
 	if cmpResult.Match {
 		t.Error("expected comparison to detect mismatch (success vs error)")
@@ -190,7 +190,7 @@ func TestReplayDivergentResponses_ServerUUID(t *testing.T) {
 	}
 
 	engine := compare.NewEngine(compare.EngineConfig{})
-	cmpResult := engine.Compare(r1, r2, query, 1)
+	cmpResult := engine.Compare(r1, r2, query, "", 1)
 
 	if cmpResult.Match {
 		t.Error("expected @@server_uuid to diverge between two MySQL instances")
@@ -249,7 +249,7 @@ func TestReplayDivergentResponses_SameTable_DifferentData(t *testing.T) {
 	}
 
 	engine := compare.NewEngine(compare.EngineConfig{})
-	cmpResult := engine.Compare(r1, r2, query, 1)
+	cmpResult := engine.Compare(r1, r2, query, "", 1)
 
 	if !cmpResult.Match {
 		t.Errorf("expected match for identical users table, got differences: %+v", cmpResult.Differences)

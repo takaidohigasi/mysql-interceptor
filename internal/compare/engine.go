@@ -49,7 +49,7 @@ func (e *Engine) matchesIgnore(query string) bool {
 	return false
 }
 
-func (e *Engine) Compare(original, replay *CapturedResult, query string, sessionID uint64) *CompareResult {
+func (e *Engine) Compare(original, replay *CapturedResult, query, user string, sessionID uint64) *CompareResult {
 	result := &CompareResult{
 		Query:          query,
 		QueryDigest:    Digest(query),
@@ -60,6 +60,17 @@ func (e *Engine) Compare(original, replay *CapturedResult, query string, session
 		OriginalTimeMs: float64(original.Duration.Microseconds()) / 1000.0,
 		ReplayTimeMs:   float64(replay.Duration.Microseconds()) / 1000.0,
 	}
+	// User is attached only when the result is a real divergence
+	// (Match=false and not in the ignore list). Matched and ignored
+	// records aren't worth carrying per-query identity for, and this
+	// keeps the diff report focused on actionable lines. Defer over
+	// the multiple early-return paths so every branch shares the
+	// same rule.
+	defer func() {
+		if !result.Match && !result.Ignored {
+			result.User = user
+		}
+	}()
 	result.TimeDiffMs = result.ReplayTimeMs - result.OriginalTimeMs
 
 	if e.cfg.TimeThresholdMs > 0 && math.Abs(result.TimeDiffMs) > e.cfg.TimeThresholdMs {

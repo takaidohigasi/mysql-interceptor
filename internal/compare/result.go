@@ -3,11 +3,17 @@ package compare
 import "time"
 
 type CompareResult struct {
-	Query       string    `json:"query"`
-	QueryDigest string    `json:"query_digest"`
-	SessionID   uint64    `json:"session_id"`
-	Timestamp   time.Time `json:"timestamp"`
-	Match       bool      `json:"match"`
+	Query       string `json:"query"`
+	QueryDigest string `json:"query_digest"`
+	SessionID   uint64 `json:"session_id"`
+	// User identifies which authenticated MySQL user issued the query.
+	// Populated by the engine from whatever the caller passes; in shadow
+	// mode this is the user authenticated on the inbound proxy session,
+	// in offline mode it's LogEntry.User from the recorded log file.
+	// Empty when unknown (zero value, omitted from JSON).
+	User      string    `json:"user,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+	Match     bool      `json:"match"`
 	// Ignored is true if the query matched an ignore pattern in
 	// comparison.ignore_queries. Ignored results are still recorded (so
 	// operators can audit them) but don't count toward the diff total.

@@ -290,7 +290,7 @@ func (r *OfflineReplayer) replayFile(ctx context.Context, filePath string) error
 					Duration:     time.Duration(se.entry.ResponseTime * float64(time.Millisecond)),
 				}
 
-				cmpResult := r.engine.Compare(origResult, replayResult, se.entry.Query, sid)
+				cmpResult := r.engine.Compare(origResult, replayResult, se.entry.Query, se.entry.User, sid)
 				r.reporter.Record(cmpResult)
 				processed.Add(1)
 			}

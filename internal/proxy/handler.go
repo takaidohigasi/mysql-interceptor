@@ -14,6 +14,7 @@ import (
 type ProxyHandler struct {
 	sessionID     uint64
 	sourceIP      string // client IP without port; passed to shadow for CIDR filtering
+	user          string // authenticated MySQL user from the inbound handshake
 	backend       *client.Conn
 	currentDB     string
 	logQuery      func(entry QueryEvent)
@@ -107,6 +108,7 @@ func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{},
 		h.shadowSession.Send(replay.ShadowQuery{
 			SessionID:    h.sessionID,
 			SourceIP:     h.sourceIP,
+			User:         h.user,
 			Database:     h.currentDB,
 			Query:        query,
 			Args:         args,
