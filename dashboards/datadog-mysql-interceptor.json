@@ -1,0 +1,324 @@
+{
+  "title": "MySQL Interceptor — overview",
+  "description": "Throughput, divergence, shadow drops, and resource usage for the MySQL interceptor proxy. The `cluster` template variable maps to `proxy.cluster` in the proxy config — set it in your interceptor configmap to break stats down per database cluster (one shared dashboard, multiple mirrors).\n\nMetric prefix: this dashboard assumes Datadog scrapes the proxy's `/metrics` openmetrics endpoint with namespace `mysql_interceptor`. If your scrape config uses a different namespace, find/replace `mysql_interceptor.` in this file before importing.",
+  "layout_type": "ordered",
+  "template_variables": [
+    {
+      "name": "cluster",
+      "prefix": "cluster",
+      "available_values": [],
+      "default": "*"
+    }
+  ],
+  "widgets": [
+    {
+      "id": 1,
+      "definition": {
+        "type": "note",
+        "content": "## MySQL Interceptor — `$cluster`\nDiff rate, throughput, and lifecycle for the selected database cluster.",
+        "background_color": "blue",
+        "font_size": "14",
+        "text_align": "left",
+        "show_tick": false,
+        "tick_pos": "50%",
+        "tick_edge": "left"
+      },
+      "layout": {"x": 0, "y": 0, "width": 12, "height": 1}
+    },
+    {
+      "id": 10,
+      "definition": {
+        "type": "query_value",
+        "title": "Active sessions",
+        "title_size": "16",
+        "title_align": "left",
+        "precision": 0,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.active_sessions{$cluster}",
+            "aggregator": "last"
+          }
+        ],
+        "autoscale": true
+      },
+      "layout": {"x": 0, "y": 1, "width": 3, "height": 2}
+    },
+    {
+      "id": 11,
+      "definition": {
+        "type": "query_value",
+        "title": "Shadow active sessions",
+        "title_size": "16",
+        "title_align": "left",
+        "precision": 0,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.shadow_active_sessions{$cluster}",
+            "aggregator": "last"
+          }
+        ],
+        "autoscale": true
+      },
+      "layout": {"x": 3, "y": 1, "width": 3, "height": 2}
+    },
+    {
+      "id": 12,
+      "definition": {
+        "type": "query_value",
+        "title": "Shadow enabled (1=on)",
+        "title_size": "16",
+        "title_align": "left",
+        "precision": 0,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.shadow_enabled{$cluster}",
+            "aggregator": "last",
+            "conditional_formats": [
+              {"comparator": "<", "value": 1, "palette": "white_on_red"},
+              {"comparator": ">=", "value": 1, "palette": "white_on_green"}
+            ]
+          }
+        ],
+        "autoscale": false
+      },
+      "layout": {"x": 6, "y": 1, "width": 3, "height": 2}
+    },
+    {
+      "id": 13,
+      "definition": {
+        "type": "query_value",
+        "title": "Unique digests tracked",
+        "title_size": "16",
+        "title_align": "left",
+        "precision": 0,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.comparisons_digest_count{$cluster}",
+            "aggregator": "last"
+          }
+        ],
+        "autoscale": true
+      },
+      "layout": {"x": 9, "y": 1, "width": 3, "height": 2}
+    },
+    {
+      "id": 20,
+      "definition": {
+        "type": "timeseries",
+        "title": "Diff fraction (differed / total)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "legend_layout": "auto",
+        "legend_columns": ["avg", "min", "max", "value", "sum"],
+        "requests": [
+          {
+            "formulas": [
+              {"formula": "differed / total", "alias": "diff_fraction"}
+            ],
+            "queries": [
+              {
+                "name": "differed",
+                "data_source": "metrics",
+                "query": "sum:mysql_interceptor.comparisons_differed{$cluster}.as_rate()"
+              },
+              {
+                "name": "total",
+                "data_source": "metrics",
+                "query": "sum:mysql_interceptor.comparisons_total{$cluster}.as_rate()"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": {"palette": "warm", "line_type": "solid", "line_width": "normal"},
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": {"x": 0, "y": 3, "width": 6, "height": 3}
+    },
+    {
+      "id": 21,
+      "definition": {
+        "type": "timeseries",
+        "title": "Comparison rate (matched / differed / ignored)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "legend_layout": "auto",
+        "requests": [
+          {
+            "q": "sum:mysql_interceptor.comparisons_matched{$cluster}.as_rate()",
+            "display_type": "area",
+            "style": {"palette": "cool"}
+          },
+          {
+            "q": "sum:mysql_interceptor.comparisons_differed{$cluster}.as_rate()",
+            "display_type": "area",
+            "style": {"palette": "warm"}
+          },
+          {
+            "q": "sum:mysql_interceptor.comparisons_ignored{$cluster}.as_rate()",
+            "display_type": "area",
+            "style": {"palette": "grey"}
+          }
+        ]
+      },
+      "layout": {"x": 6, "y": 3, "width": 6, "height": 3}
+    },
+    {
+      "id": 30,
+      "definition": {
+        "type": "timeseries",
+        "title": "Throughput — queries handled & shadow replays (per second)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "requests": [
+          {
+            "q": "sum:mysql_interceptor.queries_handled{$cluster}.as_rate()",
+            "display_type": "line",
+            "style": {"palette": "dog_classic"}
+          },
+          {
+            "q": "sum:mysql_interceptor.shadow_queries_replayed{$cluster}.as_rate()",
+            "display_type": "line",
+            "style": {"palette": "purple"}
+          }
+        ]
+      },
+      "layout": {"x": 0, "y": 6, "width": 6, "height": 3}
+    },
+    {
+      "id": 31,
+      "definition": {
+        "type": "timeseries",
+        "title": "Sessions over time (gauge)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.active_sessions{$cluster}",
+            "display_type": "line"
+          },
+          {
+            "q": "avg:mysql_interceptor.shadow_active_sessions{$cluster}",
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": {"x": 6, "y": 6, "width": 6, "height": 3}
+    },
+    {
+      "id": 40,
+      "definition": {
+        "type": "timeseries",
+        "title": "Shadow drops & filters (per second)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "requests": [
+          {
+            "q": "sum:mysql_interceptor.shadow_dropped{$cluster}.as_rate()",
+            "display_type": "line",
+            "style": {"palette": "warm"}
+          },
+          {
+            "q": "sum:mysql_interceptor.shadow_skipped{$cluster}.as_rate()",
+            "display_type": "line"
+          },
+          {
+            "q": "sum:mysql_interceptor.shadow_sampled_out{$cluster}.as_rate()",
+            "display_type": "line"
+          },
+          {
+            "q": "sum:mysql_interceptor.shadow_filtered_by_cidr{$cluster}.as_rate()",
+            "display_type": "line"
+          },
+          {
+            "q": "sum:mysql_interceptor.shadow_disabled{$cluster}.as_rate()",
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": {"x": 0, "y": 9, "width": 6, "height": 3}
+    },
+    {
+      "id": 41,
+      "definition": {
+        "type": "timeseries",
+        "title": "Errors & dropped log entries (per second)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "requests": [
+          {
+            "q": "sum:mysql_interceptor.query_errors{$cluster}.as_rate()",
+            "display_type": "line",
+            "style": {"palette": "warm"}
+          },
+          {
+            "q": "sum:mysql_interceptor.logger_dropped{$cluster}.as_rate()",
+            "display_type": "line"
+          },
+          {
+            "q": "sum:mysql_interceptor.comparisons_digest_overflow{$cluster}.as_rate()",
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": {"x": 6, "y": 9, "width": 6, "height": 3}
+    },
+    {
+      "id": 50,
+      "definition": {
+        "type": "timeseries",
+        "title": "Goroutines",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": false,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.num_goroutines{$cluster}",
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": {"x": 0, "y": 12, "width": 4, "height": 3}
+    },
+    {
+      "id": 51,
+      "definition": {
+        "type": "timeseries",
+        "title": "Heap allocated bytes",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": false,
+        "requests": [
+          {
+            "q": "avg:mysql_interceptor.heap_alloc_bytes{$cluster}",
+            "display_type": "area"
+          }
+        ]
+      },
+      "layout": {"x": 4, "y": 12, "width": 4, "height": 3}
+    },
+    {
+      "id": 52,
+      "definition": {
+        "type": "timeseries",
+        "title": "GC pause time (per second)",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": false,
+        "requests": [
+          {
+            "q": "sum:mysql_interceptor.gc_pause_ns_total{$cluster}.as_rate()",
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": {"x": 8, "y": 12, "width": 4, "height": 3}
+    }
+  ]
+}

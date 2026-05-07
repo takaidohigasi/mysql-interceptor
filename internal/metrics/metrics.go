@@ -54,9 +54,21 @@ type Server struct {
 	srv *http.Server
 }
 
+// Labels carries metric labels appended to every Prometheus line emitted
+// by /metrics. The zero value emits unlabeled metrics, preserving the
+// pre-Cluster behavior for single-cluster deployments.
+type Labels struct {
+	// Cluster names the database cluster this proxy fronts. Rendered as
+	// `metric_name{cluster="<value>"} <value>`. Empty = omit the label
+	// entirely.
+	Cluster string
+}
+
 // NewServer constructs (but does not start) an HTTP server on addr.
-// Pass addr="" to disable metrics entirely.
-func NewServer(addr string) *Server {
+// Pass addr="" to disable metrics entirely. labels is rendered on every
+// Prometheus line; pass the zero value (Labels{}) to keep the old
+// unlabeled output.
+func NewServer(addr string, labels Labels) *Server {
 	if addr == "" {
 		return nil
 	}
@@ -66,7 +78,7 @@ func NewServer(addr string) *Server {
 	// /metrics serves Prometheus/OpenMetrics text format — the industry
 	// convention, and what Datadog's openmetrics check and Prometheus
 	// scrapers expect by default.
-	mux.HandleFunc("/metrics", handlePrometheus)
+	mux.HandleFunc("/metrics", makePrometheusHandler(labels))
 	// /metrics.json keeps the JSON view for human debugging or scrapers
 	// that prefer structured data.
 	mux.HandleFunc("/metrics.json", handleJSONMetrics)
@@ -173,24 +185,40 @@ func snapshot() []metric {
 	}
 }
 
-// handlePrometheus serves the /metrics endpoint in Prometheus/OpenMetrics
-// text exposition format. Compatible with Datadog's openmetrics check and
-// any Prometheus scraper.
-func handlePrometheus(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	writePrometheus(w, snapshot())
+// makePrometheusHandler returns an http.HandlerFunc bound to the given
+// labels. Closures over labels keep the rendering branch out of the hot
+// path: empty labels render exactly the unlabeled bytes of the
+// pre-Labels code, so single-cluster deployments aren't penalized.
+func makePrometheusHandler(labels Labels) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		writePrometheus(w, snapshot(), labels)
+	}
 }
 
-func writePrometheus(w io.Writer, metrics []metric) {
+// labelSuffix renders Labels into the `{key="value",...}` form appended
+// after the metric name. Empty labels return "" so the output is
+// byte-identical to the pre-Labels code.
+func (l Labels) labelSuffix() string {
+	if l.Cluster == "" {
+		return ""
+	}
+	// Quote the value to handle (rare) whitespace or special chars.
+	// Prometheus exposition format requires escaping of \, \n, and ".
+	return fmt.Sprintf("{cluster=%q}", l.Cluster)
+}
+
+func writePrometheus(w io.Writer, metrics []metric, labels Labels) {
 	// Sort by name for a stable output order — helpful when diffing
 	// scrape output across versions.
 	sort.Slice(metrics, func(i, j int) bool { return metrics[i].name < metrics[j].name })
+	suffix := labels.labelSuffix()
 	for _, m := range metrics {
 		fmt.Fprintf(w, "# HELP %s %s\n", m.name, m.help)
 		fmt.Fprintf(w, "# TYPE %s %s\n", m.name, m.typ)
 		// %g for floats, %d for integer-valued gauges would be nicer but
 		// complicates the type table; Prometheus accepts scientific notation.
-		fmt.Fprintf(w, "%s %g\n", m.name, m.value)
+		fmt.Fprintf(w, "%s%s %g\n", m.name, suffix, m.value)
 	}
 }
 

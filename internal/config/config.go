@@ -33,6 +33,13 @@ type ProxyConfig struct {
 	MetricsAddr     string        `yaml:"metrics_addr"` // "" to disable; e.g. "127.0.0.1:9090"
 	MaxConnections  int           `yaml:"max_connections"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	// Cluster names the database cluster this proxy fronts. When set,
+	// every Prometheus metric line is rendered with `{cluster="<value>"}`,
+	// so a single dashboard can break stats down per database cluster
+	// (e.g. select a specific cluster from a template variable). Empty =
+	// no label emitted, preserving backward compatibility for
+	// single-cluster deployments.
+	Cluster string `yaml:"cluster,omitempty"`
 	// Users is the list of credentials the proxy will accept on the
 	// inbound handshake. The matched (username, password) pair is also
 	// used to authenticate the per-session outbound connection to the

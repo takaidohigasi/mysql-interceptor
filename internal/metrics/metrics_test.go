@@ -39,7 +39,7 @@ func TestPrometheusEndpoint(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	handlePrometheus(rr, req)
+	makePrometheusHandler(Labels{})(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
@@ -70,6 +70,12 @@ func TestPrometheusEndpoint(t *testing.T) {
 		}
 	}
 
+	// With empty Labels the output must be byte-identical to the
+	// pre-Labels behavior — no `{...}` sequences anywhere.
+	if strings.Contains(body, "{") {
+		t.Errorf("empty Labels should produce no label braces, body was:\n%s", body)
+	}
+
 	// Sanity: the output should be valid Prometheus exposition format —
 	// every non-blank, non-comment line should be "name value".
 	for i, line := range strings.Split(body, "\n") {
@@ -79,6 +85,43 @@ func TestPrometheusEndpoint(t *testing.T) {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
 			t.Errorf("line %d is not valid exposition format: %q", i, line)
+		}
+	}
+}
+
+// TestPrometheusEndpoint_WithClusterLabel confirms that a non-empty
+// Labels.Cluster causes every metric line to be rendered as
+// `name{cluster="..."} value` and that the value is properly quoted.
+func TestPrometheusEndpoint_WithClusterLabel(t *testing.T) {
+	setupTestCounters(t)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	makePrometheusHandler(Labels{Cluster: "example-cluster"})(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		`active_sessions{cluster="example-cluster"} 3`,
+		`total_sessions{cluster="example-cluster"} 42`,
+		`queries_handled{cluster="example-cluster"} 100`,
+		`comparisons_ignored{cluster="example-cluster"} 7`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected output to contain %q, body was:\n%s", want, body)
+		}
+	}
+
+	// Every non-comment, non-blank line must carry the label.
+	for i, line := range strings.Split(body, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.Contains(line, `{cluster="example-cluster"}`) {
+			t.Errorf("line %d missing cluster label: %q", i, line)
 		}
 	}
 }
@@ -116,7 +159,7 @@ func TestJSONMetricsEndpoint(t *testing.T) {
 }
 
 func TestNewServerNilForEmptyAddr(t *testing.T) {
-	if s := NewServer(""); s != nil {
+	if s := NewServer("", Labels{}); s != nil {
 		t.Errorf("expected nil server for empty addr, got %v", s)
 	}
 	// Nil-safe methods

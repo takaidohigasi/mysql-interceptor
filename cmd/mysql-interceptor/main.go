@@ -179,7 +179,9 @@ func runServe() {
 		})
 	}
 
-	metricsSrv := metrics.NewServer(cfg.Proxy.MetricsAddr)
+	metricsSrv := metrics.NewServer(cfg.Proxy.MetricsAddr, metrics.Labels{
+		Cluster: cfg.Proxy.Cluster,
+	})
 	metricsSrv.Start()
 	defer metricsSrv.Shutdown()
 
