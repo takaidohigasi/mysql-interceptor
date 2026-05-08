@@ -48,6 +48,13 @@ type ShadowSession struct {
 // check — then enqueues for execution on this session's pinned connection.
 // Non-blocking: if the per-session queue is full, the query is dropped
 // and counted as shadow_dropped.
+//
+// If sq.OrigResult is nil and sq.Capture is non-nil, Capture is invoked
+// AFTER the gate checks pass to materialize the primary's result lazily.
+// This lets the proxy hot path skip captureResult work for queries that
+// will be rejected by sample_rate / CIDR / category filters — measured
+// at ~20% of sends in dev (DML against persistent tables fails the
+// category check).
 func (ss *ShadowSession) Send(sq ShadowQuery) {
 	if ss.closed.Load() {
 		ss.sender.dropped.Add(1)
@@ -67,6 +74,16 @@ func (ss *ShadowSession) Send(sq ShadowQuery) {
 		metrics.Global.ShadowSkipped.Add(1)
 		return
 	}
+
+	// All gates passed. Lazily materialize OrigResult if the producer
+	// deferred capture via the Capture callback. Nil out the closure
+	// after invocation so the queued ShadowQuery doesn't pin captured
+	// variables (the *mysql.Result, etc.) for the entire queue
+	// lifetime.
+	if sq.OrigResult == nil && sq.Capture != nil {
+		sq.OrigResult = sq.Capture()
+	}
+	sq.Capture = nil
 
 	select {
 	case ss.queryCh <- sq:

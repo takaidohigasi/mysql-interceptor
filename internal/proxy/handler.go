@@ -104,7 +104,11 @@ func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{},
 	}
 
 	if h.shadowSession != nil {
-		captured := captureResult(result, err, duration)
+		// Defer captureResult until after Send's gate checks
+		// (enabled / sample_rate / CIDR / category) pass — saves the
+		// result-set walk for queries that would be rejected anyway.
+		// Measured at ~20% of sends in dev (DML against persistent
+		// tables fails the category check).
 		h.shadowSession.Send(replay.ShadowQuery{
 			SessionID:    h.sessionID,
 			SourceIP:     h.sourceIP,
@@ -113,7 +117,9 @@ func (h *ProxyHandler) afterExecute(queryType, query string, args []interface{},
 			Query:        query,
 			Args:         args,
 			OrigDuration: duration,
-			OrigResult:   captured,
+			Capture: func() *compare.CapturedResult {
+				return captureResult(result, err, duration)
+			},
 		})
 	}
 }
