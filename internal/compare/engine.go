@@ -92,16 +92,19 @@ func (e *Engine) redactError(value string) string {
 }
 
 func (e *Engine) Compare(original, replay *CapturedResult, query, user string, sessionID uint64) *CompareResult {
-	result := &CompareResult{
-		Query:          query,
-		QueryDigest:    Digest(query),
-		SessionID:      sessionID,
-		Timestamp:      time.Now(),
-		Match:          true,
-		Ignored:        e.matchesIgnore(query),
-		OriginalTimeMs: float64(original.Duration.Microseconds()) / 1000.0,
-		ReplayTimeMs:   float64(replay.Duration.Microseconds()) / 1000.0,
-	}
+	// Pulled from a sync.Pool so high-rate diff workloads don't burn
+	// allocations on CompareResult + the Differences slice. Caller
+	// MUST release via ReleaseCompareResult once Reporter.Record has
+	// consumed the result — see the helper's doc.
+	result := AcquireCompareResult()
+	result.Query = query
+	result.QueryDigest = Digest(query)
+	result.SessionID = sessionID
+	result.Timestamp = time.Now()
+	result.Match = true
+	result.Ignored = e.matchesIgnore(query)
+	result.OriginalTimeMs = float64(original.Duration.Microseconds()) / 1000.0
+	result.ReplayTimeMs = float64(replay.Duration.Microseconds()) / 1000.0
 	// User is attached only when the result is a real divergence
 	// (Match=false and not in the ignore list). Matched and ignored
 	// records aren't worth carrying per-query identity for, and this
