@@ -215,10 +215,20 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 		timeout = 5 * time.Second
 	}
 
+	// time.NewTimer + Stop is preferred over time.After here: most queries
+	// finish well under the 5s default, so the timer is unused 99%+ of the
+	// time. time.After can't be cancelled — the underlying timer survives
+	// until expiry, holding a reference in the runtime's timer heap. With
+	// 200k+ queries/sec each holding a 5s timer for ~1ms of actual usage,
+	// that's significant heap pressure. NewTimer + defer Stop releases the
+	// timer immediately on the success / ctx.Done paths.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case res := <-done:
 		ss.recordResult(sq, res, engine, reporter)
-	case <-time.After(timeout):
+	case <-timer.C:
 		slog.Warn("shadow: query timeout exceeded, tearing down session",
 			"session_id", ss.sessionID, "timeout", timeout, "query", sq.Query)
 		ss.abortInFlightExec(done)
