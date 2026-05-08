@@ -43,6 +43,7 @@ type Counters struct {
 	ComparisonsIgnored        atomic.Int64
 	ComparisonsDigestOver     atomic.Int64 // new digests dropped because cap hit
 	ComparisonsDigestCount    atomic.Int64 // current unique digests tracked (gauge)
+	ComparisonsReportDropped  atomic.Int64 // diff/heartbeat records dropped because the async writer queue was full
 }
 
 // Global is the singleton counter set. Components increment fields on it
@@ -170,6 +171,7 @@ func snapshot() []metric {
 		{"comparisons_ignored", "counter", "Comparisons that matched a configured ignore pattern", float64(Global.ComparisonsIgnored.Load())},
 		{"comparisons_digest_count", "gauge", "Current number of unique query digests being tracked", float64(Global.ComparisonsDigestCount.Load())},
 		{"comparisons_digest_overflow", "counter", "New digests dropped because the max_unique_digests cap was reached", float64(Global.ComparisonsDigestOver.Load())},
+		{"comparisons_report_dropped", "counter", "Diff/heartbeat records dropped because the async reporter writer queue was full (consumer fell behind producers)", float64(Global.ComparisonsReportDropped.Load())},
 
 		// Runtime
 		{"heap_alloc_bytes", "gauge", "Bytes currently allocated on the Go heap", float64(ms.HeapAlloc)},

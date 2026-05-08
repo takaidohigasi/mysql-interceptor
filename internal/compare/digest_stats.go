@@ -3,6 +3,7 @@ package compare
 import (
 	"encoding/json"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"math"
@@ -25,12 +26,42 @@ const maxReservoirSize = 10000
 // Matches the default in config.ComparisonConfig.
 const DefaultMaxUniqueDigests = 10000
 
+// digestNumShards is the number of independent shards over which the
+// digest map (and its mutex) are partitioned. Using a power of two
+// lets shardFor mask the hash with digestShardMask instead of taking
+// a modulo. 32 is a sweet spot: enough to absorb contention from
+// dozens of producers per host without ballooning per-shard overhead
+// (each shard adds 64 B of mutex + map header, ~2 KB total).
+const digestNumShards = 32
+const digestShardMask = digestNumShards - 1
+
+// DigestStats accumulates per-query-digest counters and timing
+// samples. It is safe for concurrent use from many goroutines.
+//
+// The digest map is sharded into digestNumShards independent buckets,
+// each protected by its own mutex. A digest always lands on the same
+// shard (via maphash.String), so per-digest updates never contend
+// with updates to other digests on different shards. The global
+// uniqueness cap is enforced via a single atomic counter so the
+// "max_unique_digests" config knob retains its global meaning.
 type DigestStats struct {
-	mu             sync.Mutex
-	digests        map[string]*DigestEntry
-	maxDigests     int
+	seed           maphash.Seed
+	shards         [digestNumShards]digestShard
+	maxDigests     int          // global cap across all shards
+	digestCount    atomic.Int64 // current global count of unique digests
 	overflow       atomic.Int64 // count of new digests dropped due to cap
 	overflowWarned atomic.Bool  // one-time log on first overflow
+}
+
+type digestShard struct {
+	mu      sync.Mutex                // 8 bytes
+	digests map[string]*DigestEntry   // 8 bytes (map header is one pointer)
+	// Pad each shard out to exactly 64 bytes so adjacent shards land
+	// on different AMD64 / arm64 cache lines and never false-share.
+	// Without padding to a full cache-line stride, shard[0]'s tail
+	// would share a line with shard[1]'s head and concurrent updates
+	// would invalidate each other. 8 + 8 + 48 = 64 = one cache line.
+	_ [48]byte
 }
 
 type DigestEntry struct {
@@ -78,17 +109,32 @@ func NewDigestStats() *DigestStats {
 }
 
 // NewDigestStatsWithCap constructs a DigestStats that tracks at most
-// maxDigests unique query digests. Once reached, new digests are dropped
-// (counted via Overflow()) but existing digests keep updating. A cap of
-// 0 or negative is treated as DefaultMaxUniqueDigests.
+// maxDigests unique query digests across all shards combined. Once
+// reached, new digests are dropped (counted via Overflow()) but
+// existing digests keep updating. A cap of 0 or negative is treated
+// as DefaultMaxUniqueDigests.
 func NewDigestStatsWithCap(maxDigests int) *DigestStats {
 	if maxDigests <= 0 {
 		maxDigests = DefaultMaxUniqueDigests
 	}
-	return &DigestStats{
-		digests:    make(map[string]*DigestEntry),
+	ds := &DigestStats{
+		seed:       maphash.MakeSeed(),
 		maxDigests: maxDigests,
 	}
+	for i := range ds.shards {
+		ds.shards[i].digests = make(map[string]*DigestEntry)
+	}
+	return ds
+}
+
+// shardFor returns the shard owning a given digest. maphash.String is
+// used so the distribution is hash-randomized per process (the seed
+// is per-DigestStats), preventing pathological patterns where a
+// caller could deliberately concentrate distinct digests on one
+// shard.
+func (ds *DigestStats) shardFor(digest string) *digestShard {
+	h := maphash.String(ds.seed, digest)
+	return &ds.shards[h&digestShardMask]
 }
 
 func (ds *DigestStats) Record(result *CompareResult) {
@@ -103,31 +149,38 @@ func (ds *DigestStats) Record(result *CompareResult) {
 		digest = Digest(result.Query)
 	}
 
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
+	sh := ds.shardFor(digest)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	entry, ok := ds.digests[digest]
+	entry, ok := sh.digests[digest]
 	if !ok {
-		// New digest: honor the cap. We drop the new digest entirely
-		// rather than evicting an existing one so operators with stable
-		// query patterns see no surprises; overflow is visible via the
-		// metric and a one-time warning log.
-		if len(ds.digests) >= ds.maxDigests {
-			ds.overflow.Add(1)
-			metrics.Global.ComparisonsDigestOver.Add(1)
-			if ds.overflowWarned.CompareAndSwap(false, true) {
-				slog.Warn("digest stats cap reached; new query patterns are being dropped",
-					"cap", ds.maxDigests,
-					"hint", "tune comparison.max_unique_digests up or investigate high-cardinality query patterns")
+		// Reserve a slot from the global cap before inserting. CAS loop
+		// because multiple goroutines may hit different shards
+		// concurrently and race for the last few slots; whoever loses
+		// re-reads the new value and re-checks against the cap.
+		for {
+			cur := ds.digestCount.Load()
+			if cur >= int64(ds.maxDigests) {
+				ds.overflow.Add(1)
+				metrics.Global.ComparisonsDigestOver.Add(1)
+				if ds.overflowWarned.CompareAndSwap(false, true) {
+					slog.Warn("digest stats cap reached; new query patterns are being dropped",
+						"cap", ds.maxDigests,
+						"hint", "tune comparison.max_unique_digests up or investigate high-cardinality query patterns")
+				}
+				return
 			}
-			return
+			if ds.digestCount.CompareAndSwap(cur, cur+1) {
+				metrics.Global.ComparisonsDigestCount.Store(cur + 1)
+				break
+			}
 		}
 		entry = &DigestEntry{
 			Digest:      digest,
 			SampleQuery: result.Query,
 		}
-		ds.digests[digest] = entry
-		metrics.Global.ComparisonsDigestCount.Store(int64(len(ds.digests)))
+		sh.digests[digest] = entry
 	}
 
 	entry.Count++
@@ -178,37 +231,44 @@ func (ds *DigestStats) Overflow() int64 {
 	return ds.overflow.Load()
 }
 
+// Summaries returns a snapshot of every tracked digest, sorted by
+// count descending. Each shard is locked individually while its
+// entries are summarized; no two shard locks are ever held
+// simultaneously, so this can run concurrently with Record on
+// different shards without contention beyond the per-shard lock.
 func (ds *DigestStats) Summaries() []DigestSummary {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-
-	summaries := make([]DigestSummary, 0, len(ds.digests))
-	for _, entry := range ds.digests {
-		s := DigestSummary{
-			Digest:      entry.Digest,
-			SampleQuery: entry.SampleQuery,
-			Count:       entry.Count,
-			MatchCount:  entry.MatchCount,
-			DiffCount:   entry.DiffCount,
-			ErrorCount:  entry.ErrorCount,
+	// Best-effort capacity hint to avoid grow-doubling. The atomic
+	// load is racy with concurrent inserts; one or two off doesn't
+	// matter for an append-grow heuristic.
+	summaries := make([]DigestSummary, 0, ds.digestCount.Load())
+	for i := range ds.shards {
+		sh := &ds.shards[i]
+		sh.mu.Lock()
+		for _, entry := range sh.digests {
+			s := DigestSummary{
+				Digest:      entry.Digest,
+				SampleQuery: entry.SampleQuery,
+				Count:       entry.Count,
+				MatchCount:  entry.MatchCount,
+				DiffCount:   entry.DiffCount,
+				ErrorCount:  entry.ErrorCount,
+			}
+			if entry.OriginalCount > 0 {
+				s.OriginalAvg = round2(entry.OriginalSum / float64(entry.OriginalCount))
+				s.OriginalP95 = percentile64(entry.OriginalTimes, 95)
+				s.OriginalP99 = percentile64(entry.OriginalTimes, 99)
+			}
+			if entry.ReplayCount > 0 {
+				s.ReplayAvg = round2(entry.ReplaySum / float64(entry.ReplayCount))
+				s.ReplayP95 = percentile64(entry.ReplayTimes, 95)
+				s.ReplayP99 = percentile64(entry.ReplayTimes, 99)
+			}
+			s.OverheadAvg = round2(s.ReplayAvg - s.OriginalAvg)
+			s.OverheadP95 = round2(s.ReplayP95 - s.OriginalP95)
+			s.OverheadP99 = round2(s.ReplayP99 - s.OriginalP99)
+			summaries = append(summaries, s)
 		}
-
-		if entry.OriginalCount > 0 {
-			s.OriginalAvg = round2(entry.OriginalSum / float64(entry.OriginalCount))
-			s.OriginalP95 = percentile64(entry.OriginalTimes, 95)
-			s.OriginalP99 = percentile64(entry.OriginalTimes, 99)
-		}
-		if entry.ReplayCount > 0 {
-			s.ReplayAvg = round2(entry.ReplaySum / float64(entry.ReplayCount))
-			s.ReplayP95 = percentile64(entry.ReplayTimes, 95)
-			s.ReplayP99 = percentile64(entry.ReplayTimes, 99)
-		}
-
-		s.OverheadAvg = round2(s.ReplayAvg - s.OriginalAvg)
-		s.OverheadP95 = round2(s.ReplayP95 - s.OriginalP95)
-		s.OverheadP99 = round2(s.ReplayP99 - s.OriginalP99)
-
-		summaries = append(summaries, s)
+		sh.mu.Unlock()
 	}
 
 	sort.Slice(summaries, func(i, j int) bool {
