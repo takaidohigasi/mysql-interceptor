@@ -2,12 +2,11 @@ package compare
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,30 +34,32 @@ const reporterBufSize = 16 << 10
 // invisible to operators tailing the file.
 const reporterFlushInterval = 250 * time.Millisecond
 
-// emitterEntry is a pooled (bytes.Buffer, *json.Encoder) pair used
-// by emit() to amortize per-record allocation. The Buffer's internal
-// []byte is reused across pool gets — bytes.Buffer.Reset preserves
-// its capacity — so steady-state encoding hits zero allocations on
-// the buffer itself.
-//
-// The encoder is paired 1:1 with its buffer because json.NewEncoder
-// captures the io.Writer at construction; you can't swap writers
-// after the fact. SetEscapeHTML(false) is set on the encoder during
-// pool construction so the per-call hot path doesn't need to set it.
+// emitterEntry holds the encoded JSON bytes for one queued record.
+// Both producers (emit) and the writer goroutine (runWriter) handle
+// pointers to entries through the channel, so the writer can return
+// the entry to the pool after the syscall completes — eliminating
+// the per-record payload copy the encoding/json + channel-of-bytes
+// design needed.
 type emitterEntry struct {
-	buf *bytes.Buffer
-	enc *json.Encoder
+	buf []byte
 }
 
-// emitterPool reuses (Buffer, Encoder) pairs across calls. Pool
-// entries can be reclaimed by GC at any time — that's fine because
-// the New func builds a fresh entry on Get when needed.
+// emitterPool amortizes the (potentially KB-sized) encoded-record
+// buffer across calls. Pool entries can be reclaimed by GC at any
+// time — that's fine because the New func builds a fresh zero-cap
+// entry on next Get; the first appendJSON call grows it.
+//
+// The pool is shared across all Reporter instances in the process
+// (typical: one). That's intentional: report sizes are similar
+// across reporters, so the pool stays warm regardless of which
+// reporter most recently emitted.
 var emitterPool = sync.Pool{
 	New: func() interface{} {
-		buf := &bytes.Buffer{}
-		enc := json.NewEncoder(buf)
-		enc.SetEscapeHTML(false)
-		return &emitterEntry{buf: buf, enc: enc}
+		// 1 KiB initial cap covers most match records; diff records
+		// with multiple Differences will grow the slice on first use,
+		// after which the grown capacity stays with the entry across
+		// pool round-trips.
+		return &emitterEntry{buf: make([]byte, 0, 1024)}
 	},
 }
 
@@ -86,7 +87,7 @@ type Reporter struct {
 	// from buffering is more annoying than the syscall savings.
 	// Touched only by runWriter, so no locking is needed.
 	bw         *bufio.Writer
-	writeCh    chan []byte
+	writeCh    chan *emitterEntry
 	writerDone chan struct{}
 	closeOnce  sync.Once
 	closeErr   error
@@ -151,7 +152,7 @@ func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
 
 	r := &Reporter{
 		writer:      w,
-		writeCh:     make(chan []byte, reporterWriteChCap),
+		writeCh:     make(chan *emitterEntry, reporterWriteChCap),
 		writerDone:  make(chan struct{}),
 		logMatches:  opts.LogMatches,
 		digestStats: NewDigestStatsWithCap(opts.MaxUniqueDigests),
@@ -206,14 +207,19 @@ func (r *Reporter) runWriter() {
 
 	for {
 		select {
-		case buf, ok := <-r.writeCh:
+		case e, ok := <-r.writeCh:
 			if !ok {
 				flush()
 				return
 			}
-			if _, err := sink.Write(buf); err != nil {
+			if _, err := sink.Write(e.buf); err != nil {
 				slog.Error("failed to write comparison record", "err", err)
 			}
+			// The writer is the sole consumer; safe to return the
+			// entry to the pool now that the bytes have been handed
+			// off to bufio (or directly to the file). Producers
+			// won't see this entry again until a fresh Get.
+			emitterPool.Put(e)
 		case <-tickerC:
 			flush()
 		}
@@ -262,34 +268,40 @@ func (r *Reporter) Record(result *CompareResult) {
 // (writer fell behind producers), the record is dropped and counted
 // on comparisons_report_dropped. Dropping is preferred to blocking
 // because the alternative would back-pressure the proxy hot path.
+//
+// Encoding goes through hand-rolled appendJSON methods (see
+// jsonenc.go and the appendJSON methods on CompareResult /
+// Difference / HeartbeatRecord) — encoding/json is not on the hot
+// path. The pooled emitterEntry's []byte is filled in place and
+// passed by pointer to the writer goroutine, which returns it to
+// the pool after the underlying Write completes; no per-record copy
+// of the encoded bytes happens.
 func (r *Reporter) emit(v interface{}) {
-	// Grab a pooled (Buffer, Encoder) pair. The encoder already has
-	// SetEscapeHTML(false) — done once at pool construction — so the
-	// hot path doesn't pay that cost per call. SetEscapeHTML(false)
-	// matches the pre-async output format (no < / > / &
-	// escapes for <, >, & in cell values).
 	e := emitterPool.Get().(*emitterEntry)
-	e.buf.Reset()
-	if err := e.enc.Encode(v); err != nil {
-		slog.Error("failed to marshal comparison record", "err", err)
+	e.buf = e.buf[:0]
+	switch t := v.(type) {
+	case *CompareResult:
+		e.buf = t.appendJSON(e.buf)
+	case *HeartbeatRecord:
+		e.buf = t.appendJSON(e.buf)
+	default:
+		// Unreachable from in-tree callers (Record + WriteHeartbeat
+		// are the only producers). Surface loud so a future caller
+		// adding a new type doesn't silently get records dropped.
+		slog.Error("compare.Reporter.emit: unsupported value type",
+			"type", fmt.Sprintf("%T", v))
 		emitterPool.Put(e)
 		return
 	}
-	// We must copy the bytes out before returning the entry to the
-	// pool, because the next pool consumer will Reset() the buffer
-	// and overwrite the underlying []byte. Without the copy, the
-	// writer goroutine would race the next emit() call.
-	//
-	// json.Encoder.Encode appends a trailing newline, so the payload
-	// is ready to write as-is.
-	payload := make([]byte, e.buf.Len())
-	copy(payload, e.buf.Bytes())
-	emitterPool.Put(e)
 
 	select {
-	case r.writeCh <- payload:
+	case r.writeCh <- e:
 	default:
 		metrics.Global.ComparisonsReportDropped.Add(1)
+		// Drop = put the entry back so the buffer capacity isn't
+		// lost. The writer goroutine is the only other Put-er, so
+		// returning here doesn't race anyone.
+		emitterPool.Put(e)
 	}
 }
 
@@ -306,6 +318,33 @@ type HeartbeatRecord struct {
 	WindowIgnored   int64   `json:"window_ignored"`
 	CumulativeTotal int64   `json:"cumulative_total"`
 	CumulativeDiff  int64   `json:"cumulative_differed"`
+}
+
+// appendJSON appends the JSON encoding of h (followed by a newline,
+// matching json.Encoder.Encode) to buf. See CompareResult.appendJSON
+// for the shape of the hand-rolled encoder.
+func (h *HeartbeatRecord) appendJSON(buf []byte) []byte {
+	buf = append(buf, '{')
+	buf = append(buf, `"type":`...)
+	buf = appendJSONString(buf, h.Type)
+	buf = append(buf, `,"timestamp":`...)
+	buf = appendJSONString(buf, h.Timestamp)
+	buf = append(buf, `,"window_seconds":`...)
+	buf = appendJSONFloat(buf, h.WindowSeconds)
+	buf = append(buf, `,"window_total":`...)
+	buf = strconv.AppendInt(buf, h.WindowTotal, 10)
+	buf = append(buf, `,"window_matched":`...)
+	buf = strconv.AppendInt(buf, h.WindowMatched, 10)
+	buf = append(buf, `,"window_differed":`...)
+	buf = strconv.AppendInt(buf, h.WindowDiffered, 10)
+	buf = append(buf, `,"window_ignored":`...)
+	buf = strconv.AppendInt(buf, h.WindowIgnored, 10)
+	buf = append(buf, `,"cumulative_total":`...)
+	buf = strconv.AppendInt(buf, h.CumulativeTotal, 10)
+	buf = append(buf, `,"cumulative_differed":`...)
+	buf = strconv.AppendInt(buf, h.CumulativeDiff, 10)
+	buf = append(buf, '}', '\n')
+	return buf
 }
 
 // WriteHeartbeat emits a single line summarizing comparison activity

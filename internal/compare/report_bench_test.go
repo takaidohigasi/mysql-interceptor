@@ -24,7 +24,7 @@ func newBenchReporter(b *testing.B) *Reporter {
 	b.Helper()
 	r := &Reporter{
 		writer:      nullCloser{Writer: io.Discard},
-		writeCh:     make(chan []byte, reporterWriteChCap),
+		writeCh:     make(chan *emitterEntry, reporterWriteChCap),
 		writerDone:  make(chan struct{}),
 		logMatches:  true, // emit every Record so the encode path is on the hot path
 		digestStats: NewDigestStats(),
@@ -45,7 +45,7 @@ func newBufferedBenchReporter(b *testing.B) *Reporter {
 	r := &Reporter{
 		writer:      w,
 		bw:          bufio.NewWriterSize(w, reporterBufSize),
-		writeCh:     make(chan []byte, reporterWriteChCap),
+		writeCh:     make(chan *emitterEntry, reporterWriteChCap),
 		writerDone:  make(chan struct{}),
 		logMatches:  true,
 		digestStats: NewDigestStats(),
