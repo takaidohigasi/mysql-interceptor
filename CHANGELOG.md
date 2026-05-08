@@ -7,6 +7,137 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.7"></a>
+## v0.0.7
+
+_Released 2026-05-08._
+
+Comparison hot-path overhaul plus sensitive-column redaction. Four
+stacked perf PRs progressively eliminate allocator and lock pressure
+on `Engine.Compare → Reporter.Record`; on the diff-emit path the
+steady-state allocation count drops from ~5 allocs/op to 0 and per-
+record latency falls roughly **35–60%** in microbench. No wire-format
+or config changes are required to opt in — every change preserves
+byte-identical JSONL output and existing operator workflows.
+
+### Highlights
+
+- **Sensitive column redaction in diff records.** New
+  `comparison.redact_columns` allow-list and `comparison.redact_all_values`
+  global override let operators learn _that_ a security-relevant column
+  drifted (the `type` / `column` / `row` / timing fields stay intact)
+  without leaking the data into `comparison.output_file`. Sibling to
+  the existing `logging.redact_args` for prepared-statement bind values
+  in the audit log. (#22)
+- **Comparison hot-path is now zero-allocation steady-state.** Four
+  layered changes, each measured in isolation:
+  1. **Sharded `DigestStats`** — replaces the single `sync.Mutex` + map
+     with 32 cache-line-aligned shards (#24).
+  2. **Async reporter** — `sync.Mutex`-around-`Encode` becomes a
+     buffered channel + single writer goroutine; producers
+     JSON-marshal in parallel (#24).
+  3. **`bufio.Writer`** wrapping the report file — coalesces ~22
+     records per syscall, replacing ~10k Write syscalls/sec at
+     sustained 5%-diff-rate × 200k qps with ~450/sec (#25).
+  4. **Hand-rolled `appendJSON`** for `CompareResult` /
+     `Difference` / `HeartbeatRecord` — drops `encoding/json`
+     reflection + interface dispatch from the hot path. Wire format
+     is byte-identical to `json.Encoder` with `SetEscapeHTML(false)`,
+     pinned by a compatibility test (#25).
+  5. **`*CompareResult` pool + Differences slice reuse** —
+     `Engine.Compare` pulls a zeroed entry from a pool; callers
+     release after `Reporter.Record`. The Differences slice keeps
+     its capacity across pool round-trips (#25).
+- **`comparisons_report_dropped` metric.** New counter exposes diff or
+  heartbeat records dropped because the async writer's channel was
+  full (consumer fell behind producers). Dropping is preferred to
+  back-pressuring the proxy hot path; the metric lets operators tell
+  when the safety valve is firing. (#24)
+- **Capture-after-filter on the shadow path.** `ShadowQuery` now
+  carries an optional `Capture func()` callback that
+  `ShadowSession.Send` invokes only after the `enabled` /
+  `sample_rate` / CIDR / category gates pass. Today ~20% of sends
+  fail the category check (DML against persistent tables); the
+  primary-side `captureResult` walk is now skipped for those. With
+  `sample_rate < 1.0` or CIDR filters the savings are larger. (#24)
+
+### Added
+
+- **`comparison.redact_columns`** — list of column names whose
+  `cell_value` diff payloads have `original` / `replay` replaced with
+  `"<redacted>"`. The diff record is still emitted (so operators see
+  _that_ the column drifted) — only the values are masked. Other
+  diff types (`column_count`, `row_count`, `affected_rows`,
+  `column_name`) carry counts or schema names, not user data, and
+  are unaffected. (#22)
+- **`comparison.redact_all_values`** — global override. When `true`,
+  every `cell_value` AND `error` diff is redacted regardless of
+  column. Defense-in-depth for environments where any value leak is
+  unacceptable, or as a fallback against an incomplete
+  `redact_columns` list. (#22)
+- **`comparisons_report_dropped`** metric (counter) — diff /
+  heartbeat records dropped because the async reporter writer queue
+  was full. (#24)
+- **`AcquireCompareResult` / `ReleaseCompareResult`** — package-level
+  helpers in `internal/compare`. Engine.Compare pulls from the pool;
+  callers release after `Reporter.Record` consumes the result. Tests
+  that construct `*CompareResult` literally don't need to use
+  these — short-lived test allocations are cheap. (#25)
+- **`ShadowQuery.Capture`** — optional `func() *compare.CapturedResult`
+  callback that defers materialization of `OrigResult` until after
+  `Send`'s gate checks. Producers should set `Capture` OR
+  `OrigResult`, not both. Direct callers (offline replay, tests) can
+  still pre-fill `OrigResult` and leave `Capture` nil for the
+  original eager-capture behavior. (#24)
+
+### Changed
+
+- **`Reporter` write path is now async.** `Reporter.Close` is
+  idempotent (`sync.Once`-guarded) and drains the writer goroutine
+  before closing the underlying file. Concurrent `Record` calls
+  during `Close` remain unsafe by contract — existing usage
+  (`ShadowSender.Close` + `bgWG`-gated teardown,
+  `OfflineReplayer.Run` deferred close) already serializes
+  correctly. (#24)
+- **Reporter writes are buffered.** File-backed sinks now wrap the
+  underlying file with a 16 KiB `bufio.Writer`; auto-flush when the
+  buffer fills + 250 ms ticker bound the latency for sparse traffic.
+  Stdout sinks (`output_file = ""` or `"-"`) skip bufio so human
+  tails see records immediately. (#25)
+- **`DigestStats.Record` reuses the precomputed digest.**
+  `Engine.Compare` already populates `result.QueryDigest`;
+  `DigestStats.Record` no longer recomputes it on every call. The
+  defensive fallback preserves behavior for callers (mostly tests)
+  that bypass `Engine.Compare`. (#23)
+
+### Trade-offs to be aware of
+
+- The new bufio writer means a process crash (panic, SIGKILL without
+  defer) can lose up to **16 KiB or 250 ms of records**, whichever
+  comes first. The pre-bufio behavior already lost records on OS
+  crashes (no `fsync` is performed); this widens the window slightly
+  on _process_ crashes. The diff report is a diagnostic / audit log,
+  not a transaction log; the bounded loss window is acceptable for
+  this workload. Operators who need stronger durability should
+  forward `comparison.output_file` through a sidecar that fsyncs.
+
+### Notes for operators
+
+- Wire format on `comparison.output_file` is unchanged. Hand-rolled
+  encoding emits byte-identical bytes to `json.Encoder` with
+  `SetEscapeHTML(false)` — the existing
+  `TestAppendJSON_*_MatchesEncodingJSON` tests pin this against a
+  representative corpus including UTF-8, control characters, U+2028
+  / U+2029, and HTML chars.
+- No config migration required for the perf changes.
+- For redaction, start with `comparison.redact_columns: ["hashed_password",
+  "email", ...]`. Consider `comparison.redact_all_values: true` in
+  environments where any value leak is unacceptable.
+- The `comparisons_report_dropped` metric should normally be 0. A
+  sustained nonzero rate indicates the report file is too slow for
+  the diff arrival rate — investigate disk throughput or reduce
+  `comparison.log_matches`.
+
 <a id="v0.0.6"></a>
 ## v0.0.6
 
