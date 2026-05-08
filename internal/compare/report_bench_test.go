@@ -68,13 +68,13 @@ func BenchmarkReporter_Record_Diff(b *testing.B) {
 	// Diff record — has Differences populated, exercises the
 	// JSON-encoding path the way real divergence records do.
 	tmpl := &CompareResult{
-		Query:       "SELECT id, name, email, hashed_password, num_sell_items, num_ticket FROM users WHERE id = ?",
-		QueryDigest: "select id, name, email, hashed_password, num_sell_items, num_ticket from users where id = ?",
+		Query:       "SELECT id, name, email, last_login FROM users WHERE id = ?",
+		QueryDigest: "select id, name, email, last_login from users where id = ?",
 		SessionID:   42,
 		Match:       false,
 		Differences: []Difference{
-			{Type: "cell_value", Row: 0, Column: "iv_cert", Original: "ad7e8d29bbc3589350ff74fe5295422e9818d14c", Replay: "7dd686cbc139d353f2fca63586af9a9c3da466b8"},
-			{Type: "cell_value", Row: 0, Column: "updated", Original: "2026-05-08 10:00:00", Replay: "2026-05-08 09:59:50"},
+			{Type: "cell_value", Row: 0, Column: "email", Original: "alice@example.com", Replay: "alice@example.org"},
+			{Type: "cell_value", Row: 0, Column: "last_login", Original: "2026-05-08 10:00:00", Replay: "2026-05-08 09:59:50"},
 		},
 		OriginalTimeMs: 2.5,
 		ReplayTimeMs:   2.6,
@@ -95,13 +95,13 @@ func BenchmarkReporter_Record_Diff(b *testing.B) {
 func BenchmarkReporter_Record_DiffBuffered(b *testing.B) {
 	r := newBufferedBenchReporter(b)
 	tmpl := &CompareResult{
-		Query:       "SELECT id, name, email, hashed_password, num_sell_items, num_ticket FROM users WHERE id = ?",
-		QueryDigest: "select id, name, email, hashed_password, num_sell_items, num_ticket from users where id = ?",
+		Query:       "SELECT id, name, email, last_login FROM users WHERE id = ?",
+		QueryDigest: "select id, name, email, last_login from users where id = ?",
 		SessionID:   42,
 		Match:       false,
 		Differences: []Difference{
-			{Type: "cell_value", Row: 0, Column: "iv_cert", Original: "ad7e8d29bbc3589350ff74fe5295422e9818d14c", Replay: "7dd686cbc139d353f2fca63586af9a9c3da466b8"},
-			{Type: "cell_value", Row: 0, Column: "updated", Original: "2026-05-08 10:00:00", Replay: "2026-05-08 09:59:50"},
+			{Type: "cell_value", Row: 0, Column: "email", Original: "alice@example.com", Replay: "alice@example.org"},
+			{Type: "cell_value", Row: 0, Column: "last_login", Original: "2026-05-08 10:00:00", Replay: "2026-05-08 09:59:50"},
 		},
 		OriginalTimeMs: 2.5,
 		ReplayTimeMs:   2.6,
@@ -111,6 +111,44 @@ func BenchmarkReporter_Record_DiffBuffered(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			r.Record(tmpl)
+		}
+	})
+}
+
+// BenchmarkReporter_Engine_Diff measures the full production hot
+// path: engine.Compare allocates (or pool-acquires) a CompareResult,
+// Reporter.Record encodes + enqueues it, the caller releases it
+// back to the pool. Distinguishes the steady-state win of the pool
+// from the encoder microbench above (which reuses one shared tmpl).
+func BenchmarkReporter_Engine_Diff(b *testing.B) {
+	r := newBufferedBenchReporter(b)
+	engine := NewEngine(EngineConfig{TimeThresholdMs: 100})
+
+	// Set up CapturedResult inputs that produce a multi-Difference
+	// diff result, exercising the Differences-slice append path.
+	orig := &CapturedResult{
+		Columns: []string{"id", "name", "email", "last_login"},
+		Rows: [][]string{
+			{"1", "alice", "alice@example.com", "2026-05-08 10:00:00"},
+		},
+		Duration: 2500 * 1000, // 2.5ms in nanoseconds
+	}
+	replay := &CapturedResult{
+		Columns: []string{"id", "name", "email", "last_login"},
+		Rows: [][]string{
+			{"1", "alice", "alice@example.org", "2026-05-08 09:59:50"},
+		},
+		Duration: 2600 * 1000,
+	}
+	const query = "SELECT id, name, email, last_login FROM users WHERE id = ?"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			cr := engine.Compare(orig, replay, query, "app_user", 42)
+			r.Record(cr)
+			ReleaseCompareResult(cr)
 		}
 	})
 }

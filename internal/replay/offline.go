@@ -299,6 +299,7 @@ func (r *OfflineReplayer) replayFile(ctx context.Context, filePath string) error
 
 				cmpResult := r.engine.Compare(origResult, replayResult, se.entry.Query, se.entry.User, sid)
 				r.reporter.Record(cmpResult)
+				compare.ReleaseCompareResult(cmpResult)
 				processed.Add(1)
 			}
 		}(sessionID, entries)

@@ -282,6 +282,7 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 			replayRes := &compare.CapturedResult{Error: res.err.Error()}
 			cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.User, sq.SessionID)
 			reporter.Record(cmpResult)
+			compare.ReleaseCompareResult(cmpResult)
 		}
 		return
 	}
@@ -289,6 +290,7 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 	if sq.OrigResult != nil {
 		cmpResult := engine.Compare(sq.OrigResult, res.result, sq.Query, sq.User, sq.SessionID)
 		reporter.Record(cmpResult)
+		compare.ReleaseCompareResult(cmpResult)
 	}
 }
 

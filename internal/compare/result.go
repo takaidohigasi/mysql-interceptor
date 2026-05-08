@@ -2,8 +2,66 @@ package compare
 
 import (
 	"strconv"
+	"sync"
 	"time"
 )
+
+// compareResultPool amortizes the per-record allocation of
+// CompareResult and its Differences slice across the comparison hot
+// path. Engine.Compare pulls an entry via AcquireCompareResult; the
+// caller (typically the shadow / offline replay record path) returns
+// it via ReleaseCompareResult once Reporter.Record has consumed it.
+//
+// The Differences slice's capacity is preserved across pool round
+// trips so a sustained high-divergence workload reaches steady state
+// with zero per-record allocation on the slice header. The slice
+// elements (Difference structs) hold strings; those still allocate
+// per record because Go strings are immutable, but their headers
+// reuse the slice's existing backing array slots.
+//
+// Pool entries can be reclaimed by GC at any time — that's fine
+// because New rebuilds a zero-value CompareResult on next Get.
+var compareResultPool = sync.Pool{
+	New: func() interface{} { return &CompareResult{} },
+}
+
+// AcquireCompareResult returns a zeroed *CompareResult ready for
+// population. Pair every call with ReleaseCompareResult once the
+// result is no longer in use, or the pool wins evaporate (the
+// allocation just shifts from the GC to the pool's New func).
+//
+// Tests that construct a *CompareResult literally (`&CompareResult{...}`)
+// don't need to use this helper; they also don't need to release —
+// short-lived test allocations are cheap and the GC handles them.
+func AcquireCompareResult() *CompareResult {
+	return compareResultPool.Get().(*CompareResult)
+}
+
+// ReleaseCompareResult zeros r's fields, trims its Differences slice
+// to length 0 while preserving the underlying capacity, and returns
+// r to the shared pool. Callers must not reference r after this
+// call — the next Acquire could surface the same pointer to a
+// different goroutine.
+//
+// Safe to call with a nil r; returns immediately.
+func ReleaseCompareResult(r *CompareResult) {
+	if r == nil {
+		return
+	}
+	r.Query = ""
+	r.QueryDigest = ""
+	r.SessionID = 0
+	r.User = ""
+	r.Timestamp = time.Time{}
+	r.Match = false
+	r.Ignored = false
+	r.Differences = r.Differences[:0]
+	r.OriginalTimeMs = 0
+	r.ReplayTimeMs = 0
+	r.TimeDiffMs = 0
+	r.TimeDiffExceed = false
+	compareResultPool.Put(r)
+}
 
 type CompareResult struct {
 	Query       string `json:"query"`

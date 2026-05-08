@@ -38,7 +38,7 @@ func TestAppendJSON_CompareResult_MatchesEncodingJSON(t *testing.T) {
 			Timestamp:   time.Date(2026, 5, 8, 10, 1, 0, 0, time.UTC),
 			Match:       false,
 			Differences: []Difference{
-				{Type: "cell_value", Row: 0, Column: "iv_cert", Original: "abc\"def\\ghi", Replay: "xyz"},
+				{Type: "cell_value", Row: 0, Column: "email", Original: "abc\"def\\ghi", Replay: "xyz"},
 				{Type: "cell_value", Row: 5, Column: "name", Original: "line1\nline2", Replay: "tab\there"},
 				{Type: "error", Original: "<html>&malformed", Replay: ""},
 			},
