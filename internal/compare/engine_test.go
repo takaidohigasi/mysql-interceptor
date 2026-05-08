@@ -348,3 +348,173 @@ func TestCompare_UserOnlyOnDiverging(t *testing.T) {
 		}
 	})
 }
+
+// findDiff returns the first Difference whose Type matches typ, or
+// (Difference{}, false) if none. Helper for the redaction tests.
+func findDiff(diffs []Difference, typ string) (Difference, bool) {
+	for _, d := range diffs {
+		if d.Type == typ {
+			return d, true
+		}
+	}
+	return Difference{}, false
+}
+
+// TestCompare_RedactColumns covers the per-column cell_value
+// redaction path: a cell whose column is in RedactColumns has its
+// Original / Replay values replaced with "<redacted>", but the diff
+// is still recorded with the column name and row index intact.
+func TestCompare_RedactColumns(t *testing.T) {
+	engine := NewEngine(EngineConfig{
+		RedactColumns: map[string]bool{"hashed_password": true},
+	})
+	original := &CapturedResult{
+		Columns: []string{"id", "hashed_password", "email"},
+		Rows:    [][]string{{"1", "old-hash-AAA", "alice@example.com"}},
+	}
+	replay := &CapturedResult{
+		Columns: []string{"id", "hashed_password", "email"},
+		Rows:    [][]string{{"1", "new-hash-BBB", "alice2@example.com"}},
+	}
+
+	result := engine.Compare(original, replay, "SELECT * FROM users WHERE id=1", "", 1)
+	if result.Match {
+		t.Fatal("expected Match=false for differing rows")
+	}
+
+	hp, ok := findDiff(result.Differences, "cell_value")
+	if !ok {
+		t.Fatal("expected at least one cell_value diff")
+	}
+	// Walk all cell_value diffs; hashed_password values must be redacted,
+	// email values must not (column not in the redact list).
+	hpCount, emailCount, redactedHP, leakedEmail := 0, 0, false, false
+	for _, d := range result.Differences {
+		if d.Type != "cell_value" {
+			continue
+		}
+		switch d.Column {
+		case "hashed_password":
+			hpCount++
+			if d.Original == "<redacted>" && d.Replay == "<redacted>" {
+				redactedHP = true
+			}
+			if d.Original == "old-hash-AAA" || d.Replay == "new-hash-BBB" {
+				t.Errorf("hashed_password values leaked through redaction: orig=%q replay=%q", d.Original, d.Replay)
+			}
+		case "email":
+			emailCount++
+			if d.Original == "alice@example.com" && d.Replay == "alice2@example.com" {
+				leakedEmail = false // expected, not redacted
+			} else if d.Original == "<redacted>" || d.Replay == "<redacted>" {
+				leakedEmail = true
+				t.Errorf("email was redacted but column not in RedactColumns; orig=%q replay=%q", d.Original, d.Replay)
+			}
+		}
+	}
+	if hpCount != 1 || !redactedHP {
+		t.Errorf("expected exactly one redacted hashed_password diff, got count=%d redacted=%v", hpCount, redactedHP)
+	}
+	if emailCount != 1 || leakedEmail {
+		t.Errorf("expected unredacted email diff, got count=%d leaked=%v", emailCount, leakedEmail)
+	}
+	// The diff record itself (column, row, type) must survive redaction
+	// — that's the point of redact vs ignore.
+	if hp.Column != "hashed_password" || hp.Type != "cell_value" {
+		t.Errorf("redacted diff dropped its metadata: %+v", hp)
+	}
+}
+
+// TestCompare_RedactAllValues confirms the global override redacts
+// every cell_value AND error diff regardless of column.
+func TestCompare_RedactAllValues(t *testing.T) {
+	t.Run("cell_value", func(t *testing.T) {
+		engine := NewEngine(EngineConfig{RedactAllValues: true})
+		original := &CapturedResult{
+			Columns: []string{"id", "name"},
+			Rows:    [][]string{{"1", "alice"}},
+		}
+		replay := &CapturedResult{
+			Columns: []string{"id", "name"},
+			Rows:    [][]string{{"2", "bob"}},
+		}
+		result := engine.Compare(original, replay, "SELECT * FROM users", "", 1)
+		if result.Match {
+			t.Fatal("expected Match=false")
+		}
+		for _, d := range result.Differences {
+			if d.Type != "cell_value" {
+				continue
+			}
+			if d.Original != "<redacted>" || d.Replay != "<redacted>" {
+				t.Errorf("cell_value not redacted under RedactAllValues: %+v", d)
+			}
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		engine := NewEngine(EngineConfig{RedactAllValues: true})
+		original := &CapturedResult{
+			Error: "Duplicate entry 'foo@bar.com' for key 'email'",
+		}
+		replay := &CapturedResult{
+			Error: "Duplicate entry 'baz@qux.com' for key 'email'",
+		}
+		result := engine.Compare(original, replay, "INSERT INTO users (email) VALUES (?)", "", 1)
+		if result.Match {
+			t.Fatal("expected Match=false on differing error strings")
+		}
+		err, ok := findDiff(result.Differences, "error")
+		if !ok {
+			t.Fatal("expected an error diff")
+		}
+		if err.Original != "<redacted>" || err.Replay != "<redacted>" {
+			t.Errorf("error values not redacted under RedactAllValues: orig=%q replay=%q", err.Original, err.Replay)
+		}
+	})
+}
+
+// TestCompare_RedactErrorOnlyUnderGlobalSwitch confirms RedactColumns
+// alone does NOT redact error diffs (errors aren't tied to a column).
+func TestCompare_RedactErrorOnlyUnderGlobalSwitch(t *testing.T) {
+	engine := NewEngine(EngineConfig{
+		RedactColumns: map[string]bool{"email": true},
+	})
+	original := &CapturedResult{Error: "Duplicate entry 'foo@bar.com' for key 'email'"}
+	replay := &CapturedResult{Error: "Duplicate entry 'baz@qux.com' for key 'email'"}
+
+	result := engine.Compare(original, replay, "INSERT INTO users (email) VALUES (?)", "", 1)
+	err, ok := findDiff(result.Differences, "error")
+	if !ok {
+		t.Fatal("expected an error diff")
+	}
+	if err.Original != "Duplicate entry 'foo@bar.com' for key 'email'" {
+		t.Errorf("error.Original was unexpectedly redacted: %q", err.Original)
+	}
+}
+
+// TestCompare_RedactColumnsAndAllValues confirms that when both
+// switches are on, RedactAllValues wins (everything is redacted).
+func TestCompare_RedactColumnsAndAllValues(t *testing.T) {
+	engine := NewEngine(EngineConfig{
+		RedactColumns:   map[string]bool{"hashed_password": true},
+		RedactAllValues: true,
+	})
+	original := &CapturedResult{
+		Columns: []string{"id", "name", "hashed_password"},
+		Rows:    [][]string{{"1", "alice", "AAA"}},
+	}
+	replay := &CapturedResult{
+		Columns: []string{"id", "name", "hashed_password"},
+		Rows:    [][]string{{"2", "bob", "BBB"}},
+	}
+	result := engine.Compare(original, replay, "SELECT * FROM users", "", 1)
+	for _, d := range result.Differences {
+		if d.Type != "cell_value" {
+			continue
+		}
+		if d.Original != "<redacted>" || d.Replay != "<redacted>" {
+			t.Errorf("expected all cell_value diffs redacted under RedactAllValues, got column=%q orig=%q replay=%q", d.Column, d.Original, d.Replay)
+		}
+	}
+}

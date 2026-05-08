@@ -78,6 +78,11 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		ignoreColumns[col] = true
 	}
 
+	redactColumns := make(map[string]bool)
+	for _, col := range compareCfg.RedactColumns {
+		redactColumns[col] = true
+	}
+
 	ignoreRegexes, err := compare.CompileIgnoreQueries(compareCfg.IgnoreQueries)
 	if err != nil {
 		return nil, fmt.Errorf("compiling ignore_queries: %w", err)
@@ -87,6 +92,8 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		IgnoreColumns:    ignoreColumns,
 		TimeThresholdMs:  compareCfg.TimeThresholdMs,
 		IgnoreQueryRegex: ignoreRegexes,
+		RedactColumns:    redactColumns,
+		RedactAllValues:  compareCfg.RedactAllValues,
 	})
 
 	reporter, err := compare.NewReporterFromOptions(compare.ReporterOptions{

@@ -121,6 +121,20 @@ comparison:
                                # window_total / window_matched /
                                # window_differed since the last
                                # heartbeat. Negative disables.
+  # redact_columns: list of columns whose cell_value diff payloads
+  # should be masked. The diff record still carries type, column, row
+  # index, and timing — only `original` and `replay` are replaced with
+  # "<redacted>". Use for security-relevant columns where you need
+  # drift visibility but not the values themselves.
+  redact_columns:
+    # - hashed_password
+    # - email
+    # - phone_number
+  # redact_all_values: global override. When true, every cell_value
+  # AND error diff has its values replaced with "<redacted>",
+  # regardless of redact_columns. Defense-in-depth fallback for
+  # high-sensitivity environments.
+  redact_all_values: false
   # Queries that match any of these case-insensitive regexes are still
   # recorded in the diff report but marked "ignored" instead of counted
   # as differences. Use for queries that read server-local state and

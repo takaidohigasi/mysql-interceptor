@@ -11,7 +11,25 @@ type EngineConfig struct {
 	IgnoreColumns    map[string]bool
 	TimeThresholdMs  float64
 	IgnoreQueryRegex []*regexp.Regexp // if any match, result is marked Ignored
+
+	// RedactColumns is the set of column names whose cell_value diff
+	// payloads are masked. The diff record is still emitted (so
+	// operators see *that* the column drifted, with type / column /
+	// row index / timing intact) but Original and Replay are replaced
+	// with redactedPlaceholder. Sibling to logging.RedactArgs.
+	RedactColumns map[string]bool
+
+	// RedactAllValues, when true, replaces Original and Replay on
+	// every cell_value AND error Difference with redactedPlaceholder
+	// regardless of column. Defense-in-depth fallback for cases where
+	// RedactColumns might be incomplete.
+	RedactAllValues bool
 }
+
+// redactedPlaceholder is the string substituted for cell or error
+// values when redaction applies. Same wording the audit logger uses
+// for prepared-statement bind values (logging.RedactArgs).
+const redactedPlaceholder = "<redacted>"
 
 type Engine struct {
 	cfg EngineConfig
@@ -49,6 +67,30 @@ func (e *Engine) matchesIgnore(query string) bool {
 	return false
 }
 
+// redactCell returns the value to record for a cell_value diff,
+// applying RedactAllValues (global) or RedactColumns (per-column)
+// when appropriate. The returned string is what lands in the JSON.
+func (e *Engine) redactCell(column, value string) string {
+	if e.cfg.RedactAllValues {
+		return redactedPlaceholder
+	}
+	if e.cfg.RedactColumns[column] {
+		return redactedPlaceholder
+	}
+	return value
+}
+
+// redactError returns the value to record for an error diff. Only
+// RedactAllValues applies — error messages aren't tied to a single
+// column, so per-column redaction would be ambiguous; the global
+// switch is the only knob that suppresses them.
+func (e *Engine) redactError(value string) string {
+	if e.cfg.RedactAllValues {
+		return redactedPlaceholder
+	}
+	return value
+}
+
 func (e *Engine) Compare(original, replay *CapturedResult, query, user string, sessionID uint64) *CompareResult {
 	result := &CompareResult{
 		Query:          query,
@@ -82,8 +124,8 @@ func (e *Engine) Compare(original, replay *CapturedResult, query, user string, s
 		result.Match = false
 		result.Differences = append(result.Differences, Difference{
 			Type:     "error",
-			Original: original.Error,
-			Replay:   replay.Error,
+			Original: e.redactError(original.Error),
+			Replay:   e.redactError(replay.Error),
 		})
 		return result
 	}
@@ -155,8 +197,8 @@ func (e *Engine) Compare(original, replay *CapturedResult, query, user string, s
 					Type:     "cell_value",
 					Row:      rowIdx,
 					Column:   colName,
-					Original: origRow[colIdx],
-					Replay:   replayRow[colIdx],
+					Original: e.redactCell(colName, origRow[colIdx]),
+					Replay:   e.redactCell(colName, replayRow[colIdx]),
 				})
 			}
 		}
