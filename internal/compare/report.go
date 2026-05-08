@@ -1,6 +1,7 @@
 package compare
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,10 +14,35 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
+// reporterWriteChCap is the buffer size of the async writer channel.
+// Sized to absorb a few seconds of normal diff volume without
+// blocking producers; once full the producer drops the record and
+// counts it on comparisons_report_dropped.
+const reporterWriteChCap = 4096
+
+// Reporter writes comparison records (and periodic heartbeats) to an
+// output sink, plus accumulates aggregate counters and per-digest
+// stats. Encoding and writing happen on a dedicated background
+// goroutine so producers (proxy / shadow worker / heartbeat ticker)
+// don't serialize on the file write — at high diff rates the
+// previous synchronous-with-mutex design pinned every recorder
+// behind one Encode call. The producer still does the JSON
+// marshaling on its own goroutine (so encoder cost is parallelized);
+// it just hands the encoded bytes off via a buffered channel.
+//
+// Lifecycle: Close() closes the channel, waits for the writer
+// goroutine to drain queued records, then closes the underlying
+// writer. Calling Record concurrently with Close is unsafe (would
+// send on a closed channel). Existing call sites already serialize
+// against Close via ShadowSender.Close + bgWG / OfflineReplayer.Run
+// teardown order, so this contract is met without extra locking.
 type Reporter struct {
-	writer       io.WriteCloser
-	mu           sync.Mutex
-	enc          *json.Encoder
+	writer     io.WriteCloser
+	writeCh    chan []byte
+	writerDone chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
+
 	totalCount   atomic.Int64
 	matchCount   atomic.Int64
 	diffCount    atomic.Int64
@@ -61,7 +87,8 @@ func NewReporterWithDigestCap(outputFile string, maxUniqueDigests int) (*Reporte
 
 // NewReporterFromOptions constructs a Reporter with full control over
 // digest capacity and per-record logging behavior. An empty OutputFile
-// or "-" routes output to stdout.
+// or "-" routes output to stdout. Spawns the async writer goroutine;
+// callers MUST call Close to flush and stop it.
 func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
 	var w io.WriteCloser
 	if opts.OutputFile == "" || opts.OutputFile == "-" {
@@ -74,15 +101,29 @@ func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
 		w = f
 	}
 
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-
-	return &Reporter{
+	r := &Reporter{
 		writer:      w,
-		enc:         enc,
+		writeCh:     make(chan []byte, reporterWriteChCap),
+		writerDone:  make(chan struct{}),
 		logMatches:  opts.LogMatches,
 		digestStats: NewDigestStatsWithCap(opts.MaxUniqueDigests),
-	}, nil
+	}
+	go r.runWriter()
+	return r, nil
+}
+
+// runWriter is the sole consumer of writeCh. By concentrating the
+// underlying file Write into one goroutine we eliminate the previous
+// design's mutex-around-encode hot path: producers now race for a
+// channel send instead of a mutex, and the channel is non-blocking
+// (drop-on-full).
+func (r *Reporter) runWriter() {
+	defer close(r.writerDone)
+	for buf := range r.writeCh {
+		if _, err := r.writer.Write(buf); err != nil {
+			slog.Error("failed to write comparison record", "err", err)
+		}
+	}
 }
 
 // shouldEmit reports whether a comparison result should be written
@@ -119,11 +160,33 @@ func (r *Reporter) Record(result *CompareResult) {
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.emit(result)
+}
 
-	if err := r.enc.Encode(result); err != nil {
-		slog.Error("failed to write comparison result", "err", err)
+// emit JSON-encodes the value and hands the bytes to the writer
+// goroutine via writeCh. Non-blocking: if the channel is full
+// (writer fell behind producers), the record is dropped and counted
+// on comparisons_report_dropped. Dropping is preferred to blocking
+// because the alternative would back-pressure the proxy hot path.
+func (r *Reporter) emit(v interface{}) {
+	// json.Marshal escapes <, >, & by default. The pre-async code used
+	// json.Encoder with SetEscapeHTML(false) to skip that — match
+	// behavior here so consumers parsing previous output keep working.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		slog.Error("failed to marshal comparison record", "err", err)
+		return
+	}
+	// json.Encoder.Encode appends a trailing newline already, so the
+	// bytes are ready to write as-is. buf.Bytes() aliases the
+	// internal slice — fine because buf is on this stack frame and
+	// not reused.
+	select {
+	case r.writeCh <- buf.Bytes():
+	default:
+		metrics.Global.ComparisonsReportDropped.Add(1)
 	}
 }
 
@@ -143,11 +206,12 @@ type HeartbeatRecord struct {
 }
 
 // WriteHeartbeat emits a single line summarizing comparison activity
-// since the previous call (or since startup, for the first call). It's
-// safe to invoke concurrently with Record. Window deltas are derived
-// from atomic Swap on the snapshot fields, so missing-by-one against
-// in-flight records is possible — the deltas always converge over the
-// next heartbeat or at shutdown.
+// since the previous call (or since startup, for the first call). The
+// returned error is reserved for future use — the actual write
+// happens asynchronously in the writer goroutine, so a write error
+// would not be visible here. A return of nil does NOT mean the bytes
+// reached disk; it means the record was either queued for the writer
+// or counted as comparisons_report_dropped if the queue was full.
 func (r *Reporter) WriteHeartbeat(window time.Duration) error {
 	total := r.totalCount.Load()
 	matched := r.matchCount.Load()
@@ -166,9 +230,8 @@ func (r *Reporter) WriteHeartbeat(window time.Duration) error {
 		CumulativeDiff:  diffed,
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.enc.Encode(&hb)
+	r.emit(&hb)
+	return nil
 }
 
 func (r *Reporter) Summary() string {
@@ -187,6 +250,22 @@ func (r *Reporter) DigestStats() *DigestStats {
 	return r.digestStats
 }
 
+// Close stops the async writer and closes the underlying writer.
+// Drains any queued records first so callers see a consistent
+// snapshot at shutdown. Idempotent: subsequent calls are no-ops and
+// return the same error as the first call (sync.Once guards the
+// channel close, which would otherwise panic on the second call).
+//
+// Concurrent calls to Record while Close runs are unsafe (sending on
+// a closed channel panics). Callers must serialize Close after the
+// last Record (existing usage in ShadowSender.Close after sessions +
+// background goroutines drain, and OfflineReplayer.Run via defer at
+// the end, satisfies this).
 func (r *Reporter) Close() error {
-	return r.writer.Close()
+	r.closeOnce.Do(func() {
+		close(r.writeCh)
+		<-r.writerDone
+		r.closeErr = r.writer.Close()
+	})
+	return r.closeErr
 }

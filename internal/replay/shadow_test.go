@@ -2,14 +2,17 @@ package replay
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 )
 
@@ -492,5 +495,157 @@ func TestShadowSender_PeriodicSummaryDisabled(t *testing.T) {
 	mu.Unlock()
 	if strings.Contains(out, "shadow comparison periodic summary") {
 		t.Fatalf("expected no periodic summary when interval<0, got:\n%s", out)
+	}
+}
+
+// minimalShadowSession constructs a *ShadowSession suitable for
+// gate-only unit tests — no real backend connection, queueCh just big
+// enough to hold one Send. The caller must NOT call Close() (which
+// would try to close the nil conn).
+func minimalShadowSession(t *testing.T, sender *ShadowSender) *ShadowSession {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return &ShadowSession{
+		sessionID:  42,
+		sender:     sender,
+		queryCh:    make(chan ShadowQuery, 1),
+		tempTables: make(map[string]struct{}),
+		done:       make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+}
+
+// TestShadowSession_Send_DefersCaptureOnGateRejection verifies the
+// capture-after-filter optimization: when Send's gates reject (e.g.
+// sample_rate=0 drops everything), the Capture closure must not be
+// invoked. This is the whole point of deferring captureResult.
+func TestShadowSession_Send_DefersCaptureOnGateRejection(t *testing.T) {
+	rate := 0.0
+	sender, err := NewShadowSender(
+		config.ShadowConfig{
+			TargetAddr:    "127.0.0.1:1", // unreachable; we never run the session
+			TargetUser:    "root",
+			MaxConcurrent: 1,
+			SampleRate:    &rate,
+		},
+		config.ComparisonConfig{SummaryInterval: -1, HeartbeatInterval: -1},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+	defer sender.Close()
+
+	ss := minimalShadowSession(t, sender)
+
+	var captureCalls atomic.Int32
+	ss.Send(ShadowQuery{
+		Query: "SELECT 1",
+		Capture: func() *compare.CapturedResult {
+			captureCalls.Add(1)
+			return nil
+		},
+	})
+
+	if got := captureCalls.Load(); got != 0 {
+		t.Errorf("Capture was invoked %d time(s) despite sample_rate=0; expected 0", got)
+	}
+}
+
+// TestShadowSession_Send_InvokesCaptureWhenGatesPass verifies the
+// other half of the contract: when gates pass, Capture is called
+// exactly once, its return value lands as OrigResult on the queued
+// ShadowQuery, and the Capture closure itself is cleared (not
+// retained in the queue, which would pin captured variables for the
+// queue lifetime).
+func TestShadowSession_Send_InvokesCaptureWhenGatesPass(t *testing.T) {
+	rate := 1.0
+	sender, err := NewShadowSender(
+		config.ShadowConfig{
+			TargetAddr:    "127.0.0.1:1",
+			TargetUser:    "root",
+			MaxConcurrent: 1,
+			SampleRate:    &rate,
+		},
+		config.ComparisonConfig{SummaryInterval: -1, HeartbeatInterval: -1},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+	defer sender.Close()
+
+	ss := minimalShadowSession(t, sender)
+
+	var captureCalls atomic.Int32
+	want := &compare.CapturedResult{Duration: time.Millisecond}
+	ss.Send(ShadowQuery{
+		Query: "SELECT 1",
+		Capture: func() *compare.CapturedResult {
+			captureCalls.Add(1)
+			return want
+		},
+	})
+
+	if got := captureCalls.Load(); got != 1 {
+		t.Errorf("Capture should have been invoked exactly once, got %d", got)
+	}
+
+	select {
+	case sq := <-ss.queryCh:
+		if sq.OrigResult != want {
+			t.Errorf("OrigResult on enqueued ShadowQuery not set from Capture; got %+v", sq.OrigResult)
+		}
+		if sq.Capture != nil {
+			t.Error("Capture closure should be nil on enqueued ShadowQuery (queue would otherwise pin captured variables)")
+		}
+	default:
+		t.Error("expected ShadowQuery in queueCh after passing gates")
+	}
+}
+
+// TestShadowSession_Send_OrigResultBeatsCapture confirms that if the
+// caller pre-sets OrigResult AND Capture, OrigResult wins and Capture
+// is never called. Backwards-compatibility for legacy callers.
+func TestShadowSession_Send_OrigResultBeatsCapture(t *testing.T) {
+	rate := 1.0
+	sender, err := NewShadowSender(
+		config.ShadowConfig{
+			TargetAddr:    "127.0.0.1:1",
+			TargetUser:    "root",
+			MaxConcurrent: 1,
+			SampleRate:    &rate,
+		},
+		config.ComparisonConfig{SummaryInterval: -1, HeartbeatInterval: -1},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+	defer sender.Close()
+
+	ss := minimalShadowSession(t, sender)
+
+	preset := &compare.CapturedResult{Duration: 7 * time.Millisecond}
+	var captureCalls atomic.Int32
+
+	ss.Send(ShadowQuery{
+		Query:      "SELECT 1",
+		OrigResult: preset,
+		Capture: func() *compare.CapturedResult {
+			captureCalls.Add(1)
+			return &compare.CapturedResult{Duration: 99 * time.Millisecond}
+		},
+	})
+
+	if got := captureCalls.Load(); got != 0 {
+		t.Errorf("Capture should have been skipped because OrigResult was pre-set, got %d calls", got)
+	}
+	select {
+	case sq := <-ss.queryCh:
+		if sq.OrigResult != preset {
+			t.Errorf("expected OrigResult to remain the pre-set value, got %+v", sq.OrigResult)
+		}
+	default:
+		t.Error("expected ShadowQuery in queueCh")
 	}
 }

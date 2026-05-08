@@ -25,7 +25,23 @@ type ShadowQuery struct {
 	Query        string
 	Args         []interface{} // non-nil for prepared statement executions
 	OrigDuration time.Duration
-	OrigResult   *compare.CapturedResult
+	// OrigResult is the materialized primary-side result. If nil and
+	// Capture is non-nil, ShadowSession.Send will invoke Capture
+	// after the gate checks pass to materialize lazily — so the
+	// (potentially expensive) result-set walk in
+	// ProxyHandler.captureResult is skipped for queries that get
+	// rejected by sample_rate / CIDR / category filters. Direct
+	// callers (e.g. tests, offline replay) can still pre-fill this
+	// and leave Capture nil for the original eager-capture behavior.
+	OrigResult *compare.CapturedResult
+	// Capture defers materialization of OrigResult until after
+	// Send's gate checks. Producers should set this OR OrigResult,
+	// not both — if both are set, OrigResult wins. Ignored once
+	// OrigResult is non-nil (i.e. after a successful Capture call).
+	// Not stored in the queued ShadowQuery: Send nils it out before
+	// enqueueing so the closure doesn't pin variables for the queue
+	// lifetime.
+	Capture func() *compare.CapturedResult `json:"-"`
 }
 
 // ShadowSender is the configuration and lifecycle root for shadow traffic.

@@ -1,8 +1,10 @@
 package compare
 
 import (
+	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -231,9 +233,14 @@ func TestDigestStats_ReservoirBounded(t *testing.T) {
 		})
 	}
 
-	ds.mu.Lock()
-	entry := ds.digests["select ?"]
-	ds.mu.Unlock()
+	// Reach into the per-shard map directly. The test relies on the
+	// internal layout to verify the reservoir bound — that's the whole
+	// point of this test, so it can stay coupled to the data
+	// structure.
+	sh := ds.shardFor("select ?")
+	sh.mu.Lock()
+	entry := sh.digests["select ?"]
+	sh.mu.Unlock()
 
 	if entry == nil {
 		t.Fatal("expected digest entry to exist")
@@ -275,5 +282,117 @@ func TestDigestStats_WriteJSON(t *testing.T) {
 	}
 	if !strings.Contains(output, `"original_avg_ms"`) {
 		t.Error("expected original_avg_ms field in JSON output")
+	}
+}
+
+// alphaName returns a distinct identifier-safe table name for index n.
+// Avoids digits because Digest() strips numeric literals — `t0`, `t1`
+// would all normalize to `t?` and collapse to one digest.
+func alphaName(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz"
+	if n < 0 {
+		n = -n
+	}
+	if n == 0 {
+		return string(letters[0])
+	}
+	var s []byte
+	for n > 0 {
+		s = append([]byte{letters[n%len(letters)]}, s...)
+		n /= len(letters)
+	}
+	return string(s)
+}
+
+// TestDigestStats_ConcurrentRecord exercises the sharded path under
+// many goroutines × many distinct digests. Run with -race to catch
+// any missing synchronization: a successful run proves both that
+// per-shard locking is correct and that the global cap CAS loop
+// preserves the maxDigests semantic across shards.
+func TestDigestStats_ConcurrentRecord(t *testing.T) {
+	const (
+		numGoroutines      = 64
+		recordsPerRoutine  = 500
+		distinctDigests    = 200 // < numGoroutines*recordsPerRoutine so map churn is real
+		expectedTotalCount = numGoroutines * recordsPerRoutine
+	)
+	ds := NewDigestStatsWithCap(distinctDigests * 2)
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+	for g := 0; g < numGoroutines; g++ {
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < recordsPerRoutine; i++ {
+				digestIdx := (seed*recordsPerRoutine + i) % distinctDigests
+				query := fmt.Sprintf("SELECT * FROM tab_%s WHERE id = %d", alphaName(digestIdx), i)
+				ds.Record(&CompareResult{
+					Query:          query,
+					Match:          i%2 == 0,
+					OriginalTimeMs: float64(i),
+					ReplayTimeMs:   float64(i) * 1.1,
+				})
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	summaries := ds.Summaries()
+	if len(summaries) != distinctDigests {
+		t.Errorf("expected %d unique digests, got %d", distinctDigests, len(summaries))
+	}
+	var sumCount int
+	for _, s := range summaries {
+		sumCount += s.Count
+	}
+	if sumCount != expectedTotalCount {
+		t.Errorf("expected total count %d across digests, got %d", expectedTotalCount, sumCount)
+	}
+	if got := ds.Overflow(); got != 0 {
+		t.Errorf("expected no overflow with cap=%d (have %d unique digests), got overflow=%d",
+			distinctDigests*2, distinctDigests, got)
+	}
+}
+
+// TestDigestStats_ConcurrentRecordRespectsGlobalCap confirms that
+// even under heavy concurrent inserts across shards, the global
+// maxDigests cap is enforced — overflow fires, and the map size
+// stops growing once the cap is hit.
+func TestDigestStats_ConcurrentRecordRespectsGlobalCap(t *testing.T) {
+	const (
+		numGoroutines   = 64
+		distinctDigests = 1000
+		capacity        = 100 // less than the number of distinct digests
+		iterations      = distinctDigests * 4 / numGoroutines
+	)
+	ds := NewDigestStatsWithCap(capacity)
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+	for g := 0; g < numGoroutines; g++ {
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				// (seed*iterations + i) covers contiguous ranges so all
+				// 1000 distinct digests get touched across the goroutines
+				// instead of every goroutine hammering the same low range.
+				digestIdx := (seed*iterations + i) % distinctDigests
+				ds.Record(&CompareResult{
+					Query:          fmt.Sprintf("SELECT * FROM tab_%s WHERE id = %d", alphaName(digestIdx), i),
+					Match:          true,
+					OriginalTimeMs: 1.0,
+					ReplayTimeMs:   1.0,
+				})
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	summaries := ds.Summaries()
+	if len(summaries) > capacity {
+		t.Errorf("expected at most %d unique digests under cap, got %d", capacity, len(summaries))
+	}
+	if ds.Overflow() == 0 {
+		t.Error("expected non-zero overflow with cap=100 and 1000 distinct digests, got 0")
 	}
 }

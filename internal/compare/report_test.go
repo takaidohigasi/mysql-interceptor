@@ -3,9 +3,11 @@ package compare
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -169,5 +171,91 @@ func TestReporter_Heartbeat(t *testing.T) {
 	// Cumulative total in hb2 must include both windows.
 	if got := hb2["cumulative_total"].(float64); got != 4 {
 		t.Errorf("hb2 cumulative_total: want 4, got %v", got)
+	}
+}
+
+// TestReporter_CloseIdempotent confirms that calling Close more than
+// once is safe — the underlying close(r.writeCh) would panic if it
+// fired twice, so sync.Once is the load-bearing guard. The first
+// call's writer.Close error is returned from subsequent calls too.
+func TestReporter_CloseIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rep.jsonl")
+	r, err := NewReporterFromOptions(ReporterOptions{OutputFile: path})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	// Second close must not panic. A return value can be the same
+	// error as the first call (or nil, if the first call's writer
+	// close succeeded).
+	if err := r.Close(); err != nil {
+		t.Errorf("second Close should match first or be nil, got %v", err)
+	}
+}
+
+// TestReporter_AsyncWriter_NoLostRecords confirms the async writer
+// drains every queued record before Close returns. Lots of producers
+// → one writer; the file must contain exactly the records we sent
+// (no losses, no duplicates) and no goroutine racing on the writer
+// state. Run with -race; the producers all touch r.totalCount /
+// digestStats / writeCh in parallel.
+func TestReporter_AsyncWriter_NoLostRecords(t *testing.T) {
+	const (
+		numGoroutines = 32
+		recordsEach   = 100
+		totalRecords  = numGoroutines * recordsEach
+	)
+	path := filepath.Join(t.TempDir(), "diffs.jsonl")
+	r, err := NewReporterFromOptions(ReporterOptions{
+		OutputFile: path,
+		LogMatches: true, // emit every record so we can count them deterministically
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+	for g := 0; g < numGoroutines; g++ {
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < recordsEach; i++ {
+				r.Record(&CompareResult{
+					Query:       fmt.Sprintf("SELECT * FROM tab_%s WHERE id = %d", alphaName(seed), i),
+					QueryDigest: fmt.Sprintf("select * from tab_%s where id = ?", alphaName(seed)),
+					Match:       i%2 == 0,
+				})
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Close drains writeCh and waits for the writer goroutine.
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Read file and count lines.
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	var lines int
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	for sc.Scan() {
+		if strings.HasPrefix(strings.TrimSpace(sc.Text()), "{") {
+			lines++
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if lines != totalRecords {
+		t.Errorf("expected %d lines in report, got %d (drops counted as comparisons_report_dropped if writeCh saturated)", totalRecords, lines)
 	}
 }
