@@ -239,6 +239,29 @@ type ComparisonConfig struct {
 	// while otherwise looks indistinguishable from a stuck proxy. Only
 	// shadow mode emits heartbeats. Negative disables. Default 1m.
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
+
+	// RedactColumns is the per-column list of columns whose cell-value
+	// diff payloads are masked. When a cell_value diff is recorded for
+	// a column in this list, the diff record still carries the type,
+	// column name, and row index (so operators see *that* the column
+	// drifted), but `original` and `replay` are replaced with the
+	// literal string "<redacted>". Use for security-relevant columns
+	// where you want drift visibility without leaking the values
+	// themselves into the comparison output stream — e.g. credentials,
+	// PII, tokens. Sibling to logging.redact_args (which masks
+	// prepared-statement bind values in the audit log).
+	RedactColumns []string `yaml:"redact_columns"`
+
+	// RedactAllValues is the global override: when true, every
+	// cell_value and error diff has its `original` and `replay`
+	// replaced with "<redacted>", regardless of RedactColumns. The
+	// diff record itself (type, column name where applicable, row
+	// index, timing) is still emitted so digest and column counters
+	// still work. Use for high-sensitivity environments where any
+	// value leak through divergence logs is unacceptable, or as a
+	// defense-in-depth fallback against an incomplete RedactColumns
+	// list.
+	RedactAllValues bool `yaml:"redact_all_values"`
 }
 
 func Load(path string) (*Config, error) {

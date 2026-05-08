@@ -51,6 +51,11 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		ignoreColumns[col] = true
 	}
 
+	redactColumns := make(map[string]bool)
+	for _, col := range compareCfg.RedactColumns {
+		redactColumns[col] = true
+	}
+
 	ignoreRegexes, err := compare.CompileIgnoreQueries(compareCfg.IgnoreQueries)
 	if err != nil {
 		return nil, fmt.Errorf("compiling ignore_queries: %w", err)
@@ -60,6 +65,8 @@ func NewOfflineReplayer(cfg config.OfflineConfig, compareCfg config.ComparisonCo
 		IgnoreColumns:    ignoreColumns,
 		TimeThresholdMs:  compareCfg.TimeThresholdMs,
 		IgnoreQueryRegex: ignoreRegexes,
+		RedactColumns:    redactColumns,
+		RedactAllValues:  compareCfg.RedactAllValues,
 	})
 
 	// Offline mode always emits every record to the report file: the
