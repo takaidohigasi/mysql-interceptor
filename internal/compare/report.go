@@ -1,6 +1,7 @@
 package compare
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,20 @@ import (
 // blocking producers; once full the producer drops the record and
 // counts it on comparisons_report_dropped.
 const reporterWriteChCap = 4096
+
+// reporterBufSize is the user-space write buffer wrapping the report
+// file. Sized to coalesce ~20+ typical diff records (~700B each) into
+// one write syscall. Bigger buffer = fewer syscalls but a larger crash
+// window; 16KiB hits the same sweet spot bufio.NewWriter uses by
+// default and keeps loss bounded for unflushed records on SIGKILL.
+const reporterBufSize = 16 << 10
+
+// reporterFlushInterval bounds how long an isolated record can sit in
+// the bufio buffer before reaching the file. Under sustained load the
+// 16KiB buffer auto-flushes well before this fires; the ticker only
+// matters at low diff rates where a single record could otherwise be
+// invisible to operators tailing the file.
+const reporterFlushInterval = 250 * time.Millisecond
 
 // emitterEntry is a pooled (bytes.Buffer, *json.Encoder) pair used
 // by emit() to amortize per-record allocation. The Buffer's internal
@@ -64,7 +79,13 @@ var emitterPool = sync.Pool{
 // against Close via ShadowSender.Close + bgWG / OfflineReplayer.Run
 // teardown order, so this contract is met without extra locking.
 type Reporter struct {
-	writer     io.WriteCloser
+	writer io.WriteCloser
+	// bw wraps writer with a user-space buffer for file-backed sinks.
+	// Nil when the underlying writer is os.Stdout — stdout traffic is
+	// usually a human tail or a small dev test, where added latency
+	// from buffering is more annoying than the syscall savings.
+	// Touched only by runWriter, so no locking is needed.
+	bw         *bufio.Writer
 	writeCh    chan []byte
 	writerDone chan struct{}
 	closeOnce  sync.Once
@@ -135,6 +156,9 @@ func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
 		logMatches:  opts.LogMatches,
 		digestStats: NewDigestStatsWithCap(opts.MaxUniqueDigests),
 	}
+	if w != os.Stdout {
+		r.bw = bufio.NewWriterSize(w, reporterBufSize)
+	}
 	go r.runWriter()
 	return r, nil
 }
@@ -144,11 +168,54 @@ func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
 // design's mutex-around-encode hot path: producers now race for a
 // channel send instead of a mutex, and the channel is non-blocking
 // (drop-on-full).
+//
+// For file-backed sinks the bufio.Writer coalesces many records into
+// each underlying syscall; bufio auto-flushes when its buffer fills,
+// and a periodic ticker bounds the time an isolated record can sit
+// in the buffer at low diff rates. On channel close (Reporter.Close)
+// the final Flush happens before the goroutine returns, so Close
+// observes a fully drained file.
 func (r *Reporter) runWriter() {
 	defer close(r.writerDone)
-	for buf := range r.writeCh {
-		if _, err := r.writer.Write(buf); err != nil {
-			slog.Error("failed to write comparison record", "err", err)
+
+	// Pick the active write target once: bufio when wrapping a file,
+	// the raw writer otherwise. Avoids a per-call branch on every
+	// record.
+	var sink io.Writer = r.writer
+	if r.bw != nil {
+		sink = r.bw
+	}
+
+	flush := func() {
+		if r.bw == nil {
+			return
+		}
+		if err := r.bw.Flush(); err != nil {
+			slog.Error("failed to flush comparison records", "err", err)
+		}
+	}
+
+	// The flush ticker is only useful when bufio buffering is enabled.
+	// For stdout we leave tickerC nil so the select arm never fires.
+	var tickerC <-chan time.Time
+	if r.bw != nil {
+		t := time.NewTicker(reporterFlushInterval)
+		defer t.Stop()
+		tickerC = t.C
+	}
+
+	for {
+		select {
+		case buf, ok := <-r.writeCh:
+			if !ok {
+				flush()
+				return
+			}
+			if _, err := sink.Write(buf); err != nil {
+				slog.Error("failed to write comparison record", "err", err)
+			}
+		case <-tickerC:
+			flush()
 		}
 	}
 }

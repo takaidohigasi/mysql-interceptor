@@ -1,6 +1,7 @@
 package compare
 
 import (
+	"bufio"
 	"io"
 	"path/filepath"
 	"sync"
@@ -33,6 +34,27 @@ func newBenchReporter(b *testing.B) *Reporter {
 	return r
 }
 
+// newBufferedBenchReporter mirrors newBenchReporter but enables the
+// bufio.Writer wrap so benchmarks see the same code path used in
+// production for file-backed sinks. io.Discard still removes the
+// disk component, so we measure the marshal + channel + writer +
+// bufio coalescing overhead without disk noise.
+func newBufferedBenchReporter(b *testing.B) *Reporter {
+	b.Helper()
+	w := nullCloser{Writer: io.Discard}
+	r := &Reporter{
+		writer:      w,
+		bw:          bufio.NewWriterSize(w, reporterBufSize),
+		writeCh:     make(chan []byte, reporterWriteChCap),
+		writerDone:  make(chan struct{}),
+		logMatches:  true,
+		digestStats: NewDigestStats(),
+	}
+	go r.runWriter()
+	b.Cleanup(func() { _ = r.Close() })
+	return r
+}
+
 // BenchmarkReporter_Record_Diff measures the per-record cost of the
 // encode + channel-enqueue path with the emitter pool. Runs each
 // goroutine producing CompareResult records in parallel; the writer
@@ -45,6 +67,33 @@ func BenchmarkReporter_Record_Diff(b *testing.B) {
 	r := newBenchReporter(b)
 	// Diff record — has Differences populated, exercises the
 	// JSON-encoding path the way real divergence records do.
+	tmpl := &CompareResult{
+		Query:       "SELECT id, name, email, hashed_password, num_sell_items, num_ticket FROM users WHERE id = ?",
+		QueryDigest: "select id, name, email, hashed_password, num_sell_items, num_ticket from users where id = ?",
+		SessionID:   42,
+		Match:       false,
+		Differences: []Difference{
+			{Type: "cell_value", Row: 0, Column: "iv_cert", Original: "ad7e8d29bbc3589350ff74fe5295422e9818d14c", Replay: "7dd686cbc139d353f2fca63586af9a9c3da466b8"},
+			{Type: "cell_value", Row: 0, Column: "updated", Original: "2026-05-08 10:00:00", Replay: "2026-05-08 09:59:50"},
+		},
+		OriginalTimeMs: 2.5,
+		ReplayTimeMs:   2.6,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			r.Record(tmpl)
+		}
+	})
+}
+
+// BenchmarkReporter_Record_DiffBuffered mirrors Diff but exercises
+// the bufio-wrapped writer path (the file-backed default in
+// production). Comparing vs Diff isolates the cost added by bufio
+// coalescing.
+func BenchmarkReporter_Record_DiffBuffered(b *testing.B) {
+	r := newBufferedBenchReporter(b)
 	tmpl := &CompareResult{
 		Query:       "SELECT id, name, email, hashed_password, num_sell_items, num_ticket FROM users WHERE id = ?",
 		QueryDigest: "select id, name, email, hashed_password, num_sell_items, num_ticket from users where id = ?",
