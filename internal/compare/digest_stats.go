@@ -92,7 +92,16 @@ func NewDigestStatsWithCap(maxDigests int) *DigestStats {
 }
 
 func (ds *DigestStats) Record(result *CompareResult) {
-	digest := Digest(result.Query)
+	// Reuse the digest already computed by Engine.Compare instead of
+	// recomputing Digest(result.Query) here. The compute is non-trivial
+	// (full SQL normalization pass) and runs per record on the hot path;
+	// duplicating it costs ~1 µs/record at high QPS for no benefit.
+	digest := result.QueryDigest
+	if digest == "" {
+		// Defensive fallback for callers (mostly tests) that bypass
+		// Engine.Compare and construct CompareResult directly.
+		digest = Digest(result.Query)
+	}
 
 	ds.mu.Lock()
 	defer ds.mu.Unlock()

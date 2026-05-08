@@ -129,15 +129,20 @@ func captureResult(result *mysql.Result, err error, duration time.Duration) *com
 	if result != nil {
 		captured.AffectedRows = result.AffectedRows
 		if result.Resultset != nil {
-			for _, field := range result.Fields {
-				captured.Columns = append(captured.Columns, string(field.Name))
+			// Pre-allocate so append doesn't grow-double 2-3 times for
+			// wider/longer resultsets — both sides know the exact final
+			// size up front.
+			captured.Columns = make([]string, len(result.Fields))
+			for i, field := range result.Fields {
+				captured.Columns[i] = string(field.Name)
 			}
-			for rowIdx := 0; rowIdx < len(result.Values); rowIdx++ {
+			captured.Rows = make([][]string, len(result.Values))
+			for rowIdx := range result.Values {
 				row := make([]string, len(result.Values[rowIdx]))
 				for colIdx := range result.Values[rowIdx] {
 					row[colIdx] = compare.FormatCellValue(result.Values[rowIdx][colIdx].Value())
 				}
-				captured.Rows = append(captured.Rows, row)
+				captured.Rows[rowIdx] = row
 			}
 		}
 	}
