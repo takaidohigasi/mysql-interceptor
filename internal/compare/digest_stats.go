@@ -54,8 +54,8 @@ type DigestStats struct {
 }
 
 type digestShard struct {
-	mu      sync.Mutex                // 8 bytes
-	digests map[string]*DigestEntry   // 8 bytes (map header is one pointer)
+	mu      sync.Mutex              // 8 bytes
+	digests map[string]*DigestEntry // 8 bytes (map header is one pointer)
 	// Pad each shard out to exactly 64 bytes so adjacent shards land
 	// on different AMD64 / arm64 cache lines and never false-share.
 	// Without padding to a full cache-line stride, shard[0]'s tail
