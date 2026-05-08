@@ -20,6 +20,33 @@ import (
 // counts it on comparisons_report_dropped.
 const reporterWriteChCap = 4096
 
+// emitterEntry is a pooled (bytes.Buffer, *json.Encoder) pair used
+// by emit() to amortize per-record allocation. The Buffer's internal
+// []byte is reused across pool gets — bytes.Buffer.Reset preserves
+// its capacity — so steady-state encoding hits zero allocations on
+// the buffer itself.
+//
+// The encoder is paired 1:1 with its buffer because json.NewEncoder
+// captures the io.Writer at construction; you can't swap writers
+// after the fact. SetEscapeHTML(false) is set on the encoder during
+// pool construction so the per-call hot path doesn't need to set it.
+type emitterEntry struct {
+	buf *bytes.Buffer
+	enc *json.Encoder
+}
+
+// emitterPool reuses (Buffer, Encoder) pairs across calls. Pool
+// entries can be reclaimed by GC at any time — that's fine because
+// the New func builds a fresh entry on Get when needed.
+var emitterPool = sync.Pool{
+	New: func() interface{} {
+		buf := &bytes.Buffer{}
+		enc := json.NewEncoder(buf)
+		enc.SetEscapeHTML(false)
+		return &emitterEntry{buf: buf, enc: enc}
+	},
+}
+
 // Reporter writes comparison records (and periodic heartbeats) to an
 // output sink, plus accumulates aggregate counters and per-digest
 // stats. Encoding and writing happen on a dedicated background
@@ -169,22 +196,31 @@ func (r *Reporter) Record(result *CompareResult) {
 // on comparisons_report_dropped. Dropping is preferred to blocking
 // because the alternative would back-pressure the proxy hot path.
 func (r *Reporter) emit(v interface{}) {
-	// json.Marshal escapes <, >, & by default. The pre-async code used
-	// json.Encoder with SetEscapeHTML(false) to skip that — match
-	// behavior here so consumers parsing previous output keep working.
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	// Grab a pooled (Buffer, Encoder) pair. The encoder already has
+	// SetEscapeHTML(false) — done once at pool construction — so the
+	// hot path doesn't pay that cost per call. SetEscapeHTML(false)
+	// matches the pre-async output format (no < / > / &
+	// escapes for <, >, & in cell values).
+	e := emitterPool.Get().(*emitterEntry)
+	e.buf.Reset()
+	if err := e.enc.Encode(v); err != nil {
 		slog.Error("failed to marshal comparison record", "err", err)
+		emitterPool.Put(e)
 		return
 	}
-	// json.Encoder.Encode appends a trailing newline already, so the
-	// bytes are ready to write as-is. buf.Bytes() aliases the
-	// internal slice — fine because buf is on this stack frame and
-	// not reused.
+	// We must copy the bytes out before returning the entry to the
+	// pool, because the next pool consumer will Reset() the buffer
+	// and overwrite the underlying []byte. Without the copy, the
+	// writer goroutine would race the next emit() call.
+	//
+	// json.Encoder.Encode appends a trailing newline, so the payload
+	// is ready to write as-is.
+	payload := make([]byte, e.buf.Len())
+	copy(payload, e.buf.Bytes())
+	emitterPool.Put(e)
+
 	select {
-	case r.writeCh <- buf.Bytes():
+	case r.writeCh <- payload:
 	default:
 		metrics.Global.ComparisonsReportDropped.Add(1)
 	}
