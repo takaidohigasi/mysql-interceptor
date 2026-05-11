@@ -218,7 +218,11 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 		sourceIP = h
 	}
 	sessionLog := slog.With("session_id", sessionID, "remote", remoteAddr)
-	sessionLog.Info("new connection")
+	// DEBUG, not INFO: at typical query rates this fires hundreds of
+	// times per second per pod and drowns out operationally-relevant
+	// lines. The paired "session closed" log on the teardown path is
+	// also DEBUG, so the two stay symmetric.
+	sessionLog.Debug("new connection")
 
 	handler := &ProxyHandler{
 		sessionID: sessionID,
