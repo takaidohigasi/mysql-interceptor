@@ -2,11 +2,13 @@ package replay
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
@@ -284,6 +286,24 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 			reporter.Record(cmpResult)
 			compare.ReleaseCompareResult(cmpResult)
 		}
+		// Transport-level errors poison go-mysql's *client.Conn: once
+		// the underlying net.Conn returns "i/o timeout" or "connection
+		// was bad", every subsequent Execute on the same connection
+		// short-circuits to the same error. Without tearing down here,
+		// a single broken connection produces one error-diff record
+		// per primary query for the rest of the primary session's
+		// lifetime — exactly the cascade pattern we saw in
+		// kouzoh/microservices#29641 (5k+ identical errors on one
+		// digest in 20 minutes). Server-returned SQL errors (e.g.
+		// "Table doesn't exist") arrive as *mysql.MyError and DON'T
+		// break the connection, so we keep the session alive for
+		// those.
+		if isTransportError(res.err) {
+			slog.Info("shadow: transport error, tearing down session",
+				"session_id", ss.sessionID, "err", res.err)
+			ss.conn.Close()
+			ss.cancel()
+		}
 		return
 	}
 	metrics.Global.ShadowQueriesReplayed.Add(1)
@@ -323,6 +343,30 @@ func (ss *ShadowSession) abortInFlightExec(done <-chan execResult) execResult {
 	// *packet.Conn, which embeds net.Conn.
 	_ = ss.conn.SetDeadline(time.Now().Add(-time.Second))
 	return <-done
+}
+
+// isTransportError reports whether err looks like a broken-connection
+// (TCP-level / packet.Conn) failure as opposed to a server-returned
+// SQL error.
+//
+// go-mysql wraps the MySQL server's ERR_Packet in *mysql.MyError —
+// "Table doesn't exist", "syntax error", "duplicate key", etc. Those
+// are query-specific and don't poison the underlying connection;
+// recordResult should keep the session alive for the next query.
+//
+// Anything that ISN'T *mysql.MyError is a transport-level failure:
+// i/o timeout, broken pipe, RST from the server's tcp_keepalive
+// reaper, packet.Conn's "connection was bad" cached state, etc. Once
+// the underlying net.Conn is dead, go-mysql will return the same
+// error for every subsequent Execute on this *client.Conn — the
+// session must be torn down so the next primary query opens a fresh
+// shadow session with a fresh connection.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *gomysql.MyError
+	return !errors.As(err, &myErr)
 }
 
 // startsWithKeyword is a case-insensitive prefix check after stripping
