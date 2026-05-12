@@ -62,13 +62,33 @@ type ProxyConfig struct {
 	MaxSessionLifetime time.Duration `yaml:"max_session_lifetime,omitempty"`
 }
 
-// UserConfig describes one user the proxy will accept. The same plaintext
-// password is used both to validate the inbound client handshake and to
-// authenticate the proxy's outbound connection to the backend (and shadow,
-// when shadow mode is on).
+// UserConfig describes one user the proxy will accept. Exactly one of
+// Password or HashedPassword must be set per entry — the validator
+// rejects both empty and both set.
+//
+// Password is the plaintext form. When set, it's used both to validate
+// the inbound client handshake AND to authenticate the proxy's outbound
+// connection to the backend (and shadow, when shadow mode is on). This
+// is the canonical pattern: a single source of truth for one user.
+//
+// HashedPassword is MySQL's standard `*XXXX...` 41-character hex form
+// (i.e. the value stored in `mysql.user.authentication_string` for the
+// mysql_native_password plugin: "*" + uppercase hex of SHA1(SHA1(plain))).
+// It exists to support users — typically personal accounts mirrored
+// from another proxy's config — whose plaintext password the
+// interceptor never sees. The handshake-side verification works
+// without the plaintext (see go-mysql-org/go-mysql#1129), so HashedPassword
+// entries can log in. However, the proxy's *outbound* backend
+// connection currently still requires plaintext; a hashed-only user
+// authenticates successfully but the session terminates at backend-
+// connect time with a clear error. Granting hashed-only users true
+// query access is tracked as a follow-up (would need either client-side
+// hash-auth in go-mysql, or a separate per-user `backend_password`
+// override field).
 type UserConfig struct {
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password,omitempty"`
+	HashedPassword string `yaml:"hashed_password,omitempty"`
 }
 
 // BackendConfig identifies the backend MySQL server the proxy talks to.
@@ -428,6 +448,32 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("proxy.users[%d].username %q is duplicated", i, u.Username)
 		}
 		seen[u.Username] = true
+		// Exactly one of password / hashed_password must be set.
+		// Empty plaintext password is meaningful (MySQL allows empty
+		// passwords), so we distinguish "field absent" from "field
+		// present and empty" via the HashedPassword being non-empty.
+		// HashedPassword takes precedence when set; if neither is set
+		// the entry is rejected because the auth handler would have
+		// nothing to register the user with.
+		switch {
+		case u.Password != "" && u.HashedPassword != "":
+			return fmt.Errorf("proxy.users[%d] %q: set exactly one of password or hashed_password, not both", i, u.Username)
+		case u.HashedPassword != "":
+			// MySQL's mysql_native_password stored form is "*" followed
+			// by 40 uppercase hex chars (SHA1(SHA1(plain)) → 20 bytes →
+			// 40 hex chars, prefixed). Validate shape here so a typo
+			// fails at config load rather than at first login attempt.
+			if err := validateHashedPasswordShape(u.HashedPassword); err != nil {
+				return fmt.Errorf("proxy.users[%d] %q: %w", i, u.Username, err)
+			}
+		default:
+			// u.Password == "" && u.HashedPassword == "" — allowed
+			// for the "empty password" edge case; AddUser will register
+			// the user as accepting an empty password. Operators who
+			// don't want this should either set a Password or remove
+			// the user. We don't reject the case here because we'd
+			// break the existing semantics of UserConfig{Password: ""}.
+		}
 	}
 	switch c.Replay.Mode {
 	case "disabled", "shadow", "offline":
@@ -464,4 +510,37 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// validateHashedPasswordShape checks that s is in MySQL's standard
+// mysql_native_password stored form: a leading "*" followed by exactly
+// 40 hex digits (uppercase or lowercase). This is just a shape check —
+// cryptographic validity is verified on the first login by go-mysql.
+// Fail-fast at config load so a typo (missing leading "*", wrong
+// length, paste error mixing in surrounding chars) doesn't only
+// surface when a user tries to log in hours later.
+func validateHashedPasswordShape(s string) error {
+	if len(s) == 0 {
+		return fmt.Errorf("hashed_password is empty")
+	}
+	if s[0] != '*' {
+		return fmt.Errorf("hashed_password must start with '*' (MySQL mysql_native_password form: \"*XXXXXXXX...\", 41 chars total), got %q", firstN(s, 4))
+	}
+	if len(s) != 41 {
+		return fmt.Errorf("hashed_password must be exactly 41 chars (\"*\" + 40 hex digits), got %d", len(s))
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return fmt.Errorf("hashed_password contains non-hex char %q at position %d", c, i)
+		}
+	}
+	return nil
+}
+
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

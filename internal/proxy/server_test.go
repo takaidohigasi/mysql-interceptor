@@ -87,6 +87,42 @@ func TestUsersWiring(t *testing.T) {
 			t.Error("unexpected user mallory in userPasswords")
 		}
 	})
+
+	// Verifies that hashed-password users register on the auth handler
+	// but are intentionally absent from userPasswords. The "intentionally
+	// absent" part is load-bearing: handleConnection looks up
+	// userPasswords[backendUser] right after the inbound handshake, and
+	// a hashed-only user (no plaintext) needs to surface there as
+	// "missing entry" so we emit the clear error rather than connecting
+	// to backend with an empty password and getting a confusing
+	// access-denied from MySQL.
+	t.Run("hashed-password users skip userPasswords", func(t *testing.T) {
+		// 41-char form: "*" + 40 hex chars. Same fixture shape as in
+		// config tests; cryptographic content doesn't matter here.
+		cfg := &config.Config{
+			Proxy: config.ProxyConfig{
+				ListenAddr: "127.0.0.1:0",
+				Users: []config.UserConfig{
+					{Username: "alice", Password: "alice-pw"},
+					{Username: "personal", HashedPassword: "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC"},
+				},
+			},
+			Backend: config.BackendConfig{Addr: "127.0.0.1:3306"},
+		}
+		srv, err := NewProxyServer(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("NewProxyServer: %v", err)
+		}
+		if got := srv.userPasswords["alice"]; got != "alice-pw" {
+			t.Errorf("userPasswords[alice] = %q, want alice-pw", got)
+		}
+		// Hashed user: must NOT have a plaintext mirrored, even
+		// blank — handleConnection relies on `ok=false` to take the
+		// clear-error path.
+		if _, ok := srv.userPasswords["personal"]; ok {
+			t.Error("hashed-password user must NOT appear in userPasswords")
+		}
+	})
 }
 
 // fakeBackend implements just the bit of *client.Conn that
