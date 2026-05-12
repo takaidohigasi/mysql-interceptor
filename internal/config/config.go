@@ -531,7 +531,9 @@ func validateHashedPasswordShape(s string) error {
 	}
 	for i := 1; i < len(s); i++ {
 		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+		// De Morgan'd form of "not hex"; checked positively to keep
+		// staticcheck (QF1001) quiet.
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return fmt.Errorf("hashed_password contains non-hex char %q at position %d", c, i)
 		}
 	}
