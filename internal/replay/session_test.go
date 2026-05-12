@@ -2,7 +2,13 @@ package replay
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"testing"
+
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 )
 
 // newTestShadowSession builds a ShadowSession without a real backend
@@ -152,3 +158,65 @@ func TestShadowSession_SessionStatePassesAlways(t *testing.T) {
 		}
 	}
 }
+
+// TestIsTransportError pins the decision rule that recordResult uses
+// to choose between "keep session alive" (server-returned SQL error)
+// and "tear down session" (broken connection). The cascade observed
+// in kouzoh/microservices#29641 — 5k+ identical i/o-timeout error
+// records on one digest in 20 min — happened because the previous
+// recordResult treated *all* errors as recoverable and kept dispatching
+// queries against a poisoned *client.Conn. This test fixes the
+// boundary so a future change can't silently re-introduce that.
+func TestIsTransportError(t *testing.T) {
+	// Server-returned SQL errors must NOT trigger teardown. These are
+	// query-specific and leave the underlying connection healthy for
+	// subsequent queries.
+	sqlErrors := []error{
+		// Bare *mysql.MyError as produced by go-mysql when the server
+		// returns ERR_Packet.
+		&gomysql.MyError{Code: gomysql.ER_NO_SUCH_TABLE, Message: "Table 'foo.bar' doesn't exist"},
+		&gomysql.MyError{Code: gomysql.ER_PARSE_ERROR, Message: "You have an error in your SQL syntax"},
+		&gomysql.MyError{Code: gomysql.ER_DUP_ENTRY, Message: "Duplicate entry '1' for key 'PRIMARY'"},
+		// Wrapped — errors.As must still surface the MyError.
+		fmt.Errorf("execute failed: %w", &gomysql.MyError{Code: gomysql.ER_NO_SUCH_TABLE, Message: "missing"}),
+	}
+	for _, err := range sqlErrors {
+		if isTransportError(err) {
+			t.Errorf("server SQL error misclassified as transport-level (would tear down session unnecessarily): %v", err)
+		}
+	}
+
+	// Transport-level errors MUST trigger teardown: i/o timeout from
+	// our SetDeadline poisoning or from kernel TCP keepalive death,
+	// io.EOF on read after server closed the conn, generic net.OpError,
+	// and the bare wrapped errors go-mysql emits ("Write failed.
+	// err ...: i/o timeout: connection was bad").
+	transportErrors := []error{
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		&net.OpError{Op: "write", Net: "tcp", Err: errTimeout{}},
+		errors.New("Write failed. err write tcp 10.34.27.232:54321->10.38.25.197:3306: i/o timeout: connection was bad"),
+		errors.New("io.ReadFull(header) failed. err read tcp ...: i/o timeout: connection was bad"),
+		errors.New("connection was bad"),
+	}
+	for _, err := range transportErrors {
+		if !isTransportError(err) {
+			t.Errorf("transport-level error misclassified as recoverable (cascade bug re-introduced): %v", err)
+		}
+	}
+
+	// Nil is never a transport error — guards callers that branch on
+	// res.err == nil first.
+	if isTransportError(nil) {
+		t.Error("nil error must not be classified as transport-level")
+	}
+}
+
+// errTimeout is a minimal net.Error implementation marking the error
+// as a timeout, used to construct realistic *net.OpError fixtures
+// without spinning up an actual socket.
+type errTimeout struct{}
+
+func (errTimeout) Error() string   { return "i/o timeout" }
+func (errTimeout) Timeout() bool   { return true }
+func (errTimeout) Temporary() bool { return true }
