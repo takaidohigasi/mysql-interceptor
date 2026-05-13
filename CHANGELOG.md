@@ -7,6 +7,70 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.8"></a>
+## v0.0.8
+
+_Released 2026-05-13._
+
+Patch release. Removes the cascade pattern that produced thousands of
+identical-shape `error`-type diff records per broken shadow connection,
+and downgrades a per-connection INFO log line that was drowning out
+operationally relevant events.
+
+### Fixed
+
+- **Tear down shadow session on transport-level execute errors.** When
+  `ExecuteAndCapture` returned an error, `recordResult` previously
+  recorded a single error-type diff and kept the session running.
+  That's fine for server-returned SQL errors (`*mysql.MyError` —
+  "Table doesn't exist", syntax errors, duplicate keys), which leave
+  the underlying `*client.Conn` healthy. But for transport-level
+  failures (i/o timeout from our own `SetDeadline` poisoning,
+  kernel TCP keepalive death, server RST, packet.Conn marked
+  "connection was bad"), go-mysql caches the error state: every
+  subsequent `Execute` on the same connection short-circuits to the
+  identical error without touching the wire. The primary session
+  kept issuing queries → each one produced another error diff →
+  **5,500-7,400 identical-shape records on a single digest in 20-30
+  minutes** in the dev capture used to surface this. The fix adds
+  `isTransportError(err)` (`!errors.As(err, &*mysql.MyError{})`); if
+  true, `recordResult` now calls `ss.conn.Close()` + `ss.cancel()`
+  after recording the diff, so the next primary query for this
+  session is shadow-dropped (via `Send`'s `ctx.Done` arm) until the
+  primary session ends and a fresh `ShadowSession` opens on the
+  next session. (#28, kouzoh/microservices#29641)
+
+### Changed
+
+- **`"new connection"` log line downgraded from INFO to DEBUG.** At
+  typical query rates the proxy emits hundreds of these per second
+  per pod, drowning out operationally-relevant events in stdout /
+  Cloud Logging. The matching `"session closed"` log on teardown
+  was already DEBUG, so the two are now symmetric. Set
+  `LOG_LEVEL=debug` to observe connection-open events when
+  needed. (#27)
+
+### Operational notes
+
+- The fix in #28 is independent of `replay.shadow.timeout` value.
+  Raising `shadow.timeout` (e.g. from 5 s to 30 s for legitimate
+  long-running queries) is safer after this lands because a stuck
+  connection no longer multiplies its cost across every subsequent
+  query in the session.
+- After deploying this version, expect `comparisons_differed` rates
+  to drop sharply during burst windows that previously produced
+  cascade noise — that signal is now real divergence + a single
+  audit record per actual transport failure, not thousands of
+  amplified records. `shadow_dropped` will tick up
+  correspondingly for the sessions whose shadow connection got
+  recycled.
+- The new `slog.Info("shadow: transport error, tearing down session")`
+  is emitted once per genuine transport failure (i.e. roughly the
+  rate at which shadow connections actually break). If you see
+  high volume, the underlying network/TiDB-side issue is still
+  there — but you no longer have to grep through thousands of
+  cascade records to find it.
+
 <a id="v0.0.7"></a>
 ## v0.0.7
 
