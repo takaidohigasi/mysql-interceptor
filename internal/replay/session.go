@@ -280,8 +280,18 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 	if res.err != nil {
 		slog.Debug("shadow: execution error",
 			"session_id", ss.sessionID, "err", res.err)
+		// Use res.result (which ExecuteAndCapture populates with both
+		// .Error and .Duration even on Execute failure) so the diff
+		// record carries the shadow-side latency. Before #28's fix
+		// landed end-to-end this branch was unreachable (see
+		// kouzoh/microservices#29641 post-mortem); a guard against
+		// res.result == nil is kept for defensiveness in case a
+		// future ExecuteAndCapture variant returns a nil captured.
 		if sq.OrigResult != nil {
-			replayRes := &compare.CapturedResult{Error: res.err.Error()}
+			replayRes := res.result
+			if replayRes == nil {
+				replayRes = &compare.CapturedResult{Error: res.err.Error()}
+			}
 			cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.User, sq.SessionID)
 			reporter.Record(cmpResult)
 			compare.ReleaseCompareResult(cmpResult)
@@ -289,15 +299,11 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 		// Transport-level errors poison go-mysql's *client.Conn: once
 		// the underlying net.Conn returns "i/o timeout" or "connection
 		// was bad", every subsequent Execute on the same connection
-		// short-circuits to the same error. Without tearing down here,
-		// a single broken connection produces one error-diff record
-		// per primary query for the rest of the primary session's
-		// lifetime — exactly the cascade pattern we saw in
-		// kouzoh/microservices#29641 (5k+ identical errors on one
-		// digest in 20 minutes). Server-returned SQL errors (e.g.
-		// "Table doesn't exist") arrive as *mysql.MyError and DON'T
-		// break the connection, so we keep the session alive for
-		// those.
+		// short-circuits to the same error. Tear the session down so
+		// the next primary query opens a fresh shadow connection.
+		// Server-returned SQL errors arrive as *mysql.MyError and
+		// don't break the connection, so we keep the session alive
+		// for those (see isTransportError).
 		if isTransportError(res.err) {
 			slog.Info("shadow: transport error, tearing down session",
 				"session_id", ss.sessionID, "err", res.err)
