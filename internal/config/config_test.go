@@ -155,6 +155,92 @@ proxy:
 	}
 }
 
+// TestLoad_HashedPassword_Accepts confirms the MySQL standard
+// "*XXXX..." 41-char form is parsed and validated cleanly. The exact
+// value below is `SELECT PASSWORD('alice')` from a MySQL 5.7 instance
+// — used here purely as a shape-correct fixture; no real account
+// uses it.
+func TestLoad_HashedPassword_Accepts(t *testing.T) {
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "alice"
+      hashed_password: "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if cfg.Proxy.Users[0].HashedPassword != "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC" {
+		t.Errorf("hashed_password not preserved through load: %+v", cfg.Proxy.Users[0])
+	}
+}
+
+// TestLoad_HashedPassword_RejectsBoth confirms the validator catches
+// the ambiguous "both password and hashed_password set" case. Without
+// this gate it would be silently undefined which value is used.
+func TestLoad_HashedPassword_RejectsBoth(t *testing.T) {
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "alice"
+      password: "plain"
+      hashed_password: "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	os.WriteFile(cfgPath, []byte(content), 0o644)
+
+	if _, err := Load(cfgPath); err == nil {
+		t.Error("expected validation error when both password and hashed_password are set")
+	}
+}
+
+// TestLoad_HashedPassword_RejectsMalformed exercises the shape check
+// across the most common typos: missing leading "*", wrong length,
+// and non-hex characters. Any of these registered would only fail
+// hours later at first login attempt — fail-fast here instead.
+func TestLoad_HashedPassword_RejectsMalformed(t *testing.T) {
+	// Empty string is intentionally NOT tested here: an empty
+	// hashed_password is indistinguishable from "field absent" in YAML,
+	// so the validator treats it as unset and falls through to the
+	// (also possibly empty) Password — matching the pre-change
+	// behavior where users could register with empty passwords.
+	for name, hashed := range map[string]string{
+		"no_leading_asterisk": "4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC", // 40 hex chars but missing "*"
+		"too_short":           "*4DF1D664",
+		"too_long":            "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FCEXTRA",
+		"non_hex":             "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FZ", // trailing Z
+	} {
+		t.Run(name, func(t *testing.T) {
+			content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "alice"
+      hashed_password: "` + hashed + `"
+`
+			tmpDir := t.TempDir()
+			cfgPath := filepath.Join(tmpDir, "config.yaml")
+			os.WriteFile(cfgPath, []byte(content), 0o644)
+
+			if _, err := Load(cfgPath); err == nil {
+				t.Errorf("expected validation error for hashed_password=%q", hashed)
+			}
+		})
+	}
+}
+
 func TestLoad_TLSRequiresCertAndKey(t *testing.T) {
 	content := `
 backend:

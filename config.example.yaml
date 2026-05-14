@@ -19,6 +19,19 @@ proxy:
       password: "app_pw"
     # - username: "ro_user"
     #   password: "ro_pw"
+    #
+    # Alternative: hashed_password for users whose plaintext is not
+    # available — typically personal accounts mirrored from another
+    # proxy's config that stores only the MySQL `*XXXX...`
+    # (mysql_native_password) hash. Inbound handshake verification
+    # works without the plaintext. NOTE: the proxy's *outbound*
+    # backend connection currently still requires plaintext, so a
+    # hashed-only user authenticates successfully but the session
+    # terminates at backend-connect time with a clear error. Useful
+    # for permitting audit-only auth events; not yet useful for true
+    # query forwarding.
+    # - username: "personal_alice"
+    #   hashed_password: "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC"
   # Optional cap on session lifetime — useful for forcing periodic
   # reconnects so existing sessions rebalance onto new backends after
   # autoscaling. After the cap (with ±10% per-session jitter) elapses,
