@@ -7,6 +7,95 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.9"></a>
+## v0.0.9
+
+_Released 2026-05-14._
+
+Patch release. Fixes a contract bug in `ExecuteAndCapture` that
+made the v0.0.8 transport-error teardown (PR #28) effectively dead
+code — the bug pre-existed v0.0.8 but was exposed by the post-mortem
+on kouzoh/microservices#29641 where the teardown's runtime markers
+were entirely absent on a deployed v0.0.8 pod despite the source
+clearly containing them.
+
+### Fixed
+
+- **`ExecuteAndCapture` now returns the raw Execute error alongside
+  the captured result** (`internal/replay/executor.go`). Prior to
+  this change, on Execute failure the function would set
+  `captured.Error = err.Error()` and `return captured, nil` —
+  silently dropping `err`. The shadow's `recordResult` therefore
+  always saw `res.err == nil`, took the success branch (incrementing
+  `shadow_queries_replayed` for every Execute regardless of outcome),
+  and **never evaluated `if isTransportError(res.err)`** — so PR #28's
+  `ss.conn.Close() + ss.cancel()` teardown branch was unreachable on
+  the dominant failure path. With `(captured, err)` returned, the
+  teardown finally fires for transport-level failures (i/o timeout,
+  broken pipe, server RST, `*packet.Conn` `"connection was bad"`
+  state); server-returned SQL errors (`*mysql.MyError` — table
+  missing, syntax, dup key) keep the session alive as designed.
+  (#31, kouzoh/microservices#29641)
+
+### Changed (callers of `ExecuteAndCapture`)
+
+- **`ShadowSession.recordResult`** — error branch now passes
+  `res.result` (which carries both `.Error` and `.Duration` even on
+  failure) to `engine.Compare`, instead of building a stripped
+  `{Error: res.err.Error()}` struct. Diff records for shadow
+  failures now carry the shadow-side latency too (`replay_time_ms`
+  field on the JSONL output is populated, previously was 0 for the
+  unreached error path).
+- **`OfflineReplayer.Run`** — previously did `if err != nil {
+  slog.Error; continue }`. That `continue` was harmless when the
+  contract guaranteed `err == nil` (the err branch was dead); with
+  the new contract it would silently drop diff records for failed
+  replays. Changed to `slog.Debug` and fall through to
+  `engine.Compare(orig, replayResult, ...)` so offline reports keep
+  recording replay failures as `error`-type diff records.
+- **`test/integration_test.go`** — the assertion that
+  `ExecuteAndCapture` returned `err == nil` for "orders table
+  doesn't exist" on the secondary MySQL was an artifact of the bug.
+  Now asserts `err != nil` AND `captured.Error` populated (both are
+  set for server-returned SQL errors).
+
+### Correction to v0.0.8's release notes
+
+The v0.0.8 release notes (and PR #28's commit message) described
+the fix as breaking a within-session cascade where "one broken
+connection produces an error-diff record per primary query for the
+rest of the primary session's lifetime — 5,500-7,400 identical
+errors on one digest in 20-30 min." The runtime evidence shows
+that's not the right reading — both pre and post-v0.0.8 captures
+on the dev fury-panda-mirror pod show **exactly 1 error diff per
+`session_id`**, **0 sessions with 2+ errors**. The volume was from
+many short-lived primary sessions × 1 error each, not one session
+in a death spiral.
+
+PR #28's teardown remains the correct defensive code for the case
+where a primary session DOES issue multiple queries on a poisoned
+connection. It just wasn't the dramatic reduction it was framed as
+in v0.0.8 — combined with this v0.0.9 fix, it now actually runs
+end-to-end and produces the new `"shadow: transport error, tearing
+down session"` slog INFO line operators can use to track real
+broken-connection events without grepping through error-diff
+records.
+
+### Operational notes after deploy
+
+- **Diff-record JSONL shape is unchanged** for clients tailing
+  `comparison.output_file`. (The shadow-side latency now lands in
+  `replay_time_ms` for error-type diffs too; previously it was 0.)
+- New observable signal: `slog.Info("shadow: transport error,
+  tearing down session", session_id=N, err="…")` once per genuine
+  transport failure. Useful for tracking the underlying network /
+  shadow-target health issue rather than grepping JSONL diffs.
+- `shadow_dropped` will rise as torn-down sessions cause subsequent
+  primary queries to drop on `Send`'s `ctx.Done` arm.
+- `shadow_queries_replayed` will diverge from `comparisons_total`
+  by the count of Execute-errored queries (previously they were
+  exactly equal, which was itself a signature of this bug).
+
 <a id="v0.0.8"></a>
 ## v0.0.8
 
