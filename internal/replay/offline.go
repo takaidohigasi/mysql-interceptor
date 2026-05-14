@@ -284,11 +284,20 @@ func (r *OfflineReplayer) replayFile(ctx context.Context, filePath string) error
 				}
 				prevTimestamp = se.entry.Timestamp
 
+				// ExecuteAndCapture returns (captured, err) where
+				// captured.Error carries the error string even on
+				// failure. Pre-#28-fix this returned (captured, nil)
+				// and the err branch never fired — see
+				// kouzoh/microservices#29641 post-mortem. Now we
+				// log err for observability but still pass
+				// captured through to engine.Compare so the diff
+				// record gets emitted (operators want to see replay
+				// failures in the offline report, not just in the
+				// pod log).
 				replayResult, err := ExecuteAndCapture(conn, se.entry.Query, se.entry.Args...)
 				if err != nil {
-					slog.Error("replay: execution error",
+					slog.Debug("replay: execution error",
 						"session_id", sid, "err", err)
-					continue
 				}
 
 				origResult := &compare.CapturedResult{
