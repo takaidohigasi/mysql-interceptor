@@ -283,6 +283,7 @@ func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password 
 		conn:       conn,
 		queryCh:    make(chan ShadowQuery, s.sessionQueueSz),
 		tempTables: make(map[string]struct{}),
+		execFn:     ExecuteAndCapture,
 		done:       make(chan struct{}),
 		ctx:        ctx,
 		cancel:     cancel,
