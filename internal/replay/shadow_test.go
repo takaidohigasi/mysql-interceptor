@@ -3,6 +3,7 @@ package replay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 // captureSlog redirects the default slog logger into the returned buffer
@@ -648,4 +651,116 @@ func TestShadowSession_Send_OrigResultBeatsCapture(t *testing.T) {
 	default:
 		t.Error("expected ShadowQuery in queueCh")
 	}
+}
+
+// newConnectTestSender builds a ShadowSender suitable for exercising
+// StartSession's connect behavior. The default `connect` is overridden by
+// each test; background summary/heartbeat loops are disabled and the diff
+// report is sent to a throwaway temp file.
+func newConnectTestSender(t *testing.T) *ShadowSender {
+	t.Helper()
+	enabled := true
+	s, err := NewShadowSender(
+		config.ShadowConfig{
+			Enabled:    &enabled,
+			TargetAddr: "203.0.113.1:3306", // unused: connect is injected
+		},
+		config.ComparisonConfig{
+			OutputFile:        filepath.Join(t.TempDir(), "diff.jsonl"),
+			SummaryInterval:   -1, // disable periodic summary goroutine
+			HeartbeatInterval: -1, // disable heartbeat goroutine
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewShadowSender: %v", err)
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
+// TestStartSession_SlowConnectDoesNotBlock is the regression test for the
+// shadow-connect-on-the-client-path bug: when the shadow backend connect
+// hangs (e.g. the target is unreachable and the handshake times out),
+// StartSession — which runs on the primary client's session-setup path —
+// must return immediately rather than blocking the client for the full
+// connect timeout. Sending while the connect is still pending must also
+// not block the caller.
+func TestStartSession_SlowConnectDoesNotBlock(t *testing.T) {
+	s := newConnectTestSender(t)
+
+	release := make(chan struct{})
+	var connectCalls atomic.Int32
+	s.connect = func(_ config.BackendConfig, _ config.BackendSideTLSConfig) (*client.Conn, error) {
+		connectCalls.Add(1)
+		<-release // simulate a hanging / timing-out shadow connect
+		return nil, errors.New("read tcp ...: i/o timeout")
+	}
+
+	start := time.Now()
+	ss, err := s.StartSession(1, "appdb", "", "")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("StartSession returned error: %v", err)
+	}
+	if ss == nil {
+		t.Fatal("StartSession returned nil session")
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("StartSession blocked on the shadow connect for %v; it must return promptly so the client path is not stalled", elapsed)
+	}
+
+	// Sending while the connect is still hanging must not block the caller.
+	sent := make(chan struct{})
+	go func() {
+		ss.Send(ShadowQuery{Query: "SELECT 1", OrigResult: &compare.CapturedResult{}})
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(time.Second):
+		t.Fatal("Send blocked while the shadow connect was still pending")
+	}
+
+	// Let the (failed) connect complete, then Close must return promptly.
+	close(release)
+	closed := make(chan struct{})
+	go func() { ss.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the pending connect finished")
+	}
+	if connectCalls.Load() != 1 {
+		t.Fatalf("expected exactly 1 connect attempt, got %d", connectCalls.Load())
+	}
+}
+
+// TestStartSession_ConnectFailureStopsShadow verifies that once the shadow
+// connect fails, the session stops shadowing: subsequent Send calls are
+// dropped (not buffered) and Close still returns cleanly.
+func TestStartSession_ConnectFailureStopsShadow(t *testing.T) {
+	s := newConnectTestSender(t)
+	s.connect = func(_ config.BackendConfig, _ config.BackendSideTLSConfig) (*client.Conn, error) {
+		return nil, errors.New("connection refused")
+	}
+
+	ss, err := s.StartSession(7, "", "", "")
+	if err != nil || ss == nil {
+		t.Fatalf("StartSession: ss=%v err=%v", ss, err)
+	}
+
+	// connectAndRun closes done once the (failed) connect returns.
+	select {
+	case <-ss.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connectAndRun did not finish after connect failure")
+	}
+
+	before := metrics.Global.ShadowDropped.Load()
+	ss.Send(ShadowQuery{Query: "SELECT 1", OrigResult: &compare.CapturedResult{}})
+	if got := metrics.Global.ShadowDropped.Load() - before; got != 1 {
+		t.Fatalf("after connect failure Send should drop the query (dropped +1), got +%d", got)
+	}
+
+	ss.Close() // must not panic or hang (no conn was ever established)
 }

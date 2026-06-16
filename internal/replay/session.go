@@ -69,6 +69,17 @@ func (ss *ShadowSession) Send(sq ShadowQuery) {
 		return
 	}
 
+	// Shadow connect failed (or the session is being torn down): the
+	// session context is cancelled. Drop without doing the gate /
+	// category / capture work. During the connecting window the context
+	// is still live, so queries are buffered in queryCh until the shadow
+	// connection becomes ready (see connectAndRun).
+	if ss.ctx.Err() != nil {
+		ss.sender.dropped.Add(1)
+		metrics.Global.ShadowDropped.Add(1)
+		return
+	}
+
 	// Global gates: enabled, sample rate, CIDR.
 	if !ss.sender.shouldSendPreCategory(sq) {
 		return
@@ -150,16 +161,18 @@ func (ss *ShadowSession) passesCategoryCheck(query string) bool {
 	return false
 }
 
-// Close signals the session goroutine to exit, waits for it to drain
-// the queue and close the connection, and unregisters the session from
-// its sender. Idempotent.
+// Close signals the session goroutine to exit, waits for it to drain the
+// queue, and unregisters the session from its sender. Idempotent. The
+// shadow connection is owned and closed by connectAndRun (its deferred
+// conn.Close runs after run() returns), so Close does not touch ss.conn —
+// it only needs to wait for ss.done, which connectAndRun always closes
+// (even when the connect failed and run() never started).
 func (ss *ShadowSession) Close() {
 	if !ss.closed.CompareAndSwap(false, true) {
 		return
 	}
 	ss.cancel()
 	<-ss.done
-	ss.conn.Close()
 	ss.sender.unregisterSession(ss.sessionID)
 }
 
@@ -168,10 +181,10 @@ func (ss *ShadowSession) Close() {
 // exiting, so audit records aren't silently lost when the primary
 // session ends with queries still buffered. New queries arriving
 // after ctx is cancelled are dropped by the producer side
-// (ShadowSession.Send checks ss.closed first).
+// (ShadowSession.Send checks ss.closed first). Called only from
+// connectAndRun once the connection is established; connectAndRun owns
+// closing ss.done.
 func (ss *ShadowSession) run() {
-	defer close(ss.done)
-
 	engine := ss.sender.engine
 	reporter := ss.sender.reporter
 

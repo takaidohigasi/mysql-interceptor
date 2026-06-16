@@ -11,11 +11,20 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
+
+// shadowConnectTimeout bounds the shadow backend handshake. It is shorter
+// than backend.DefaultConnectTimeout (used by the primary) because the
+// shadow connect now runs in its own goroutine off the client path: a
+// slow/unreachable shadow target should fail fast rather than pin a
+// connecting goroutine — and session teardown, which waits on it — for the
+// full default.
+const shadowConnectTimeout = 3 * time.Second
 
 type ShadowQuery struct {
 	SessionID    uint64
@@ -51,8 +60,12 @@ type ShadowQuery struct {
 // primary are faithfully mirrored on the shadow.
 type ShadowSender struct {
 	// Shared dependencies
-	backendCfg        config.BackendConfig
-	tlsCfg            config.BackendSideTLSConfig
+	backendCfg config.BackendConfig
+	tlsCfg     config.BackendSideTLSConfig
+	// connect opens a connection to the shadow backend. Defaults to a
+	// backend.ConnectWithTimeout call using shadowConnectTimeout;
+	// overridable in tests to simulate slow/failing shadow connects.
+	connect           func(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error)
 	engine            *compare.Engine
 	reporter          *compare.Reporter
 	timeout           time.Duration
@@ -146,6 +159,9 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		sessions:          make(map[uint64]*ShadowSession),
 		ctx:               ctx,
 		cancel:            cancel,
+	}
+	s.connect = func(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error) {
+		return backend.ConnectWithTimeout(cfg, tlsCfg, shadowConnectTimeout)
 	}
 
 	initiallyEnabled := true
@@ -241,11 +257,21 @@ func (s *ShadowSender) runPeriodicSummary(interval time.Duration) {
 	}
 }
 
-// StartSession opens a dedicated shadow connection for the given primary
-// session. Returns (nil, nil) if shadow is currently disabled — callers
-// should skip shadowing in that case. If the backend connection fails,
-// returns the error so the caller can decide whether to proceed without
-// shadow (recommended) or surface it.
+// StartSession registers a dedicated shadow session for the given primary
+// session and kicks off its backend connection asynchronously. Returns
+// (nil, nil) if shadow is currently disabled — callers should skip
+// shadowing in that case — and (nil, err) only if the sender is closed.
+//
+// The shadow backend connect is performed in a background goroutine
+// (connectAndRun), NOT on the caller's path: backend.Connect blocks up to
+// the connect timeout on the handshake, so doing it synchronously here
+// stalled the primary client's session setup whenever the shadow target
+// was slow or unreachable — the client couldn't run its first query until
+// the shadow connect returned (or timed out). Now StartSession returns
+// immediately; queries sent before the shadow connection is ready are
+// buffered in the session queue and replayed once it connects, and if the
+// connect fails the session simply stops shadowing. A slow or failed
+// shadow connect never affects the primary path.
 //
 // If user is non-empty, the shadow connection is opened with that user
 // and password instead of the configured shadow.target_user / target_password.
@@ -265,22 +291,11 @@ func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password 
 		backendCfg.User = user
 		backendCfg.Password = password
 	}
-	conn, err := backend.Connect(backendCfg, s.tlsCfg)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to shadow server: %w", err)
-	}
-	if initialDB != "" && initialDB != conn.GetDB() {
-		if _, err := conn.Execute("USE `" + initialDB + "`"); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("USE %q on shadow: %w", initialDB, err)
-		}
-	}
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	ss := &ShadowSession{
 		sessionID:  sessionID,
 		sender:     s,
-		conn:       conn,
 		queryCh:    make(chan ShadowQuery, s.sessionQueueSz),
 		tempTables: make(map[string]struct{}),
 		execFn:     ExecuteAndCapture,
@@ -294,8 +309,48 @@ func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password 
 	s.sessionsMu.Unlock()
 	metrics.Global.ShadowActiveSessions.Add(1)
 
-	go ss.run()
+	go ss.connectAndRun(backendCfg, initialDB)
 	return ss, nil
+}
+
+// connectAndRun establishes the session's shadow connection and then runs
+// the query-drain loop. It runs in its own goroutine (started by
+// StartSession) so the connect handshake never blocks the primary client
+// path. It always closes ss.done on return so Close can wait for teardown
+// even when the connect failed and run() never started. It owns the
+// connection's lifetime: the deferred conn.Close runs after run() returns
+// (or immediately on a connect/USE failure or mid-connect teardown). On
+// failure it cancels the session so Send drops subsequent queries instead
+// of buffering them into a queue that will never drain.
+func (ss *ShadowSession) connectAndRun(backendCfg config.BackendConfig, initialDB string) {
+	defer close(ss.done)
+
+	conn, err := ss.sender.connect(backendCfg, ss.sender.tlsCfg)
+	if err != nil {
+		slog.Info("shadow: connect failed; session will not shadow",
+			"session_id", ss.sessionID, "err", err)
+		ss.cancel()
+		return
+	}
+	defer conn.Close()
+
+	// The primary session may have ended while we were connecting; if so,
+	// discard the freshly-opened connection without running.
+	if ss.ctx.Err() != nil {
+		return
+	}
+
+	if initialDB != "" && initialDB != conn.GetDB() {
+		if _, err := conn.Execute("USE `" + initialDB + "`"); err != nil {
+			slog.Info("shadow: USE on connect failed; session will not shadow",
+				"session_id", ss.sessionID, "db", initialDB, "err", err)
+			ss.cancel()
+			return
+		}
+	}
+
+	ss.conn = conn
+	ss.run()
 }
 
 // Send applies only the non-session-state filter gates (enabled /
