@@ -15,7 +15,16 @@ import (
 // giving up, so an unreachable backend can't pin sessions indefinitely.
 const DefaultConnectTimeout = 10 * time.Second
 
+// Connect opens a backend connection using DefaultConnectTimeout.
 func Connect(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error) {
+	return ConnectWithTimeout(cfg, tlsCfg, DefaultConnectTimeout)
+}
+
+// ConnectWithTimeout opens a backend connection with an explicit handshake
+// timeout. The shadow path uses a shorter timeout than the primary so a
+// slow/unreachable shadow target doesn't pin a connecting goroutine (and,
+// by extension, session teardown) for the full default.
+func ConnectWithTimeout(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig, timeout time.Duration) (*client.Conn, error) {
 	var opts []client.Option
 
 	if tlsCfg.Enabled {
@@ -29,7 +38,7 @@ func Connect(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*cli
 		})
 	}
 
-	conn, err := client.ConnectWithTimeout(cfg.Addr, cfg.User, cfg.Password, cfg.DB, DefaultConnectTimeout, opts...)
+	conn, err := client.ConnectWithTimeout(cfg.Addr, cfg.User, cfg.Password, cfg.DB, timeout, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to backend %s: %w", cfg.Addr, err)
 	}
