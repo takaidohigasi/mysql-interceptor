@@ -7,6 +7,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.11"></a>
+## v0.0.11
+
+_Released 2026-06-16._
+
+Patch release. Fixes a bug where a slow or unreachable **shadow** backend
+could stall the **primary (client-facing)** path — not just shadow
+queries. On the dev `fury-panda-mirror` mirror, when the shadow target's
+connection timed out, normal client queries were impacted too.
+
+### Fixed
+
+- **Shadow backend connection now establishes off the client path**
+  (`internal/replay/shadow.go`, `internal/proxy/server.go`).
+  `ProxyServer.handleConnection` calls `ShadowSender.StartSession`
+  synchronously during client session setup, and `StartSession`
+  previously did a blocking `backend.Connect` (up to
+  `DefaultConnectTimeout` = 10s) plus an initial `USE` against the shadow
+  target. So when the shadow connect hung, every new client connection
+  blocked for up to 10s before it could run its first query — clients
+  with a shorter timeout saw their normal queries time out. (The
+  per-query `Send` path was already non-blocking; only session startup
+  was on the hot path.) `StartSession` now registers the session and
+  performs the connect + initial `USE` in a background goroutine
+  (`connectAndRun`), returning immediately. Queries sent before the
+  shadow connection is ready are buffered in the per-session queue and
+  replayed once it connects; if the connect fails the session cancels
+  itself and `Send` drops subsequent queries. `connectAndRun` owns the
+  connection lifetime (deferred `conn.Close` after `run()` returns) and
+  always closes `done`, so `Close()` no longer touches `conn` and works
+  whether or not the connect succeeded. A slow or failed shadow connect
+  can no longer affect the primary path. (#35)
+
+### Changed
+
+- **Added `backend.ConnectWithTimeout`** and gave the shadow connect a
+  shorter **3s** timeout (vs the primary's 10s), so a hung connect can't
+  pin a connecting goroutine — or session teardown, which waits on it —
+  for the full default. (#35)
+
 <a id="v0.0.10"></a>
 ## v0.0.10
 
