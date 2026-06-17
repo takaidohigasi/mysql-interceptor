@@ -62,8 +62,9 @@ func ConnectWithTimeout(cfg config.BackendConfig, tlsCfg config.BackendSideTLSCo
 
 // backendDialer builds the net.Dialer used for the backend connection,
 // wiring in TCP keep-alive when enabled. A nil ka.Enabled (a BackendConfig
-// that never went through config.Load — e.g. the shadow target) means
-// keep-alive is left off; KeepAlive=-1 explicitly disables Go's default.
+// built programmatically that never went through config.Load, e.g. in
+// tests) means keep-alive is left off; KeepAlive=-1 explicitly disables
+// Go's implicit default.
 func backendDialer(timeout time.Duration, ka config.KeepAliveConfig) *net.Dialer {
 	d := &net.Dialer{Timeout: timeout}
 	if ka.Enabled != nil && *ka.Enabled {

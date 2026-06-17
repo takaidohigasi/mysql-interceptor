@@ -100,6 +100,33 @@ backend:
 	}
 }
 
+func TestLoad_ShadowKeepAliveDefaults(t *testing.T) {
+	// Shadow target also gets keep-alive defaults (on, aggressive).
+	content := `
+proxy:
+  listen_addr: "0.0.0.0:3307"
+  users:
+    - username: "root"
+      password: "pass"
+backend:
+  addr: "127.0.0.1:3306"
+replay:
+  mode: "shadow"
+  shadow:
+    target_addr: "127.0.0.1:3307"
+    target_user: "root"
+    target_password: "pass"
+`
+	cfg := mustLoad(t, content)
+	ka := cfg.Replay.Shadow.KeepAlive
+	if ka.Enabled == nil || !*ka.Enabled {
+		t.Fatalf("expected shadow keepalive enabled by default, got %v", ka.Enabled)
+	}
+	if ka.Idle != 30*time.Second || ka.Interval != 10*time.Second || ka.Count != 3 {
+		t.Errorf("unexpected shadow keepalive defaults: idle=%v interval=%v count=%d", ka.Idle, ka.Interval, ka.Count)
+	}
+}
+
 func mustLoad(t *testing.T, content string) *Config {
 	t.Helper()
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")

@@ -194,6 +194,11 @@ type ShadowConfig struct {
 	// A pointer is used so "not set" (nil) can be distinguished from an
 	// explicit 0.0 (shadow nothing).
 	SampleRate *float64 `yaml:"sample_rate,omitempty"`
+	// KeepAlive configures TCP keep-alive on the shadow backend
+	// connection, mirroring backend.keepalive for the primary. Enabled by
+	// default with the same preset so a dead/half-open shadow target is
+	// detected promptly instead of pinning a per-session shadow goroutine.
+	KeepAlive KeepAliveConfig `yaml:"keepalive"`
 }
 
 type OfflineConfig struct {
@@ -435,11 +440,17 @@ func applyDefaults(cfg *Config) {
 		cfg.Comparison.HeartbeatInterval = time.Minute
 	}
 
-	// Backend TCP keep-alive: on by default. Unset enabled (nil) → true;
-	// an explicit `enabled: false` is preserved. Sub-values default to
-	// the aggressive preset (dead conn detected in ~idle + interval*count
-	// = 60s).
-	ka := &cfg.Backend.KeepAlive
+	// TCP keep-alive: on by default for both the primary backend and the
+	// shadow target. Unset enabled (nil) → true; an explicit
+	// `enabled: false` is preserved. Sub-values default to the aggressive
+	// preset (dead conn detected in ~idle + interval*count = 60s).
+	defaultKeepAlive(&cfg.Backend.KeepAlive)
+	defaultKeepAlive(&cfg.Replay.Shadow.KeepAlive)
+}
+
+// defaultKeepAlive fills a KeepAliveConfig with the default-on aggressive
+// preset, leaving any explicitly-set values untouched.
+func defaultKeepAlive(ka *KeepAliveConfig) {
 	if ka.Enabled == nil {
 		enabled := true
 		ka.Enabled = &enabled

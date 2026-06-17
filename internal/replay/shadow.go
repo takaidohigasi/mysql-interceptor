@@ -145,9 +145,10 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 
 	s := &ShadowSender{
 		backendCfg: config.BackendConfig{
-			Addr:     cfg.TargetAddr,
-			User:     cfg.TargetUser,
-			Password: cfg.TargetPassword,
+			Addr:      cfg.TargetAddr,
+			User:      cfg.TargetUser,
+			Password:  cfg.TargetPassword,
+			KeepAlive: cfg.KeepAlive,
 		},
 		tlsCfg:            cfg.TLS,
 		engine:            engine,
