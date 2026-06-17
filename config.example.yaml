@@ -30,6 +30,16 @@ proxy:
 backend:
   addr: "127.0.0.1:3306"
   db: ""
+  # TCP keep-alive on the outbound backend connection. Detects a dead or
+  # half-open backend (silent LB/firewall idle drop, peer crash, network
+  # partition) so an in-flight read/write fails promptly instead of
+  # hanging. Enabled by default; a dead connection is detected after
+  # roughly idle + interval*count.
+  keepalive:
+    enabled: true   # default true; set false to turn off
+    idle: 30s       # idle time before the first probe
+    interval: 10s   # time between probes
+    count: 3        # unacked probes before the connection is declared dead
 
 tls:
   client_side:
