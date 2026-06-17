@@ -1,9 +1,11 @@
 package backend
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -20,10 +22,17 @@ func Connect(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*cli
 	return ConnectWithTimeout(cfg, tlsCfg, DefaultConnectTimeout)
 }
 
-// ConnectWithTimeout opens a backend connection with an explicit handshake
-// timeout. The shadow path uses a shorter timeout than the primary so a
-// slow/unreachable shadow target doesn't pin a connecting goroutine (and,
-// by extension, session teardown) for the full default.
+// ConnectWithTimeout opens a backend connection with an explicit connect
+// timeout, applying cfg.KeepAlive to the underlying TCP socket. The shadow
+// path uses a shorter timeout than the primary so a slow/unreachable
+// shadow target doesn't pin a connecting goroutine (and, by extension,
+// session teardown) for the full default.
+//
+// We go through client.ConnectWithDialer with our own net.Dialer rather
+// than client.ConnectWithTimeout for two reasons: (1) the dialer is where
+// TCP keep-alive is configured, and (2) go-mysql's ConnectWithTimeout
+// ignores its timeout argument and always dials with a hardcoded 10s — our
+// net.Dialer.Timeout makes the requested timeout actually take effect.
 func ConnectWithTimeout(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig, timeout time.Duration) (*client.Conn, error) {
 	var opts []client.Option
 
@@ -38,12 +47,37 @@ func ConnectWithTimeout(cfg config.BackendConfig, tlsCfg config.BackendSideTLSCo
 		})
 	}
 
-	conn, err := client.ConnectWithTimeout(cfg.Addr, cfg.User, cfg.Password, cfg.DB, timeout, opts...)
+	dialer := backendDialer(timeout, cfg.KeepAlive)
+	// network "" lets go-mysql pick tcp/unix from the address shape
+	// (getNetProto); keep-alive only applies to TCP and is a no-op for
+	// unix sockets.
+	conn, err := client.ConnectWithDialer(
+		context.Background(), "", cfg.Addr, cfg.User, cfg.Password, cfg.DB, dialer.DialContext, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to backend %s: %w", cfg.Addr, err)
 	}
 
 	return conn, nil
+}
+
+// backendDialer builds the net.Dialer used for the backend connection,
+// wiring in TCP keep-alive when enabled. A nil ka.Enabled (a BackendConfig
+// built programmatically that never went through config.Load, e.g. in
+// tests) means keep-alive is left off; KeepAlive=-1 explicitly disables
+// Go's implicit default.
+func backendDialer(timeout time.Duration, ka config.KeepAliveConfig) *net.Dialer {
+	d := &net.Dialer{Timeout: timeout}
+	if ka.Enabled != nil && *ka.Enabled {
+		d.KeepAliveConfig = net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     ka.Idle,
+			Interval: ka.Interval,
+			Count:    ka.Count,
+		}
+	} else {
+		d.KeepAlive = -1
+	}
+	return d
 }
 
 func buildBackendTLSConfig(cfg config.BackendSideTLSConfig) (*tls.Config, error) {

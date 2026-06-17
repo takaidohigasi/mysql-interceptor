@@ -79,11 +79,38 @@ type BackendConfig struct {
 	Addr string `yaml:"addr"`
 	DB   string `yaml:"db,omitempty"`
 
+	// KeepAlive configures TCP keep-alive probing on the outbound backend
+	// connection so a dead or half-open backend (silent LB/firewall idle
+	// drop, peer crash, network partition) is detected promptly and the
+	// in-flight read/write fails instead of hanging. Enabled by default;
+	// see KeepAliveConfig.
+	KeepAlive KeepAliveConfig `yaml:"keepalive"`
+
 	// User and Password are not yaml-bound: they're set at runtime from
 	// the matched ProxyConfig.Users entry. Kept on this struct so it can
 	// be passed straight to backend.Connect.
 	User     string `yaml:"-"`
 	Password string `yaml:"-"`
+}
+
+// KeepAliveConfig controls TCP keep-alive on a backend connection. The
+// connection is considered dead after roughly Idle + Interval*Count of
+// no acknowledgement, at which point reads/writes return an error.
+type KeepAliveConfig struct {
+	// Enabled toggles keep-alive probes. Pointer so an unset value (nil)
+	// can default to true in applyDefaults while still allowing an
+	// explicit `enabled: false` to turn it off. A nil value at connect
+	// time (e.g. a BackendConfig built programmatically that never went
+	// through config.Load — such as the shadow target) is treated as
+	// disabled.
+	Enabled *bool `yaml:"enabled"`
+	// Idle is how long the connection must be idle before the first probe.
+	Idle time.Duration `yaml:"idle"`
+	// Interval is the time between probes.
+	Interval time.Duration `yaml:"interval"`
+	// Count is the number of unacknowledged probes before the connection
+	// is declared dead.
+	Count int `yaml:"count"`
 }
 
 type TLSConfig struct {
@@ -167,6 +194,11 @@ type ShadowConfig struct {
 	// A pointer is used so "not set" (nil) can be distinguished from an
 	// explicit 0.0 (shadow nothing).
 	SampleRate *float64 `yaml:"sample_rate,omitempty"`
+	// KeepAlive configures TCP keep-alive on the shadow backend
+	// connection, mirroring backend.keepalive for the primary. Enabled by
+	// default with the same preset so a dead/half-open shadow target is
+	// detected promptly instead of pinning a per-session shadow goroutine.
+	KeepAlive KeepAliveConfig `yaml:"keepalive"`
 }
 
 type OfflineConfig struct {
@@ -406,6 +438,31 @@ func applyDefaults(cfg *Config) {
 	// disabled.
 	if cfg.Comparison.HeartbeatInterval == 0 {
 		cfg.Comparison.HeartbeatInterval = time.Minute
+	}
+
+	// TCP keep-alive: on by default for both the primary backend and the
+	// shadow target. Unset enabled (nil) → true; an explicit
+	// `enabled: false` is preserved. Sub-values default to the aggressive
+	// preset (dead conn detected in ~idle + interval*count = 60s).
+	defaultKeepAlive(&cfg.Backend.KeepAlive)
+	defaultKeepAlive(&cfg.Replay.Shadow.KeepAlive)
+}
+
+// defaultKeepAlive fills a KeepAliveConfig with the default-on aggressive
+// preset, leaving any explicitly-set values untouched.
+func defaultKeepAlive(ka *KeepAliveConfig) {
+	if ka.Enabled == nil {
+		enabled := true
+		ka.Enabled = &enabled
+	}
+	if ka.Idle == 0 {
+		ka.Idle = 30 * time.Second
+	}
+	if ka.Interval == 0 {
+		ka.Interval = 10 * time.Second
+	}
+	if ka.Count == 0 {
+		ka.Count = 3
 	}
 }
 
