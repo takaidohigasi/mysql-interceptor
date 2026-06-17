@@ -7,6 +7,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.12"></a>
+## v0.0.12
+
+_Released 2026-06-18._
+
+Adds TCP keep-alive to the outbound backend connections so a dead or
+half-open backend (silent LB/firewall idle drop, peer crash, network
+partition) is detected promptly — the in-flight read/write fails instead
+of hanging on a connection the kernel still believes is open.
+
+### Added
+
+- **TCP keep-alive on the primary and shadow backend connections**
+  (`internal/backend/conn.go`, `internal/config/config.go`,
+  `internal/replay/shadow.go`). New `keepalive` config block on both
+  `backend` and `replay.shadow`, **enabled by default** with an aggressive
+  preset (`idle: 30s`, `interval: 10s`, `count: 3` — a dead connection is
+  detected in roughly `idle + interval*count` = 60s). `enabled` is a
+  pointer so an unset value defaults to true while an explicit
+  `enabled: false` is preserved; the shared default lives in
+  `config.defaultKeepAlive`. Keep-alive is configured on a `net.Dialer`
+  (`net.KeepAliveConfig`) and wired through `client.ConnectWithDialer`.
+  (#37)
+
+### Fixed
+
+- **Backend connect timeout now actually takes effect.**
+  `backend.ConnectWithTimeout` previously called go-mysql's
+  `client.ConnectWithTimeout`, which **ignores its timeout argument and
+  always dials with a hardcoded 10s**. As a result the shadow's 3s connect
+  timeout (added in v0.0.11) was silently ineffective. Dialing via our own
+  `net.Dialer` (the same change that adds keep-alive) makes the requested
+  connect timeout honored. (#37)
+
 <a id="v0.0.11"></a>
 ## v0.0.11
 
