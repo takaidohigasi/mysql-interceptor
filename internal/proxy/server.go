@@ -101,13 +101,46 @@ func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *re
 		return nil, fmt.Errorf("proxy.users must contain at least one entry")
 	}
 	ah := server.NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
+	// Two registration paths:
+	//   * Password set       → AddUser(plaintext). Plaintext also goes
+	//     into userPasswords so handleConnection can authenticate
+	//     outbound to the backend.
+	//   * HashedPassword set → AddUserWithHashedPassword(20-byte hash).
+	//     We do NOT have a plaintext, so userPasswords stays empty for
+	//     this user; handleConnection will detect the missing entry and
+	//     fail the session cleanly after a successful inbound handshake.
+	// config.Validate has already rejected entries with both fields set,
+	// so the switch below is exhaustive.
 	passwords := make(map[string]string, len(cfg.Proxy.Users))
 	for _, u := range cfg.Proxy.Users {
-		if err := ah.AddUser(u.Username, u.Password); err != nil {
-			cancel()
-			return nil, fmt.Errorf("adding user %q: %w", u.Username, err)
+		switch {
+		case u.HashedPassword != "":
+			// MySQL's "*XXXXXXXX..." 41-char stored form → raw 20-byte
+			// SHA1(SHA1(plaintext)). DecodePasswordHex strips the "*"
+			// and decodes the hex. Validate.HashedPasswordShape has
+			// already shape-checked, but DecodePasswordHex is still the
+			// canonical decoder and surfaces any unexpected error.
+			raw, err := mysql.DecodePasswordHex(u.HashedPassword)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("decoding hashed_password for user %q: %w", u.Username, err)
+			}
+			if err := ah.AddUserWithHashedPassword(u.Username, raw); err != nil {
+				cancel()
+				return nil, fmt.Errorf("adding hashed-password user %q: %w", u.Username, err)
+			}
+			// Intentionally NOT setting passwords[u.Username] — there
+			// is no plaintext to mirror. handleConnection's "no backend
+			// password mapping" path will surface the missing-plaintext
+			// case to the operator the first time this user tries to
+			// run a query.
+		default:
+			if err := ah.AddUser(u.Username, u.Password); err != nil {
+				cancel()
+				return nil, fmt.Errorf("adding user %q: %w", u.Username, err)
+			}
+			passwords[u.Username] = u.Password
 		}
-		passwords[u.Username] = u.Password
 	}
 	ps.authHandler = ah
 	ps.userPasswords = passwords
@@ -239,10 +272,15 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	backendUser := serverConn.GetUser()
 	backendPass, ok := ps.userPasswords[backendUser]
 	if !ok {
-		// Should not happen: authHandler approved a user we don't have a
-		// plaintext password for. Fail loudly so the missing entry gets
-		// noticed instead of silently falling back.
-		sessionLog.Error("authenticated user has no backend password mapping", "user", backendUser)
+		// Reachable when the user is registered via hashed_password —
+		// authentication succeeds but we have no plaintext to use for
+		// the outbound backend connection. Fail with an actionable
+		// message so operators can see which user is affected and
+		// configure a plaintext (either as password or a future
+		// backend_password field) instead of silently breaking the
+		// session.
+		sessionLog.Error("authenticated user has no plaintext password available for backend connection; configure proxy.users[].password (hashed_password handles inbound auth only)",
+			"user", backendUser)
 		return
 	}
 
