@@ -7,6 +7,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.13"></a>
+## v0.0.13
+
+_Released 2026-10-02._
+
+Backend connections are now closed with COM_QUIT, so MySQL/TiDB record
+proxy-initiated teardowns as normal disconnects instead of aborted
+clients.
+
+### Fixed
+
+- **COM_QUIT is sent before closing backend connections**
+  (`internal/backend/quit.go`, `internal/proxy/server.go`,
+  `internal/replay/shadow.go`, `internal/backend/pool.go`). go-mysql's
+  `client.Conn.Close()` is a bare TCP close, and MySQL/TiDB count a client
+  that disappears without COM_QUIT as an aborted connection (TiDB:
+  `tidb_server_disconnection_total{result="error"}`). Every session end
+  therefore showed up on both the primary and the shadow server as an
+  error disconnect even though the client had sent COM_QUIT and no query
+  failed. New `backend.Quit` sends COM_QUIT under a 1s write deadline and
+  closes the socket regardless of the outcome (go-mysql's own `Quit()`
+  returns without closing when the write fails); the primary, shadow and
+  pool teardowns use it. The `COM_QUIT` case in `HandleOtherCommand` was
+  unreachable (go-mysql's server consumes COM_QUIT before the handler) and
+  no longer closes the backend itself. (#39)
+
 <a id="v0.0.12"></a>
 ## v0.0.12
 
