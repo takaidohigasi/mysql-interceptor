@@ -333,7 +333,7 @@ func (ss *ShadowSession) connectAndRun(backendCfg config.BackendConfig, initialD
 		ss.cancel()
 		return
 	}
-	defer conn.Close()
+	defer backend.Quit(conn)
 
 	// The primary session may have ended while we were connecting; if so,
 	// discard the freshly-opened connection without running.

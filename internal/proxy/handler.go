@@ -197,7 +197,10 @@ func (h *ProxyHandler) HandleOtherCommand(cmd byte, data []byte) error {
 	case mysql.COM_PING:
 		return h.backend.Ping()
 	case mysql.COM_QUIT:
-		h.backend.Close()
+		// go-mysql's server handles COM_QUIT before the handler is
+		// consulted (server/command.go), so this is not reached; the
+		// backend is closed with COM_QUIT by handleConnection's deferred
+		// backend.Quit once HandleCommand returns.
 		return nil
 	case mysql.COM_STATISTICS,
 		mysql.COM_PROCESS_INFO,

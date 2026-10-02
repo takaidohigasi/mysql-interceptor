@@ -41,14 +41,14 @@ func (p *Pool) Put(conn *client.Conn) {
 	select {
 	case p.conns <- conn:
 	default:
-		conn.Close()
+		Quit(conn)
 	}
 }
 
 func (p *Pool) Close() {
 	close(p.conns)
 	for conn := range p.conns {
-		conn.Close()
+		Quit(conn)
 	}
 }
 
