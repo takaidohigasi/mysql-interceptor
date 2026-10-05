@@ -375,3 +375,59 @@ bench:
 		t.Errorf("bare $ should be preserved, got %q", cfg.Bench.Queries[0])
 	}
 }
+
+func TestLoad_ComparisonUpload(t *testing.T) {
+	base := `
+proxy:
+  users:
+    - username: "root"
+      password: "pass"
+backend:
+  addr: "127.0.0.1:3306"
+comparison:
+`
+	load := func(t *testing.T, comparison string) (*Config, error) {
+		t.Helper()
+		cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(cfgPath, []byte(base+comparison), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(cfgPath)
+	}
+
+	t.Run("defaults timeout", func(t *testing.T) {
+		cfg, err := load(t, `  output_file: "/tmp/diff-report.jsonl"
+  upload:
+    gcs:
+      bucket: "b"
+      prefix: "p"
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Comparison.Upload.Timeout != 20*time.Second {
+			t.Errorf("upload.timeout = %v, want 20s", cfg.Comparison.Upload.Timeout)
+		}
+		if cfg.Comparison.Upload.GCS.Bucket != "b" || cfg.Comparison.Upload.GCS.Prefix != "p" {
+			t.Errorf("gcs = %+v", cfg.Comparison.Upload.GCS)
+		}
+	})
+
+	t.Run("requires a file output", func(t *testing.T) {
+		_, err := load(t, `  output_file: "-"
+  upload:
+    gcs:
+      bucket: "b"
+`)
+		if err == nil || !strings.Contains(err.Error(), "comparison.upload.gcs") {
+			t.Errorf("expected an output_file error, got %v", err)
+		}
+	})
+
+	t.Run("disabled without bucket", func(t *testing.T) {
+		if _, err := load(t, `  output_file: "-"
+`); err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+}

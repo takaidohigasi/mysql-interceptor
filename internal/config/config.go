@@ -294,6 +294,33 @@ type ComparisonConfig struct {
 	// defense-in-depth fallback against an incomplete RedactColumns
 	// list.
 	RedactAllValues bool `yaml:"redact_all_values"`
+
+	// Upload copies OutputFile to object storage when `serve` shuts
+	// down, so the diff report survives the process and its local disk
+	// (e.g. a pod's emptyDir). Shadow mode only.
+	Upload ReportUploadConfig `yaml:"upload"`
+}
+
+// ReportUploadConfig configures the shutdown upload of the comparison
+// report. Leaving gcs.bucket empty disables it.
+type ReportUploadConfig struct {
+	GCS GCSUploadConfig `yaml:"gcs"`
+	// Timeout bounds the upload at shutdown. Keep shutdown_timeout plus
+	// this below the grace period of whatever stops the process (e.g.
+	// terminationGracePeriodSeconds). Default 20s.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// GCSUploadConfig names the destination of the report upload. The object
+// is written to gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz.
+type GCSUploadConfig struct {
+	Bucket string `yaml:"bucket"`
+	// Prefix is prepended to every object name. Empty means the bucket root.
+	Prefix string `yaml:"prefix"`
+	// Instance separates the uploads of each process so replicas don't
+	// overwrite each other. Defaults to the hostname (the pod name on
+	// Kubernetes); set it explicitly, e.g. "${POD_NAME}", to override.
+	Instance string `yaml:"instance"`
 }
 
 func Load(path string) (*Config, error) {
@@ -439,6 +466,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Comparison.HeartbeatInterval == 0 {
 		cfg.Comparison.HeartbeatInterval = time.Minute
 	}
+	if cfg.Comparison.Upload.Timeout == 0 {
+		cfg.Comparison.Upload.Timeout = 20 * time.Second
+	}
 
 	// TCP keep-alive: on by default for both the primary backend and the
 	// shadow target. Unset enabled (nil) → true; an explicit
@@ -518,6 +548,14 @@ func (c *Config) Validate() error {
 	for i, cidr := range c.Replay.Shadow.ExcludedSourceCIDRs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("replay.shadow.excluded_source_cidrs[%d] invalid CIDR %q: %w", i, cidr, err)
+		}
+	}
+	if c.Comparison.Upload.GCS.Bucket != "" {
+		if c.Comparison.OutputFile == "" || c.Comparison.OutputFile == "-" {
+			return fmt.Errorf("comparison.upload.gcs requires comparison.output_file to be a file, not stdout")
+		}
+		if c.Comparison.Upload.Timeout < 0 {
+			return fmt.Errorf("comparison.upload.timeout must be non-negative, got %v", c.Comparison.Upload.Timeout)
 		}
 	}
 	return nil
