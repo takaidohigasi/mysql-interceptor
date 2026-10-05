@@ -7,8 +7,13 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/packet"
+	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
+	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
 // newTestShadowSession builds a ShadowSession without a real backend
@@ -220,3 +225,103 @@ type errTimeout struct{}
 func (errTimeout) Error() string   { return "i/o timeout" }
 func (errTimeout) Timeout() bool   { return true }
 func (errTimeout) Temporary() bool { return true }
+
+// newPipeShadowSession builds a ShadowSession whose conn is backed by a
+// net.Pipe end, so abortInFlightExec's SetDeadline and recordResult's
+// Close behave exactly as in production (net.Pipe supports deadlines)
+// without a real MySQL backend. The returned peer is the other pipe end;
+// closing it is handled by t.Cleanup.
+func newPipeShadowSession(t *testing.T) *ShadowSession {
+	t.Helper()
+	near, far := net.Pipe()
+	t.Cleanup(func() { _ = near.Close(); _ = far.Close() })
+
+	sender := &ShadowSender{}
+	sender.enabled.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	return &ShadowSession{
+		sessionID:  1,
+		sender:     sender,
+		conn:       &client.Conn{Conn: packet.NewConn(near)},
+		queryCh:    make(chan ShadowQuery, 64),
+		tempTables: make(map[string]struct{}),
+		done:       make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+}
+
+// runProcessQuery runs ss.processQuery in a goroutine and fails the test
+// if it doesn't return within a generous bound — guarding against the
+// teardown paths hanging.
+func runProcessQuery(t *testing.T, ss *ShadowSession, sq ShadowQuery) {
+	t.Helper()
+	finished := make(chan struct{})
+	go func() {
+		ss.processQuery(sq, nil, nil)
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processQuery did not return")
+	}
+}
+
+// TestShadowSession_DrainDoesNotAbortFastQuery pins the fix for the
+// teardown race: during drainOnShutdown ctx is already cancelled when
+// processQuery starts, but a query that completes within the per-query
+// timeout must be recorded as a normal result — NOT aborted and turned
+// into a self-inflicted i/o-timeout error-diff. (kouzoh/microservices
+// dev fury-panda-mirror: false transport-error storm under connection
+// churn.) OrigResult is left nil so recordResult's success path only
+// bumps ShadowQueriesReplayed and never touches engine/reporter.
+func TestShadowSession_DrainDoesNotAbortFastQuery(t *testing.T) {
+	ss := newPipeShadowSession(t)
+	ss.execFn = func(_ *client.Conn, _ string, _ ...interface{}) (*compare.CapturedResult, error) {
+		time.Sleep(5 * time.Millisecond)
+		return &compare.CapturedResult{}, nil
+	}
+	ss.cancel() // simulate drain: ctx cancelled before processQuery runs
+
+	before := metrics.Global.ShadowQueriesReplayed.Load()
+	runProcessQuery(t, ss, ShadowQuery{Query: "SELECT 1"})
+
+	if got := metrics.Global.ShadowQueriesReplayed.Load() - before; got != 1 {
+		t.Fatalf("fast drained query should be recorded as success (replayed +1), got +%d", got)
+	}
+}
+
+// TestShadowSession_DrainAbortsHungQuery preserves the existing safety
+// behavior: a query that does NOT finish within the per-query timeout is
+// still aborted (via abortInFlightExec's deadline) even on the ctx-cancel
+// path, so a genuinely hung shadow connection can't pin teardown forever.
+func TestShadowSession_DrainAbortsHungQuery(t *testing.T) {
+	ss := newPipeShadowSession(t)
+	ss.sender.timeout = 30 * time.Millisecond
+
+	var gotErr error
+	errCh := make(chan error, 1)
+	ss.execFn = func(c *client.Conn, _ string, _ ...interface{}) (*compare.CapturedResult, error) {
+		// Block on a real read; abortInFlightExec sets a past deadline on
+		// the underlying net.Conn, which makes this Read return an i/o
+		// timeout — the same mechanism used against a live backend.
+		buf := make([]byte, 1)
+		_, err := c.Read(buf)
+		errCh <- err
+		return &compare.CapturedResult{Error: err.Error()}, err
+	}
+	ss.cancel()
+
+	runProcessQuery(t, ss, ShadowQuery{Query: "SELECT SLEEP(99)"})
+
+	select {
+	case gotErr = <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("execFn never observed an abort")
+	}
+	var netErr net.Error
+	if !errors.As(gotErr, &netErr) || !netErr.Timeout() {
+		t.Fatalf("hung query should be aborted with a timeout error, got %v", gotErr)
+	}
+}

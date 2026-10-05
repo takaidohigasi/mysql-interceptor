@@ -99,11 +99,38 @@ type BackendConfig struct {
 	Addr string `yaml:"addr"`
 	DB   string `yaml:"db,omitempty"`
 
+	// KeepAlive configures TCP keep-alive probing on the outbound backend
+	// connection so a dead or half-open backend (silent LB/firewall idle
+	// drop, peer crash, network partition) is detected promptly and the
+	// in-flight read/write fails instead of hanging. Enabled by default;
+	// see KeepAliveConfig.
+	KeepAlive KeepAliveConfig `yaml:"keepalive"`
+
 	// User and Password are not yaml-bound: they're set at runtime from
 	// the matched ProxyConfig.Users entry. Kept on this struct so it can
 	// be passed straight to backend.Connect.
 	User     string `yaml:"-"`
 	Password string `yaml:"-"`
+}
+
+// KeepAliveConfig controls TCP keep-alive on a backend connection. The
+// connection is considered dead after roughly Idle + Interval*Count of
+// no acknowledgement, at which point reads/writes return an error.
+type KeepAliveConfig struct {
+	// Enabled toggles keep-alive probes. Pointer so an unset value (nil)
+	// can default to true in applyDefaults while still allowing an
+	// explicit `enabled: false` to turn it off. A nil value at connect
+	// time (e.g. a BackendConfig built programmatically that never went
+	// through config.Load — such as the shadow target) is treated as
+	// disabled.
+	Enabled *bool `yaml:"enabled"`
+	// Idle is how long the connection must be idle before the first probe.
+	Idle time.Duration `yaml:"idle"`
+	// Interval is the time between probes.
+	Interval time.Duration `yaml:"interval"`
+	// Count is the number of unacknowledged probes before the connection
+	// is declared dead.
+	Count int `yaml:"count"`
 }
 
 type TLSConfig struct {
@@ -187,6 +214,11 @@ type ShadowConfig struct {
 	// A pointer is used so "not set" (nil) can be distinguished from an
 	// explicit 0.0 (shadow nothing).
 	SampleRate *float64 `yaml:"sample_rate,omitempty"`
+	// KeepAlive configures TCP keep-alive on the shadow backend
+	// connection, mirroring backend.keepalive for the primary. Enabled by
+	// default with the same preset so a dead/half-open shadow target is
+	// detected promptly instead of pinning a per-session shadow goroutine.
+	KeepAlive KeepAliveConfig `yaml:"keepalive"`
 }
 
 type OfflineConfig struct {
@@ -282,6 +314,33 @@ type ComparisonConfig struct {
 	// defense-in-depth fallback against an incomplete RedactColumns
 	// list.
 	RedactAllValues bool `yaml:"redact_all_values"`
+
+	// Upload copies OutputFile to object storage when `serve` shuts
+	// down, so the diff report survives the process and its local disk
+	// (e.g. a pod's emptyDir). Shadow mode only.
+	Upload ReportUploadConfig `yaml:"upload"`
+}
+
+// ReportUploadConfig configures the shutdown upload of the comparison
+// report. Leaving gcs.bucket empty disables it.
+type ReportUploadConfig struct {
+	GCS GCSUploadConfig `yaml:"gcs"`
+	// Timeout bounds the upload at shutdown. Keep shutdown_timeout plus
+	// this below the grace period of whatever stops the process (e.g.
+	// terminationGracePeriodSeconds). Default 20s.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// GCSUploadConfig names the destination of the report upload. The object
+// is written to gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz.
+type GCSUploadConfig struct {
+	Bucket string `yaml:"bucket"`
+	// Prefix is prepended to every object name. Empty means the bucket root.
+	Prefix string `yaml:"prefix"`
+	// Instance separates the uploads of each process so replicas don't
+	// overwrite each other. Defaults to the hostname (the pod name on
+	// Kubernetes); set it explicitly, e.g. "${POD_NAME}", to override.
+	Instance string `yaml:"instance"`
 }
 
 func Load(path string) (*Config, error) {
@@ -427,6 +486,34 @@ func applyDefaults(cfg *Config) {
 	if cfg.Comparison.HeartbeatInterval == 0 {
 		cfg.Comparison.HeartbeatInterval = time.Minute
 	}
+	if cfg.Comparison.Upload.Timeout == 0 {
+		cfg.Comparison.Upload.Timeout = 20 * time.Second
+	}
+
+	// TCP keep-alive: on by default for both the primary backend and the
+	// shadow target. Unset enabled (nil) → true; an explicit
+	// `enabled: false` is preserved. Sub-values default to the aggressive
+	// preset (dead conn detected in ~idle + interval*count = 60s).
+	defaultKeepAlive(&cfg.Backend.KeepAlive)
+	defaultKeepAlive(&cfg.Replay.Shadow.KeepAlive)
+}
+
+// defaultKeepAlive fills a KeepAliveConfig with the default-on aggressive
+// preset, leaving any explicitly-set values untouched.
+func defaultKeepAlive(ka *KeepAliveConfig) {
+	if ka.Enabled == nil {
+		enabled := true
+		ka.Enabled = &enabled
+	}
+	if ka.Idle == 0 {
+		ka.Idle = 30 * time.Second
+	}
+	if ka.Interval == 0 {
+		ka.Interval = 10 * time.Second
+	}
+	if ka.Count == 0 {
+		ka.Count = 3
+	}
 }
 
 func (c *Config) Validate() error {
@@ -507,6 +594,14 @@ func (c *Config) Validate() error {
 	for i, cidr := range c.Replay.Shadow.ExcludedSourceCIDRs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("replay.shadow.excluded_source_cidrs[%d] invalid CIDR %q: %w", i, cidr, err)
+		}
+	}
+	if c.Comparison.Upload.GCS.Bucket != "" {
+		if c.Comparison.OutputFile == "" || c.Comparison.OutputFile == "-" {
+			return fmt.Errorf("comparison.upload.gcs requires comparison.output_file to be a file, not stdout")
+		}
+		if c.Comparison.Upload.Timeout < 0 {
+			return fmt.Errorf("comparison.upload.timeout must be non-negative, got %v", c.Comparison.Upload.Timeout)
 		}
 	}
 	return nil

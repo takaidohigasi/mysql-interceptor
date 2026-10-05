@@ -15,6 +15,7 @@ import (
 	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 	"github.com/takaidohigasi/mysql-interceptor/internal/proxy"
 	"github.com/takaidohigasi/mysql-interceptor/internal/replay"
+	"github.com/takaidohigasi/mysql-interceptor/internal/upload"
 )
 
 var (
@@ -38,6 +39,8 @@ func main() {
 		runReplay()
 	case "bench":
 		runBench()
+	case "report":
+		runReport()
 	case "version":
 		fmt.Printf("mysql-interceptor %s (commit: %s, built: %s)\n", version, commit, date)
 	default:
@@ -85,6 +88,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  serve    Start the MySQL proxy server")
 	fmt.Fprintln(os.Stderr, "  replay   Replay recorded queries from log files")
 	fmt.Fprintln(os.Stderr, "  bench    Run benchmarks comparing direct vs proxy performance")
+	fmt.Fprintln(os.Stderr, "  report   Show comparison diffs from a report file (values hidden by default)")
 	fmt.Fprintln(os.Stderr, "  version  Print version information")
 	fmt.Fprintln(os.Stderr, "\nOptions:")
 	fmt.Fprintln(os.Stderr, "  --config <path>   Path to config file (default: config.yaml)")
@@ -202,6 +206,9 @@ func runServe() {
 	srv.Shutdown()
 	if shadowSender != nil {
 		shadowSender.Close()
+		// The reporter is closed (and the report flushed) by
+		// shadowSender.Close, so the file is complete now.
+		uploadReport(cfg.Comparison)
 	}
 	if queryLogger != nil {
 		queryLogger.Close()
@@ -209,6 +216,37 @@ func runServe() {
 
 	if serveErr != nil {
 		fatal("serve error", "err", serveErr)
+	}
+}
+
+// uploadReport copies the comparison report to GCS when
+// comparison.upload.gcs.bucket is set. Failures are logged, not fatal:
+// the proxy is already shutting down and the local file is still there.
+func uploadReport(cmp config.ComparisonConfig) {
+	gcs := cmp.Upload.GCS
+	if gcs.Bucket == "" {
+		return
+	}
+	instance := gcs.Instance
+	if instance == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			slog.Error("report upload skipped: no instance name", "err", err)
+			return
+		}
+		instance = h
+	}
+	u := &upload.GCSUploader{Bucket: gcs.Bucket, Prefix: gcs.Prefix, Instance: instance}
+	ctx, cancel := context.WithTimeout(context.Background(), cmp.Upload.Timeout)
+	defer cancel()
+	object, err := u.UploadGzip(ctx, cmp.OutputFile)
+	switch {
+	case err != nil:
+		slog.Error("report upload failed", "bucket", gcs.Bucket, "file", cmp.OutputFile, "err", err)
+	case object == "":
+		slog.Info("report upload skipped: report is empty", "file", cmp.OutputFile)
+	default:
+		slog.Info("report uploaded", "bucket", gcs.Bucket, "object", object)
 	}
 }
 

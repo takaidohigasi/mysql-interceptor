@@ -6,11 +6,13 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-mysql-org/go-mysql v1.14.0
 	github.com/go-sql-driver/mysql v1.9.3
+	golang.org/x/oauth2 v0.30.0
 	gopkg.in/lumberjack.v2 v2.0.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
+	cloud.google.com/go/compute/metadata v0.3.0 // indirect
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/google/uuid v1.6.0 // indirect

@@ -98,12 +98,16 @@ func TestReplayDivergentResponses_ErrorVsSuccess(t *testing.T) {
 	}
 	defer conn2.Close()
 
+	// ExecuteAndCapture now returns the underlying err on failure
+	// (was silently swallowed pre-fix). For "orders table doesn't
+	// exist" we expect err != nil AND secondaryResult.Error to
+	// carry the same error string — both are populated.
 	secondaryResult, err := replay.ExecuteAndCapture(conn2, "SELECT * FROM orders WHERE user_id = 1")
-	if err != nil {
-		t.Fatalf("ExecuteAndCapture on secondary failed unexpectedly: %v", err)
+	if err == nil {
+		t.Fatal("expected ExecuteAndCapture on secondary to return err (orders table missing), got nil")
 	}
 	if secondaryResult.Error == "" {
-		t.Fatal("expected error from secondary (orders table should not exist), but got success")
+		t.Fatal("expected secondaryResult.Error to be populated for the same failure, got empty")
 	}
 
 	// Step 3: Compare results

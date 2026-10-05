@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoad_ValidConfig(t *testing.T) {
@@ -47,6 +48,96 @@ logging:
 	if cfg.Logging.FilePrefix != "queries" {
 		t.Errorf("expected default file_prefix 'queries', got %s", cfg.Logging.FilePrefix)
 	}
+}
+
+func TestLoad_BackendKeepAliveDefaults(t *testing.T) {
+	// No keepalive block → defaults: enabled on, aggressive timings.
+	content := `
+proxy:
+  listen_addr: "0.0.0.0:3307"
+  users:
+    - username: "root"
+      password: "pass"
+backend:
+  addr: "127.0.0.1:3306"
+`
+	cfg := mustLoad(t, content)
+	ka := cfg.Backend.KeepAlive
+	if ka.Enabled == nil || !*ka.Enabled {
+		t.Fatalf("expected keepalive enabled by default, got %v", ka.Enabled)
+	}
+	if ka.Idle != 30*time.Second || ka.Interval != 10*time.Second || ka.Count != 3 {
+		t.Errorf("unexpected keepalive defaults: idle=%v interval=%v count=%d", ka.Idle, ka.Interval, ka.Count)
+	}
+}
+
+func TestLoad_BackendKeepAliveExplicitDisablePreserved(t *testing.T) {
+	// An explicit `enabled: false` must survive applyDefaults (not be
+	// flipped back to true by the nil-default).
+	content := `
+proxy:
+  listen_addr: "0.0.0.0:3307"
+  users:
+    - username: "root"
+      password: "pass"
+backend:
+  addr: "127.0.0.1:3306"
+  keepalive:
+    enabled: false
+    idle: 5s
+`
+	cfg := mustLoad(t, content)
+	ka := cfg.Backend.KeepAlive
+	if ka.Enabled == nil || *ka.Enabled {
+		t.Fatalf("expected keepalive explicitly disabled, got %v", ka.Enabled)
+	}
+	if ka.Idle != 5*time.Second {
+		t.Errorf("expected explicit idle 5s preserved, got %v", ka.Idle)
+	}
+	// Unset sub-values still get their defaults.
+	if ka.Interval != 10*time.Second || ka.Count != 3 {
+		t.Errorf("expected default interval/count, got interval=%v count=%d", ka.Interval, ka.Count)
+	}
+}
+
+func TestLoad_ShadowKeepAliveDefaults(t *testing.T) {
+	// Shadow target also gets keep-alive defaults (on, aggressive).
+	content := `
+proxy:
+  listen_addr: "0.0.0.0:3307"
+  users:
+    - username: "root"
+      password: "pass"
+backend:
+  addr: "127.0.0.1:3306"
+replay:
+  mode: "shadow"
+  shadow:
+    target_addr: "127.0.0.1:3307"
+    target_user: "root"
+    target_password: "pass"
+`
+	cfg := mustLoad(t, content)
+	ka := cfg.Replay.Shadow.KeepAlive
+	if ka.Enabled == nil || !*ka.Enabled {
+		t.Fatalf("expected shadow keepalive enabled by default, got %v", ka.Enabled)
+	}
+	if ka.Idle != 30*time.Second || ka.Interval != 10*time.Second || ka.Count != 3 {
+		t.Errorf("unexpected shadow keepalive defaults: idle=%v interval=%v count=%d", ka.Idle, ka.Interval, ka.Count)
+	}
+}
+
+func mustLoad(t *testing.T, content string) *Config {
+	t.Helper()
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
 }
 
 func TestLoad_MissingBackendAddr(t *testing.T) {
@@ -369,4 +460,60 @@ bench:
 	if cfg.Bench.Queries[0] != "SELECT $1, $foo FROM dual" {
 		t.Errorf("bare $ should be preserved, got %q", cfg.Bench.Queries[0])
 	}
+}
+
+func TestLoad_ComparisonUpload(t *testing.T) {
+	base := `
+proxy:
+  users:
+    - username: "root"
+      password: "pass"
+backend:
+  addr: "127.0.0.1:3306"
+comparison:
+`
+	load := func(t *testing.T, comparison string) (*Config, error) {
+		t.Helper()
+		cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(cfgPath, []byte(base+comparison), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(cfgPath)
+	}
+
+	t.Run("defaults timeout", func(t *testing.T) {
+		cfg, err := load(t, `  output_file: "/tmp/diff-report.jsonl"
+  upload:
+    gcs:
+      bucket: "b"
+      prefix: "p"
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Comparison.Upload.Timeout != 20*time.Second {
+			t.Errorf("upload.timeout = %v, want 20s", cfg.Comparison.Upload.Timeout)
+		}
+		if cfg.Comparison.Upload.GCS.Bucket != "b" || cfg.Comparison.Upload.GCS.Prefix != "p" {
+			t.Errorf("gcs = %+v", cfg.Comparison.Upload.GCS)
+		}
+	})
+
+	t.Run("requires a file output", func(t *testing.T) {
+		_, err := load(t, `  output_file: "-"
+  upload:
+    gcs:
+      bucket: "b"
+`)
+		if err == nil || !strings.Contains(err.Error(), "comparison.upload.gcs") {
+			t.Errorf("expected an output_file error, got %v", err)
+		}
+	})
+
+	t.Run("disabled without bucket", func(t *testing.T) {
+		if _, err := load(t, `  output_file: "-"
+`); err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
 }

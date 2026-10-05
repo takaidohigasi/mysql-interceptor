@@ -301,7 +301,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 		sessionLog.Error("backend connect error", "err", err, "user", backendUser)
 		return
 	}
-	defer backendConn.Close()
+	defer backend.Quit(backendConn)
 
 	// Start a dedicated shadow session if shadow is configured. A failure
 	// here must never fail the primary — we just proceed without shadow

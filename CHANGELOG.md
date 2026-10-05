@@ -7,6 +7,343 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.14"></a>
+## v0.0.14
+
+_Released 2026-10-05._
+
+Comparison reports can now be read on distroless images and kept past the
+process: a `report` subcommand prints them without a shell, and `serve`
+can upload the report to GCS when it shuts down.
+
+### Added
+
+- **`mysql-interceptor report` subcommand** (`cmd/mysql-interceptor/report.go`,
+  `internal/compare/report_view.go`). Reads `comparison.output_file`
+  (plain or `.gz`) and prints one line per differing record, or a
+  per-digest summary of difference types and columns with `--summary`.
+  `--digest`, `--since` and `--limit` narrow the output. The query text
+  and the `original` / `replay` values are shown as `<hidden>` unless
+  `--show-values` is passed, since diff records can carry row data.
+  Heartbeat lines are skipped and malformed lines are counted instead of
+  failing the read. It needs no shell, so it works through `kubectl exec`
+  on the distroless image. (#41)
+- **Upload the comparison report to GCS on shutdown** (`internal/upload/gcs.go`,
+  `internal/config/config.go`, `cmd/mysql-interceptor/main.go`). New
+  `comparison.upload.gcs.{bucket,prefix,instance}` and
+  `comparison.upload.timeout` (default 20s). After sessions drain and the
+  reporter is flushed, `serve` gzips `output_file` to
+  `gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz`.
+  `instance` defaults to the hostname (the pod name on Kubernetes), so
+  replicas write under separate paths. Authentication uses Application
+  Default Credentials (Workload Identity on GKE). A missing or empty
+  report is skipped, and a failed upload is logged with the local file
+  left in place. `upload.gcs` requires `output_file` to be a file, not
+  stdout. Keep `proxy.shutdown_timeout` plus `upload.timeout` below the
+  process grace period. Adds the `golang.org/x/oauth2` dependency. (#42)
+
+<a id="v0.0.13"></a>
+## v0.0.13
+
+_Released 2026-10-02._
+
+Backend connections are now closed with COM_QUIT, so MySQL/TiDB record
+proxy-initiated teardowns as normal disconnects instead of aborted
+clients.
+
+### Fixed
+
+- **COM_QUIT is sent before closing backend connections**
+  (`internal/backend/quit.go`, `internal/proxy/server.go`,
+  `internal/replay/shadow.go`, `internal/backend/pool.go`). go-mysql's
+  `client.Conn.Close()` is a bare TCP close, and MySQL/TiDB count a client
+  that disappears without COM_QUIT as an aborted connection (TiDB:
+  `tidb_server_disconnection_total{result="error"}`). Every session end
+  therefore showed up on both the primary and the shadow server as an
+  error disconnect even though the client had sent COM_QUIT and no query
+  failed. New `backend.Quit` sends COM_QUIT under a 1s write deadline and
+  closes the socket regardless of the outcome (go-mysql's own `Quit()`
+  returns without closing when the write fails); the primary, shadow and
+  pool teardowns use it. The `COM_QUIT` case in `HandleOtherCommand` was
+  unreachable (go-mysql's server consumes COM_QUIT before the handler) and
+  no longer closes the backend itself. (#39)
+
+<a id="v0.0.12"></a>
+## v0.0.12
+
+_Released 2026-06-18._
+
+Adds TCP keep-alive to the outbound backend connections so a dead or
+half-open backend (silent LB/firewall idle drop, peer crash, network
+partition) is detected promptly — the in-flight read/write fails instead
+of hanging on a connection the kernel still believes is open.
+
+### Added
+
+- **TCP keep-alive on the primary and shadow backend connections**
+  (`internal/backend/conn.go`, `internal/config/config.go`,
+  `internal/replay/shadow.go`). New `keepalive` config block on both
+  `backend` and `replay.shadow`, **enabled by default** with an aggressive
+  preset (`idle: 30s`, `interval: 10s`, `count: 3` — a dead connection is
+  detected in roughly `idle + interval*count` = 60s). `enabled` is a
+  pointer so an unset value defaults to true while an explicit
+  `enabled: false` is preserved; the shared default lives in
+  `config.defaultKeepAlive`. Keep-alive is configured on a `net.Dialer`
+  (`net.KeepAliveConfig`) and wired through `client.ConnectWithDialer`.
+  (#37)
+
+### Fixed
+
+- **Backend connect timeout now actually takes effect.**
+  `backend.ConnectWithTimeout` previously called go-mysql's
+  `client.ConnectWithTimeout`, which **ignores its timeout argument and
+  always dials with a hardcoded 10s**. As a result the shadow's 3s connect
+  timeout (added in v0.0.11) was silently ineffective. Dialing via our own
+  `net.Dialer` (the same change that adds keep-alive) makes the requested
+  connect timeout honored. (#37)
+
+<a id="v0.0.11"></a>
+## v0.0.11
+
+_Released 2026-06-16._
+
+Patch release. Fixes a bug where a slow or unreachable **shadow** backend
+could stall the **primary (client-facing)** path — not just shadow
+queries. On the dev `fury-panda-mirror` mirror, when the shadow target's
+connection timed out, normal client queries were impacted too.
+
+### Fixed
+
+- **Shadow backend connection now establishes off the client path**
+  (`internal/replay/shadow.go`, `internal/proxy/server.go`).
+  `ProxyServer.handleConnection` calls `ShadowSender.StartSession`
+  synchronously during client session setup, and `StartSession`
+  previously did a blocking `backend.Connect` (up to
+  `DefaultConnectTimeout` = 10s) plus an initial `USE` against the shadow
+  target. So when the shadow connect hung, every new client connection
+  blocked for up to 10s before it could run its first query — clients
+  with a shorter timeout saw their normal queries time out. (The
+  per-query `Send` path was already non-blocking; only session startup
+  was on the hot path.) `StartSession` now registers the session and
+  performs the connect + initial `USE` in a background goroutine
+  (`connectAndRun`), returning immediately. Queries sent before the
+  shadow connection is ready are buffered in the per-session queue and
+  replayed once it connects; if the connect fails the session cancels
+  itself and `Send` drops subsequent queries. `connectAndRun` owns the
+  connection lifetime (deferred `conn.Close` after `run()` returns) and
+  always closes `done`, so `Close()` no longer touches `conn` and works
+  whether or not the connect succeeded. A slow or failed shadow connect
+  can no longer affect the primary path. (#35)
+
+### Changed
+
+- **Added `backend.ConnectWithTimeout`** and gave the shadow connect a
+  shorter **3s** timeout (vs the primary's 10s), so a hung connect can't
+  pin a connecting goroutine — or session teardown, which waits on it —
+  for the full default. (#35)
+
+<a id="v0.0.10"></a>
+## v0.0.10
+
+_Released 2026-06-02._
+
+Patch release. Fixes a self-inflicted `i/o timeout` storm in shadow
+traffic that surfaced on the dev `fury-panda-mirror` pod (TiDB 8.5.3
+primary vs 8.5.5 shadow). The pod logged a high, bursty volume of
+`"shadow: transport error, tearing down session" … i/o timeout` that
+looked like the shadow target timing out, but the target was reachable,
+its queries ran in <20ms, and CPU was idle — and there were **zero**
+`"query timeout exceeded"` lines, so the 30s per-query timer never
+fired. The errors appeared exactly once per distinct, rapidly-
+incrementing `session_id`: they tracked connection churn, not cluster
+health.
+
+This is the true tail of the v0.0.8/v0.0.9 "many short-lived sessions ×
+1 error each" cascade narrative — the transport errors those releases
+made fire were, on the drain path, generated by the interceptor itself.
+
+### Fixed
+
+- **`ShadowSession.processQuery` no longer aborts an in-flight shadow
+  query merely because the session's context is cancelled**
+  (`internal/replay/session.go`). `backend.Connect` sets no
+  `ReadTimeout`, so go-mysql never sets a read deadline — meaning the
+  only source of an `i/o timeout` is `abortInFlightExec`'s past
+  `net.Conn` deadline. On primary-connection teardown,
+  `drainOnShutdown` runs queued queries with `ctx` **already**
+  cancelled, so the `ctx.Done()` arm took its non-blocking `default`
+  and aborted queries that would have completed in ~ms — recording
+  them as false `error`-type diffs and flooding the logs. Under
+  connection churn this fired constantly and inflated
+  `comparisons_differed`. The `ctx.Done()` arm now waits for the query
+  on the already-running per-query timer before aborting: fast queries
+  complete and are recorded normally, and only a genuinely hung query
+  falls through to `abortInFlightExec`. The 30s-timer abort path is
+  unchanged. (#33)
+
+### Changed (internal)
+
+- **`ShadowSession` gained an `execFn` seam** (defaults to
+  `ExecuteAndCapture`, wired in `StartSession`) so the teardown race is
+  testable without a real backend. Two `net.Pipe`-backed regression
+  tests were added — `TestShadowSession_DrainDoesNotAbortFastQuery`
+  (fast drained query is recorded, not aborted) and
+  `TestShadowSession_DrainAbortsHungQuery` (genuinely hung query is
+  still aborted with a timeout). (#33)
+
+<a id="v0.0.9"></a>
+## v0.0.9
+
+_Released 2026-05-14._
+
+Patch release. Fixes a contract bug in `ExecuteAndCapture` that
+made the v0.0.8 transport-error teardown (PR #28) effectively dead
+code — the bug pre-existed v0.0.8 but was exposed by the post-mortem
+on kouzoh/microservices#29641 where the teardown's runtime markers
+were entirely absent on a deployed v0.0.8 pod despite the source
+clearly containing them.
+
+### Fixed
+
+- **`ExecuteAndCapture` now returns the raw Execute error alongside
+  the captured result** (`internal/replay/executor.go`). Prior to
+  this change, on Execute failure the function would set
+  `captured.Error = err.Error()` and `return captured, nil` —
+  silently dropping `err`. The shadow's `recordResult` therefore
+  always saw `res.err == nil`, took the success branch (incrementing
+  `shadow_queries_replayed` for every Execute regardless of outcome),
+  and **never evaluated `if isTransportError(res.err)`** — so PR #28's
+  `ss.conn.Close() + ss.cancel()` teardown branch was unreachable on
+  the dominant failure path. With `(captured, err)` returned, the
+  teardown finally fires for transport-level failures (i/o timeout,
+  broken pipe, server RST, `*packet.Conn` `"connection was bad"`
+  state); server-returned SQL errors (`*mysql.MyError` — table
+  missing, syntax, dup key) keep the session alive as designed.
+  (#31, kouzoh/microservices#29641)
+
+### Changed (callers of `ExecuteAndCapture`)
+
+- **`ShadowSession.recordResult`** — error branch now passes
+  `res.result` (which carries both `.Error` and `.Duration` even on
+  failure) to `engine.Compare`, instead of building a stripped
+  `{Error: res.err.Error()}` struct. Diff records for shadow
+  failures now carry the shadow-side latency too (`replay_time_ms`
+  field on the JSONL output is populated, previously was 0 for the
+  unreached error path).
+- **`OfflineReplayer.Run`** — previously did `if err != nil {
+  slog.Error; continue }`. That `continue` was harmless when the
+  contract guaranteed `err == nil` (the err branch was dead); with
+  the new contract it would silently drop diff records for failed
+  replays. Changed to `slog.Debug` and fall through to
+  `engine.Compare(orig, replayResult, ...)` so offline reports keep
+  recording replay failures as `error`-type diff records.
+- **`test/integration_test.go`** — the assertion that
+  `ExecuteAndCapture` returned `err == nil` for "orders table
+  doesn't exist" on the secondary MySQL was an artifact of the bug.
+  Now asserts `err != nil` AND `captured.Error` populated (both are
+  set for server-returned SQL errors).
+
+### Correction to v0.0.8's release notes
+
+The v0.0.8 release notes (and PR #28's commit message) described
+the fix as breaking a within-session cascade where "one broken
+connection produces an error-diff record per primary query for the
+rest of the primary session's lifetime — 5,500-7,400 identical
+errors on one digest in 20-30 min." The runtime evidence shows
+that's not the right reading — both pre and post-v0.0.8 captures
+on the dev fury-panda-mirror pod show **exactly 1 error diff per
+`session_id`**, **0 sessions with 2+ errors**. The volume was from
+many short-lived primary sessions × 1 error each, not one session
+in a death spiral.
+
+PR #28's teardown remains the correct defensive code for the case
+where a primary session DOES issue multiple queries on a poisoned
+connection. It just wasn't the dramatic reduction it was framed as
+in v0.0.8 — combined with this v0.0.9 fix, it now actually runs
+end-to-end and produces the new `"shadow: transport error, tearing
+down session"` slog INFO line operators can use to track real
+broken-connection events without grepping through error-diff
+records.
+
+### Operational notes after deploy
+
+- **Diff-record JSONL shape is unchanged** for clients tailing
+  `comparison.output_file`. (The shadow-side latency now lands in
+  `replay_time_ms` for error-type diffs too; previously it was 0.)
+- New observable signal: `slog.Info("shadow: transport error,
+  tearing down session", session_id=N, err="…")` once per genuine
+  transport failure. Useful for tracking the underlying network /
+  shadow-target health issue rather than grepping JSONL diffs.
+- `shadow_dropped` will rise as torn-down sessions cause subsequent
+  primary queries to drop on `Send`'s `ctx.Done` arm.
+- `shadow_queries_replayed` will diverge from `comparisons_total`
+  by the count of Execute-errored queries (previously they were
+  exactly equal, which was itself a signature of this bug).
+
+<a id="v0.0.8"></a>
+## v0.0.8
+
+_Released 2026-05-13._
+
+Patch release. Removes the cascade pattern that produced thousands of
+identical-shape `error`-type diff records per broken shadow connection,
+and downgrades a per-connection INFO log line that was drowning out
+operationally relevant events.
+
+### Fixed
+
+- **Tear down shadow session on transport-level execute errors.** When
+  `ExecuteAndCapture` returned an error, `recordResult` previously
+  recorded a single error-type diff and kept the session running.
+  That's fine for server-returned SQL errors (`*mysql.MyError` —
+  "Table doesn't exist", syntax errors, duplicate keys), which leave
+  the underlying `*client.Conn` healthy. But for transport-level
+  failures (i/o timeout from our own `SetDeadline` poisoning,
+  kernel TCP keepalive death, server RST, packet.Conn marked
+  "connection was bad"), go-mysql caches the error state: every
+  subsequent `Execute` on the same connection short-circuits to the
+  identical error without touching the wire. The primary session
+  kept issuing queries → each one produced another error diff →
+  **5,500-7,400 identical-shape records on a single digest in 20-30
+  minutes** in the dev capture used to surface this. The fix adds
+  `isTransportError(err)` (`!errors.As(err, &*mysql.MyError{})`); if
+  true, `recordResult` now calls `ss.conn.Close()` + `ss.cancel()`
+  after recording the diff, so the next primary query for this
+  session is shadow-dropped (via `Send`'s `ctx.Done` arm) until the
+  primary session ends and a fresh `ShadowSession` opens on the
+  next session. (#28, kouzoh/microservices#29641)
+
+### Changed
+
+- **`"new connection"` log line downgraded from INFO to DEBUG.** At
+  typical query rates the proxy emits hundreds of these per second
+  per pod, drowning out operationally-relevant events in stdout /
+  Cloud Logging. The matching `"session closed"` log on teardown
+  was already DEBUG, so the two are now symmetric. Set
+  `LOG_LEVEL=debug` to observe connection-open events when
+  needed. (#27)
+
+### Operational notes
+
+- The fix in #28 is independent of `replay.shadow.timeout` value.
+  Raising `shadow.timeout` (e.g. from 5 s to 30 s for legitimate
+  long-running queries) is safer after this lands because a stuck
+  connection no longer multiplies its cost across every subsequent
+  query in the session.
+- After deploying this version, expect `comparisons_differed` rates
+  to drop sharply during burst windows that previously produced
+  cascade noise — that signal is now real divergence + a single
+  audit record per actual transport failure, not thousands of
+  amplified records. `shadow_dropped` will tick up
+  correspondingly for the sessions whose shadow connection got
+  recycled.
+- The new `slog.Info("shadow: transport error, tearing down session")`
+  is emitted once per genuine transport failure (i.e. roughly the
+  rate at which shadow connections actually break). If you see
+  high volume, the underlying network/TiDB-side issue is still
+  there — but you no longer have to grep through thousands of
+  cascade records to find it.
+
 <a id="v0.0.7"></a>
 ## v0.0.7
 
