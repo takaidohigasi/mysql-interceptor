@@ -7,6 +7,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.14"></a>
+## v0.0.14
+
+_Released 2026-10-05._
+
+Comparison reports can now be read on distroless images and kept past the
+process: a `report` subcommand prints them without a shell, and `serve`
+can upload the report to GCS when it shuts down.
+
+### Added
+
+- **`mysql-interceptor report` subcommand** (`cmd/mysql-interceptor/report.go`,
+  `internal/compare/report_view.go`). Reads `comparison.output_file`
+  (plain or `.gz`) and prints one line per differing record, or a
+  per-digest summary of difference types and columns with `--summary`.
+  `--digest`, `--since` and `--limit` narrow the output. The query text
+  and the `original` / `replay` values are shown as `<hidden>` unless
+  `--show-values` is passed, since diff records can carry row data.
+  Heartbeat lines are skipped and malformed lines are counted instead of
+  failing the read. It needs no shell, so it works through `kubectl exec`
+  on the distroless image. (#41)
+- **Upload the comparison report to GCS on shutdown** (`internal/upload/gcs.go`,
+  `internal/config/config.go`, `cmd/mysql-interceptor/main.go`). New
+  `comparison.upload.gcs.{bucket,prefix,instance}` and
+  `comparison.upload.timeout` (default 20s). After sessions drain and the
+  reporter is flushed, `serve` gzips `output_file` to
+  `gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz`.
+  `instance` defaults to the hostname (the pod name on Kubernetes), so
+  replicas write under separate paths. Authentication uses Application
+  Default Credentials (Workload Identity on GKE). A missing or empty
+  report is skipped, and a failed upload is logged with the local file
+  left in place. `upload.gcs` requires `output_file` to be a file, not
+  stdout. Keep `proxy.shutdown_timeout` plus `upload.timeout` below the
+  process grace period. Adds the `golang.org/x/oauth2` dependency. (#42)
+
 <a id="v0.0.13"></a>
 ## v0.0.13
 
