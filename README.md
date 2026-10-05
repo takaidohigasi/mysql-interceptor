@@ -358,6 +358,22 @@ The diff report (JSONL) shows per-query comparison results:
 
 Difference types: `error`, `row_count`, `column_count`, `column_name`, `cell_value`, `affected_rows`
 
+### Reading the report
+
+`mysql-interceptor report` prints the records in a report file. It needs no
+shell or extra tools, so it also works on distroless images through
+`kubectl exec`:
+
+```sh
+mysql-interceptor report --file /tmp/diff-report.jsonl              # one line per differing record
+mysql-interceptor report --file /tmp/diff-report.jsonl --summary    # per-digest counts of difference types and columns
+mysql-interceptor report --file diff-report.jsonl.gz --digest users --since 1h --limit 20
+```
+
+The query text and the `original` / `replay` values are shown as
+`<hidden>` unless `--show-values` is passed, since diff records can carry row
+data. Heartbeat lines are skipped, and `.gz` files are decompressed.
+
 ### Query digest stats
 
 After replay/shadow runs, the comparison report includes a per-digest summary:
