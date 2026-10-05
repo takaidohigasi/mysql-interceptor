@@ -697,7 +697,7 @@ func TestStartSession_SlowConnectDoesNotBlock(t *testing.T) {
 	}
 
 	start := time.Now()
-	ss, err := s.StartSession(1, "appdb", "", "")
+	ss, err := s.StartSession(1, "appdb", "", "", nil)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("StartSession returned error: %v", err)
@@ -744,7 +744,7 @@ func TestStartSession_ConnectFailureStopsShadow(t *testing.T) {
 		return nil, errors.New("connection refused")
 	}
 
-	ss, err := s.StartSession(7, "", "", "")
+	ss, err := s.StartSession(7, "", "", "", nil)
 	if err != nil || ss == nil {
 		t.Fatalf("StartSession: ss=%v err=%v", ss, err)
 	}
@@ -763,4 +763,59 @@ func TestStartSession_ConnectFailureStopsShadow(t *testing.T) {
 	}
 
 	ss.Close() // must not panic or hang (no conn was ever established)
+}
+
+// TestStartSession_PropagatesCredentials verifies the per-session override
+// of the shadow target's credentials: a plaintext user carries Password and
+// no stage1; a hashed_password user carries the recovered stage1 hash and an
+// empty Password; and an empty user leaves the configured target_user /
+// target_password untouched.
+func TestStartSession_PropagatesCredentials(t *testing.T) {
+	cases := []struct {
+		name       string
+		user       string
+		password   string
+		stage1     []byte
+		wantUser   string
+		wantPass   string
+		wantStage1 []byte
+	}{
+		{"plaintext user", "alice", "alice-pw", nil, "alice", "alice-pw", nil},
+		{"hashed user", "personal", "", []byte("01234567890123456789"), "personal", "", []byte("01234567890123456789")},
+		{"no override", "", "", nil, "", "", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newConnectTestSender(t)
+			got := make(chan config.BackendConfig, 1)
+			s.connect = func(cfg config.BackendConfig, _ config.BackendSideTLSConfig) (*client.Conn, error) {
+				got <- cfg
+				return nil, errors.New("connect intentionally refused")
+			}
+
+			ss, err := s.StartSession(3, "appdb", tc.user, tc.password, tc.stage1)
+			if err != nil {
+				t.Fatalf("StartSession: %v", err)
+			}
+			if ss == nil {
+				t.Fatal("StartSession returned nil session")
+			}
+			defer ss.Close()
+
+			select {
+			case cfg := <-got:
+				if cfg.User != tc.wantUser {
+					t.Errorf("User = %q, want %q", cfg.User, tc.wantUser)
+				}
+				if cfg.Password != tc.wantPass {
+					t.Errorf("Password = %q, want %q", cfg.Password, tc.wantPass)
+				}
+				if string(cfg.PasswordStage1) != string(tc.wantStage1) {
+					t.Errorf("PasswordStage1 = %q, want %q", cfg.PasswordStage1, tc.wantStage1)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("connect was not invoked")
+			}
+		})
+	}
 }

@@ -7,15 +7,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
+	"github.com/go-mysql-org/go-mysql/mysql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/proxy"
 )
 
 // startInProcessProxy spins up a ProxyServer listening on a free port and
-// forwarding to the configured MYSQL1_ADDR. Returns the proxy's listen
-// address and a cleanup func. Skips if no MySQL is reachable.
+// forwarding to the configured MYSQL1_ADDR, accepting root/rootpass. Returns
+// the proxy's listen address and a cleanup func. Skips if no MySQL is
+// reachable.
 func startInProcessProxy(t *testing.T) (string, func()) {
+	t.Helper()
+	return startInProcessProxyWithUsers(t, []config.UserConfig{
+		{Username: "root", Password: "rootpass"},
+	})
+}
+
+// startInProcessProxyWithUsers is startInProcessProxy with an explicit
+// proxy.users list.
+func startInProcessProxyWithUsers(t *testing.T, users []config.UserConfig) (string, func()) {
 	t.Helper()
 	skipIfNoMySQL(t)
 
@@ -33,9 +45,7 @@ func startInProcessProxy(t *testing.T) (string, func()) {
 		Proxy: config.ProxyConfig{
 			ListenAddr:      addr,
 			ShutdownTimeout: 5 * time.Second,
-			Users: []config.UserConfig{
-				{Username: "root", Password: "rootpass"},
-			},
+			Users:           users,
 		},
 		Backend: config.BackendConfig{
 			Addr: backendAddr,
@@ -148,5 +158,75 @@ func TestProxyGracefulShutdown(t *testing.T) {
 	cleanup()
 	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Errorf("shutdown took too long: %v", elapsed)
+	}
+}
+
+// TestProxyHashedPasswordUserE2E is the ProxySQL-style flow against a real
+// MySQL: the proxy is configured with only the mysql_native_password hash of
+// hashed_user, the client logs in with the plaintext, and the proxy opens
+// the backend connection with the SHA1 stage1 value recovered from the
+// handshake. Queries must flow; a wrong plaintext must be rejected.
+func TestProxyHashedPasswordUserE2E(t *testing.T) {
+	skipIfNoMySQL(t)
+
+	const (
+		user = "hashed_user"
+		pw   = "hashed-pw-1"
+	)
+	backendAddr := getEnvOrDefault("MYSQL1_ADDR", "127.0.0.1:3306")
+
+	// Provision a native-password account on the backend. MySQL 8.0 still
+	// ships the plugin enabled; the CI image is mysql:8.0.
+	root, err := client.Connect(backendAddr, "root", "rootpass", "test_db")
+	if err != nil {
+		t.Fatalf("root connect: %v", err)
+	}
+	defer root.Close()
+	for _, q := range []string{
+		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s'", user, pw),
+		fmt.Sprintf("GRANT SELECT ON test_db.* TO '%s'@'%%'", user),
+	} {
+		if _, err := root.Execute(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = root.Execute(fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", user))
+	})
+
+	// The proxy sees only the stored hash, exactly what
+	// mysql.user.authentication_string holds for this account.
+	hashed := mysql.EncodePasswordHex(mysql.NativePasswordHash([]byte(pw)))
+	proxyAddr, cleanup := startInProcessProxyWithUsers(t, []config.UserConfig{
+		{Username: user, HashedPassword: hashed},
+	})
+	defer cleanup()
+
+	// Correct plaintext: handshake, backend connect via stage1, and a
+	// query through the proxy all succeed.
+	conn, err := client.Connect(proxyAddr, user, pw, "test_db")
+	if err != nil {
+		t.Fatalf("connect through proxy as hashed user: %v", err)
+	}
+	defer conn.Close()
+	res, err := conn.Execute("SELECT id FROM users ORDER BY id")
+	if err != nil {
+		t.Fatalf("query through proxy: %v", err)
+	}
+	if got := len(res.Values); got != 3 {
+		t.Errorf("expected 3 rows from users, got %d", got)
+	}
+	who, err := conn.Execute("SELECT CURRENT_USER()")
+	if err != nil {
+		t.Fatalf("SELECT CURRENT_USER(): %v", err)
+	}
+	if cu, _ := who.GetString(0, 0); cu != user+"@%" {
+		t.Errorf("backend session user = %q, want %q", cu, user+"@%")
+	}
+
+	// Wrong plaintext: rejected at the proxy handshake.
+	if bad, err := client.Connect(proxyAddr, user, "not-the-password", "test_db"); err == nil {
+		bad.Close()
+		t.Error("expected access denied for wrong password, got nil")
 	}
 }

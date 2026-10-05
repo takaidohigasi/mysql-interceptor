@@ -29,4 +29,4 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
 
-replace github.com/go-mysql-org/go-mysql => github.com/takaidohigasi/go-mysql v1.14.1-0.20260504124049-0d8f39fded9a
+replace github.com/go-mysql-org/go-mysql => github.com/takaidohigasi/go-mysql v1.14.1-0.20261005231225-d8b5f1d41d46

@@ -92,10 +92,9 @@ func TestUsersWiring(t *testing.T) {
 	// but are intentionally absent from userPasswords. The "intentionally
 	// absent" part is load-bearing: handleConnection looks up
 	// userPasswords[backendUser] right after the inbound handshake, and
-	// a hashed-only user (no plaintext) needs to surface there as
-	// "missing entry" so we emit the clear error rather than connecting
-	// to backend with an empty password and getting a confusing
-	// access-denied from MySQL.
+	// a hashed-only user (no plaintext) must surface there as "missing
+	// entry" so the outbound connection uses the recovered stage1 hash
+	// rather than an empty password.
 	t.Run("hashed-password users skip userPasswords", func(t *testing.T) {
 		// 41-char form: "*" + 40 hex chars. Same fixture shape as in
 		// config tests; cryptographic content doesn't matter here.
@@ -118,7 +117,7 @@ func TestUsersWiring(t *testing.T) {
 		}
 		// Hashed user: must NOT have a plaintext mirrored, even
 		// blank — handleConnection relies on `ok=false` to take the
-		// clear-error path.
+		// stage1-hash path.
 		if _, ok := srv.userPasswords["personal"]; ok {
 			t.Error("hashed-password user must NOT appear in userPasswords")
 		}

@@ -320,10 +320,22 @@ func runBench() {
 	}
 
 	// The bench connects to both the direct backend and the proxy with
-	// the same credentials. Use the first proxy.users entry — config.Validate
-	// guarantees there is at least one, and the proxy will only accept
-	// clients that authenticate as one of its configured users.
-	benchUser := cfg.Proxy.Users[0]
+	// the same credentials, so it needs a user with a plaintext password:
+	// hashed_password users have none. Use the first such proxy.users
+	// entry; the proxy will only accept clients that authenticate as one
+	// of its configured users.
+	var benchUser config.UserConfig
+	found := false
+	for _, u := range cfg.Proxy.Users {
+		if u.HashedPassword == "" {
+			benchUser = u
+			found = true
+			break
+		}
+	}
+	if !found {
+		fatal("bench needs a proxy.users entry with a plaintext password; all configured users use hashed_password")
+	}
 	directDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",
 		benchUser.Username, benchUser.Password, cfg.Backend.Addr, cfg.Backend.DB)
 	proxyDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s",

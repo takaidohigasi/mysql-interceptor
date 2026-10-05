@@ -64,27 +64,27 @@ type ProxyConfig struct {
 
 // UserConfig describes one user the proxy will accept. Exactly one of
 // Password or HashedPassword must be set per entry — the validator
-// rejects both empty and both set.
+// rejects both set.
 //
 // Password is the plaintext form. When set, it's used both to validate
 // the inbound client handshake AND to authenticate the proxy's outbound
-// connection to the backend (and shadow, when shadow mode is on). This
-// is the canonical pattern: a single source of truth for one user.
+// connection to the backend (and shadow, when shadow mode is on).
 //
 // HashedPassword is MySQL's standard `*XXXX...` 41-character hex form
-// (i.e. the value stored in `mysql.user.authentication_string` for the
-// mysql_native_password plugin: "*" + uppercase hex of SHA1(SHA1(plain))).
-// It exists to support users — typically personal accounts mirrored
-// from another proxy's config — whose plaintext password the
-// interceptor never sees. The handshake-side verification works
-// without the plaintext (see go-mysql-org/go-mysql#1129), so HashedPassword
-// entries can log in. However, the proxy's *outbound* backend
-// connection currently still requires plaintext; a hashed-only user
-// authenticates successfully but the session terminates at backend-
-// connect time with a clear error. Granting hashed-only users true
-// query access is tracked as a follow-up (would need either client-side
-// hash-auth in go-mysql, or a separate per-user `backend_password`
-// override field).
+// (the value in `mysql.user.authentication_string` for the
+// mysql_native_password plugin: "*" + uppercase hex of SHA1(SHA1(plain))),
+// for users whose plaintext the interceptor never sees — the same thing
+// ProxySQL accepts in `mysql_users.password`. The inbound handshake is
+// verified against the hash, and the proxy recovers SHA1(plain) from the
+// client's challenge response (reply XOR SHA1(salt || hash)), which is all
+// a mysql_native_password client needs to answer the backend's challenge.
+// The outbound backend (and shadow) connection is opened with that
+// recovered value, so hashed users forward queries end to end without a
+// plaintext anywhere in the config.
+//
+// Constraints: the backend account must use mysql_native_password with
+// the same hash (MySQL 8.4+ disables that plugin by default), and a
+// hashed user cannot log in with an empty password.
 type UserConfig struct {
 	Username       string `yaml:"username"`
 	Password       string `yaml:"password,omitempty"`
@@ -106,11 +106,17 @@ type BackendConfig struct {
 	// see KeepAliveConfig.
 	KeepAlive KeepAliveConfig `yaml:"keepalive"`
 
-	// User and Password are not yaml-bound: they're set at runtime from
-	// the matched ProxyConfig.Users entry. Kept on this struct so it can
-	// be passed straight to backend.Connect.
-	User     string `yaml:"-"`
-	Password string `yaml:"-"`
+	// User, Password and PasswordStage1 are not yaml-bound: they're set at
+	// runtime from the matched ProxyConfig.Users entry. Kept on this struct
+	// so it can be passed straight to backend.Connect.
+	//
+	// PasswordStage1 is the mysql_native_password stage1 hash
+	// (SHA1(plaintext), 20 bytes) recovered from the inbound handshake of a
+	// hashed_password user. When set, backend.Connect authenticates with it
+	// instead of Password. It is password-equivalent; never log it.
+	User           string `yaml:"-"`
+	Password       string `yaml:"-"`
+	PasswordStage1 []byte `yaml:"-"`
 }
 
 // KeepAliveConfig controls TCP keep-alive on a backend connection. The
