@@ -55,7 +55,7 @@ you didn't achieve.
 
 | Path | Purpose |
 | --- | --- |
-| `cmd/mysql-interceptor/` | Main binary; subcommands `serve`, `replay`, `bench`. |
+| `cmd/mysql-interceptor/` | Main binary; subcommands `serve`, `replay`, `bench`, `report`. |
 | `internal/proxy/` | TCP listener, per-connection lifecycle, MySQL handshake bridging. `server.go` is the entrypoint; `handler.go` implements the go-mysql `server.Handler` for query forwarding + shadow + audit logging. |
 | `internal/backend/` | Backend connection factory (`Connect`) and a small connection pool used by offline replay. |
 | `internal/replay/` | Shadow sender (`shadow.go`, `session.go`) and offline replayer (`offline.go`). Query category classification (`filter.go`) gates what is safe to forward. Checkpoint tracking lives in `checkpoint.go`. |
