@@ -47,6 +47,16 @@ func ConnectWithTimeout(cfg config.BackendConfig, tlsCfg config.BackendSideTLSCo
 		})
 	}
 
+	// Hashed-password users: authenticate with the stage1 hash recovered
+	// from the inbound handshake instead of a plaintext (which we don't
+	// have). cfg.Password is "" in that case and ignored by go-mysql.
+	if len(cfg.PasswordStage1) > 0 {
+		stage1 := cfg.PasswordStage1
+		opts = append(opts, func(c *client.Conn) error {
+			return c.SetNativePasswordStage1(stage1)
+		})
+	}
+
 	dialer := backendDialer(timeout, cfg.KeepAlive)
 	// network "" lets go-mysql pick tcp/unix from the address shape
 	// (getNetProto); keep-alive only applies to TCP and is a no-op for

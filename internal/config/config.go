@@ -62,13 +62,33 @@ type ProxyConfig struct {
 	MaxSessionLifetime time.Duration `yaml:"max_session_lifetime,omitempty"`
 }
 
-// UserConfig describes one user the proxy will accept. The same plaintext
-// password is used both to validate the inbound client handshake and to
-// authenticate the proxy's outbound connection to the backend (and shadow,
-// when shadow mode is on).
+// UserConfig describes one user the proxy will accept. Exactly one of
+// Password or HashedPassword must be set per entry — the validator
+// rejects both set.
+//
+// Password is the plaintext form. When set, it's used both to validate
+// the inbound client handshake AND to authenticate the proxy's outbound
+// connection to the backend (and shadow, when shadow mode is on).
+//
+// HashedPassword is MySQL's standard `*XXXX...` 41-character hex form
+// (the value in `mysql.user.authentication_string` for the
+// mysql_native_password plugin: "*" + uppercase hex of SHA1(SHA1(plain))),
+// for users whose plaintext the interceptor never sees — the same thing
+// ProxySQL accepts in `mysql_users.password`. The inbound handshake is
+// verified against the hash, and the proxy recovers SHA1(plain) from the
+// client's challenge response (reply XOR SHA1(salt || hash)), which is all
+// a mysql_native_password client needs to answer the backend's challenge.
+// The outbound backend (and shadow) connection is opened with that
+// recovered value, so hashed users forward queries end to end without a
+// plaintext anywhere in the config.
+//
+// Constraints: the backend account must use mysql_native_password with
+// the same hash (MySQL 8.4+ disables that plugin by default), and a
+// hashed user cannot log in with an empty password.
 type UserConfig struct {
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password,omitempty"`
+	HashedPassword string `yaml:"hashed_password,omitempty"`
 }
 
 // BackendConfig identifies the backend MySQL server the proxy talks to.
@@ -86,11 +106,17 @@ type BackendConfig struct {
 	// see KeepAliveConfig.
 	KeepAlive KeepAliveConfig `yaml:"keepalive"`
 
-	// User and Password are not yaml-bound: they're set at runtime from
-	// the matched ProxyConfig.Users entry. Kept on this struct so it can
-	// be passed straight to backend.Connect.
-	User     string `yaml:"-"`
-	Password string `yaml:"-"`
+	// User, Password and PasswordStage1 are not yaml-bound: they're set at
+	// runtime from the matched ProxyConfig.Users entry. Kept on this struct
+	// so it can be passed straight to backend.Connect.
+	//
+	// PasswordStage1 is the mysql_native_password stage1 hash
+	// (SHA1(plaintext), 20 bytes) recovered from the inbound handshake of a
+	// hashed_password user. When set, backend.Connect authenticates with it
+	// instead of Password. It is password-equivalent; never log it.
+	User           string `yaml:"-"`
+	Password       string `yaml:"-"`
+	PasswordStage1 []byte `yaml:"-"`
 }
 
 // KeepAliveConfig controls TCP keep-alive on a backend connection. The
@@ -515,6 +541,32 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("proxy.users[%d].username %q is duplicated", i, u.Username)
 		}
 		seen[u.Username] = true
+		// Exactly one of password / hashed_password must be set.
+		// Empty plaintext password is meaningful (MySQL allows empty
+		// passwords), so we distinguish "field absent" from "field
+		// present and empty" via the HashedPassword being non-empty.
+		// HashedPassword takes precedence when set; if neither is set
+		// the entry is rejected because the auth handler would have
+		// nothing to register the user with.
+		switch {
+		case u.Password != "" && u.HashedPassword != "":
+			return fmt.Errorf("proxy.users[%d] %q: set exactly one of password or hashed_password, not both", i, u.Username)
+		case u.HashedPassword != "":
+			// MySQL's mysql_native_password stored form is "*" followed
+			// by 40 uppercase hex chars (SHA1(SHA1(plain)) → 20 bytes →
+			// 40 hex chars, prefixed). Validate shape here so a typo
+			// fails at config load rather than at first login attempt.
+			if err := validateHashedPasswordShape(u.HashedPassword); err != nil {
+				return fmt.Errorf("proxy.users[%d] %q: %w", i, u.Username, err)
+			}
+		default:
+			// u.Password == "" && u.HashedPassword == "" — allowed
+			// for the "empty password" edge case; AddUser will register
+			// the user as accepting an empty password. Operators who
+			// don't want this should either set a Password or remove
+			// the user. We don't reject the case here because we'd
+			// break the existing semantics of UserConfig{Password: ""}.
+		}
 	}
 	switch c.Replay.Mode {
 	case "disabled", "shadow", "offline":
@@ -559,4 +611,39 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// validateHashedPasswordShape checks that s is in MySQL's standard
+// mysql_native_password stored form: a leading "*" followed by exactly
+// 40 hex digits (uppercase or lowercase). This is just a shape check —
+// cryptographic validity is verified on the first login by go-mysql.
+// Fail-fast at config load so a typo (missing leading "*", wrong
+// length, paste error mixing in surrounding chars) doesn't only
+// surface when a user tries to log in hours later.
+func validateHashedPasswordShape(s string) error {
+	if len(s) == 0 {
+		return fmt.Errorf("hashed_password is empty")
+	}
+	if s[0] != '*' {
+		return fmt.Errorf("hashed_password must start with '*' (MySQL mysql_native_password form: \"*XXXXXXXX...\", 41 chars total), got %q", firstN(s, 4))
+	}
+	if len(s) != 41 {
+		return fmt.Errorf("hashed_password must be exactly 41 chars (\"*\" + 40 hex digits), got %d", len(s))
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		// De Morgan'd form of "not hex"; checked positively to keep
+		// staticcheck (QF1001) quiet.
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return fmt.Errorf("hashed_password contains non-hex char %q at position %d", c, i)
+		}
+	}
+	return nil
+}
+
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

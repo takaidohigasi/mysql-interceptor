@@ -279,7 +279,12 @@ func (s *ShadowSender) runPeriodicSummary(interval time.Duration) {
 // This is used in multi-user proxy mode so the shadow connection mirrors
 // the same identity the primary session used, preserving per-user GRANTs
 // on the shadow target.
-func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password string) (*ShadowSession, error) {
+//
+// password is the plaintext for proxy.users[].password entries; for
+// hashed_password users it is "" and stage1 carries the mysql_native_password
+// SHA1(plaintext) recovered from the inbound handshake instead (see
+// config.BackendConfig.PasswordStage1).
+func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password string, stage1 []byte) (*ShadowSession, error) {
 	if s.closed.Load() {
 		return nil, fmt.Errorf("shadow sender is closed")
 	}
@@ -291,6 +296,7 @@ func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password 
 	if user != "" {
 		backendCfg.User = user
 		backendCfg.Password = password
+		backendCfg.PasswordStage1 = stage1
 	}
 
 	ctx, cancel := context.WithCancel(s.ctx)

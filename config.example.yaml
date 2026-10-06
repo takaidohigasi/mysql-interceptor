@@ -19,6 +19,20 @@ proxy:
       password: "app_pw"
     # - username: "ro_user"
     #   password: "ro_pw"
+    #
+    # Alternative: hashed_password for users whose plaintext is not
+    # available — e.g. accounts copied from `mysql.user` or from a
+    # ProxySQL `mysql_users` table, which store only the MySQL
+    # `*XXXX...` mysql_native_password hash. Works like ProxySQL: the
+    # inbound handshake is checked against the hash, and the SHA1
+    # stage1 value recovered from the client's reply is used to open
+    # the outbound backend (and shadow) connection, so queries forward
+    # end to end without a plaintext anywhere. Requires the backend
+    # account to use mysql_native_password with the same hash (MySQL
+    # 8.4+ disables that plugin by default). Not available for
+    # caching_sha2_password accounts.
+    # - username: "personal_alice"
+    #   hashed_password: "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC"
   # Optional cap on session lifetime — useful for forcing periodic
   # reconnects so existing sessions rebalance onto new backends after
   # autoscaling. After the cap (with ±10% per-session jitter) elapses,

@@ -30,9 +30,11 @@ type ProxyServer struct {
 	shadowSender *replay.ShadowSender
 
 	// authHandler validates the inbound MySQL handshake against
-	// cfg.Proxy.Users. The same map keys are mirrored in userPasswords
-	// so we can recover the plaintext password after the handshake and
-	// use it to authenticate the session's outbound backend connection.
+	// cfg.Proxy.Users. Plaintext-configured users are mirrored in
+	// userPasswords so we can authenticate the session's outbound backend
+	// connection with the same password. hashed_password users are absent
+	// from the map: for them the outbound connection uses the stage1 hash
+	// go-mysql recovered during the handshake (Conn.NativePasswordStage1).
 	authHandler   *server.InMemoryAuthenticationHandler
 	userPasswords map[string]string
 
@@ -101,13 +103,44 @@ func NewProxyServer(cfg *config.Config, logger *logging.Logger, shadowSender *re
 		return nil, fmt.Errorf("proxy.users must contain at least one entry")
 	}
 	ah := server.NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
+	// Two registration paths:
+	//   * Password set       → AddUser(plaintext). Plaintext also goes
+	//     into userPasswords so handleConnection can authenticate
+	//     outbound to the backend.
+	//   * HashedPassword set → AddUserWithHashedPassword(20-byte hash).
+	//     We do NOT have a plaintext, so userPasswords stays empty for
+	//     this user; handleConnection takes the stage1 hash recovered
+	//     from the inbound handshake for the outbound connection instead.
+	// config.Validate has already rejected entries with both fields set,
+	// so the switch below is exhaustive.
 	passwords := make(map[string]string, len(cfg.Proxy.Users))
 	for _, u := range cfg.Proxy.Users {
-		if err := ah.AddUser(u.Username, u.Password); err != nil {
-			cancel()
-			return nil, fmt.Errorf("adding user %q: %w", u.Username, err)
+		switch {
+		case u.HashedPassword != "":
+			// MySQL's "*XXXXXXXX..." 41-char stored form → raw 20-byte
+			// SHA1(SHA1(plaintext)). DecodePasswordHex strips the "*"
+			// and decodes the hex. Validate.HashedPasswordShape has
+			// already shape-checked, but DecodePasswordHex is still the
+			// canonical decoder and surfaces any unexpected error.
+			raw, err := mysql.DecodePasswordHex(u.HashedPassword)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("decoding hashed_password for user %q: %w", u.Username, err)
+			}
+			if err := ah.AddUserWithHashedPassword(u.Username, raw); err != nil {
+				cancel()
+				return nil, fmt.Errorf("adding hashed-password user %q: %w", u.Username, err)
+			}
+			// Intentionally NOT setting passwords[u.Username] — there
+			// is no plaintext to mirror; the absence is what tells
+			// handleConnection to use the recovered stage1 hash.
+		default:
+			if err := ah.AddUser(u.Username, u.Password); err != nil {
+				cancel()
+				return nil, fmt.Errorf("adding user %q: %w", u.Username, err)
+			}
+			passwords[u.Username] = u.Password
 		}
-		passwords[u.Username] = u.Password
 	}
 	ps.authHandler = ah
 	ps.userPasswords = passwords
@@ -238,12 +271,22 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	}
 	backendUser := serverConn.GetUser()
 	backendPass, ok := ps.userPasswords[backendUser]
+	// For hashed_password users there is no plaintext; go-mysql recovered
+	// SHA1(plaintext) from the client's mysql_native_password reply during
+	// the handshake, and that is enough to authenticate outbound (the
+	// ProxySQL approach). It is password-equivalent: never log it.
+	var backendStage1 []byte
 	if !ok {
-		// Should not happen: authHandler approved a user we don't have a
-		// plaintext password for. Fail loudly so the missing entry gets
-		// noticed instead of silently falling back.
-		sessionLog.Error("authenticated user has no backend password mapping", "user", backendUser)
-		return
+		backendStage1 = serverConn.NativePasswordStage1()
+		if backendStage1 == nil {
+			// Not expected: a hashed_password user can only pass the
+			// handshake via a mysql_native_password match, which always
+			// yields the stage1 hash. Fail loudly rather than connecting
+			// to the backend with an empty password.
+			sessionLog.Error("authenticated user has neither a configured password nor a recoverable native-password hash for the backend connection",
+				"user", backendUser)
+			return
+		}
 	}
 
 	handler.user = backendUser
@@ -251,6 +294,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	backendCfg := ps.cfg.Backend
 	backendCfg.User = backendUser
 	backendCfg.Password = backendPass
+	backendCfg.PasswordStage1 = backendStage1
 	// If the client sent CONNECT_WITH_DB during the handshake,
 	// ProxyHandler.UseDB has already recorded it in handler.currentDB.
 	// Override the configured default so the backend connection comes up
@@ -271,7 +315,7 @@ func (ps *ProxyServer) handleConnection(sessionID uint64, conn net.Conn) {
 	// so per-user GRANTs apply consistently.
 	var shadowSession *replay.ShadowSession
 	if ps.shadowSender != nil {
-		ss, sErr := ps.shadowSender.StartSession(sessionID, backendConn.GetDB(), backendUser, backendPass)
+		ss, sErr := ps.shadowSender.StartSession(sessionID, backendConn.GetDB(), backendUser, backendPass, backendStage1)
 		if sErr != nil {
 			sessionLog.Warn("shadow session start failed; continuing without shadow for this session",
 				"err", sErr)

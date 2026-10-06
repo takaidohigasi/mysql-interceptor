@@ -128,6 +128,39 @@ proxy:
       password: "${MYSQL_REPLICATION_PASSWORD}"
 ```
 
+### Hashed passwords (no plaintext in the config)
+
+An entry may carry `hashed_password` instead of `password`: the MySQL
+`mysql_native_password` stored hash (`*` + 40 hex chars), the same value
+ProxySQL accepts in `mysql_users.password`. This lets you mirror accounts
+whose plaintext you do not have, straight from the backend:
+
+```sql
+SELECT user, authentication_string FROM mysql.user
+ WHERE plugin = 'mysql_native_password';
+-- or compute one:
+SELECT CONCAT('*', UPPER(SHA1(UNHEX(SHA1('the-password')))));
+```
+
+```yaml
+proxy:
+  users:
+    - username: "personal_alice"
+      hashed_password: "*4DF1D66463C18D44E3B001A8FB1BBFBEA13E27FC"
+```
+
+It works end to end the way ProxySQL does: the client's handshake reply is
+verified against the hash, and the `SHA1(password)` value recovered from
+that reply is used to authenticate the outbound backend (and shadow)
+connection. Constraints:
+
+- The backend account must use `mysql_native_password` with the same hash.
+  MySQL 8.0 has the plugin enabled; 8.4+ disables it by default
+  (`--mysql-native-password=ON`), and `caching_sha2_password` accounts
+  cannot be mirrored this way.
+- A hashed user cannot log in with an empty password.
+- `bench` needs a user with a plaintext `password`.
+
 ### Session lifetime cap (autoscale rebalance)
 
 The proxy keeps one dedicated backend connection per client session for
