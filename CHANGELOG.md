@@ -7,6 +7,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.16"></a>
+## v0.0.16
+
+_Released 2026-10-06._
+
+`proxy.users` entries can hold a `mysql_native_password` hash instead of
+the plaintext, the way ProxySQL's `mysql_users.password` does, so
+accounts whose plaintext the proxy never sees can log in and run queries
+end to end.
+
+### Added
+
+- **`hashed_password` for `proxy.users`** (`internal/config/config.go`,
+  `internal/proxy/server.go`, `internal/backend/conn.go`,
+  `internal/replay/shadow.go`). An entry carries either `password` or
+  `hashed_password` (`*` + 40 hex, i.e. `*` + SHA1(SHA1(plaintext)), the
+  value in `mysql.user.authentication_string` for `mysql_native_password`);
+  exactly one of the two is required and the shape is checked at load
+  time. The inbound handshake reply is verified against the hash, the
+  `SHA1(plaintext)` stage1 value is recovered from that reply, and it is
+  used to authenticate the outbound backend and shadow connections, so
+  per-user GRANTs apply on both targets without a plaintext anywhere.
+  Requires the backend account to use `mysql_native_password` with the
+  same hash (MySQL 8.4+ disables the plugin by default);
+  `caching_sha2_password` accounts cannot be mirrored this way, and a
+  hashed user cannot log in with an empty password. `bench` keeps needing
+  a user with a plaintext `password`. Implemented on the go-mysql fork
+  `takaidohigasi/go-mysql` branch `feat/native-stage1-passthrough`
+  (`replace` in `go.mod`), which adds `AddUserWithHashedPassword`,
+  `server.Conn.NativePasswordStage1` and
+  `client.Conn.SetNativePasswordStage1`. (#29)
+
+### Changed
+
+- **Releases are cut from `VERSION`** (`.github/workflows/tag-release.yml`,
+  `.github/workflows/release.yml`). A release PR bumps `VERSION` together
+  with the matching `CHANGELOG.md` section; on merge to `main` the tag is
+  created at the merge commit and the release workflow runs. Pushing a
+  `v*` tag by hand still works. (#46)
+
 <a id="v0.0.15"></a>
 ## v0.0.15
 
