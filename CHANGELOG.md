@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.15"></a>
+## v0.0.15
+
+_Released 2026-10-06._
+
+`mysql-interceptor report` no longer leaks literals through computed
+column names when values are hidden.
+
+### Fixed
+
+- **Expression column names are normalized in the hidden view**
+  (`internal/compare/report_view.go`). A computed column is named after
+  its expression, so a diff on `SELECT EXISTS (... WHERE id = 'x')`
+  printed the expression, literals included, in the `DIFFERENCES` and
+  `COLUMNS` output even without `--show-values`. Without
+  `--show-values` the column name is now normalized with `Digest`, like
+  the query digest. Literals become `?` and whitespace collapses. Plain
+  column names are unchanged, and `--show-values` keeps the original.
+  (#44)
+
 <a id="v0.0.14"></a>
 ## v0.0.14
 
