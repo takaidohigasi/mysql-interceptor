@@ -503,7 +503,7 @@ GitHub Actions runs on every push/PR:
 - **Integration tests** - 2 MySQL service containers with divergent schemas, including proxy round-trip and prepared-statement tests
 - **Docker build** - verifies the container image builds correctly
 
-On tag push (`v*`), the release workflow runs GoReleaser to build multi-platform binaries and a Docker image, then runs the benchmark against a fresh MySQL and appends the latency table to the GitHub Release body.
+Releases are cut from `VERSION`. A release PR bumps `VERSION` (e.g. `v0.0.16`) and adds the matching `<a id="v0.0.16"></a>` section to `CHANGELOG.md`. When it merges, the tag-release workflow creates the tag and calls the release workflow. That workflow runs GoReleaser to build multi-platform binaries and a Docker image, then runs the benchmark against a fresh MySQL and appends the latency table to the GitHub Release body. Pushing a `v*` tag by hand still runs the release workflow too.
 
 ## License
 
