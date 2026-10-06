@@ -39,6 +39,30 @@ func TestReadReport_HidesValuesByDefault(t *testing.T) {
 	}
 }
 
+func TestReadReport_NormalizesExpressionColumns(t *testing.T) {
+	line := `{"query":"SELECT EXISTS (SELECT 1 FROM t WHERE id = 'm123')","query_digest":"select exists ( select ? from t where id = ? )","session_id":1,"timestamp":"2026-10-05T00:00:00Z","match":false,"differences":[{"type":"cell_value","row":0,"column":"EXISTS (\n  SELECT 1 FROM t WHERE id = 'm123'\n)","original":"1","replay":"0"},{"type":"cell_value","row":0,"column":"status","original":"a","replay":"b"}],"original_time_ms":1,"replay_time_ms":1,"time_diff_ms":0,"time_diff_exceeded":false}
+`
+	records, _, err := ReadReport(strings.NewReader(line), ReportViewOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := records[0].Differences
+	if strings.Contains(got[0].Column, "m123") || strings.Contains(got[0].Column, "\n") {
+		t.Errorf("expression column leaks literals: %q", got[0].Column)
+	}
+	if got[1].Column != "status" {
+		t.Errorf("plain column changed: %q", got[1].Column)
+	}
+
+	shown, _, err := ReadReport(strings.NewReader(line), ReportViewOptions{ShowValues: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(shown[0].Differences[0].Column, "m123") {
+		t.Errorf("--show-values should keep the original column name: %q", shown[0].Differences[0].Column)
+	}
+}
+
 func TestReadReport_ShowValuesAndFilters(t *testing.T) {
 	records, _, err := ReadReport(strings.NewReader(reportFixture), ReportViewOptions{
 		ShowValues: true,
