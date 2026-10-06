@@ -103,6 +103,10 @@ func ReadReport(r io.Reader, opts ReportViewOptions) (records []CompareResult, s
 			for i := range rec.Differences {
 				rec.Differences[i].Original = hiddenValue
 				rec.Differences[i].Replay = hiddenValue
+				// A computed column is named after its expression, so the
+				// name can carry literals (e.g. EXISTS (... WHERE id = 'x')).
+				// Normalize it the same way as the query digest.
+				rec.Differences[i].Column = Digest(rec.Differences[i].Column)
 			}
 		}
 		records = append(records, rec)
