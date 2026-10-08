@@ -7,6 +7,60 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.17"></a>
+## v0.0.17
+
+_Released 2026-10-09._
+
+Shadow diffs caused by the shadow target lagging behind the primary can be
+re-verified before they are reported, and `comparison.ignore_queries`
+patterns now match multi-line queries and the query digest.
+
+### Added
+
+- **`comparison.retry`** (`internal/config/config.go`,
+  `internal/replay/session.go`, `internal/replay/shadow.go`,
+  `internal/compare/`, `internal/metrics/metrics.go`). A non-ignored diff
+  on a `SELECT` is held back and the query is executed again after
+  `delay`; if the result then matches, the comparison is recorded as
+  matched and resolved by retry, otherwise it is retried up to
+  `max_attempts` times and reported once as a diff with the retry count.
+  `max_attempts: 0` (the default) disables it; `max_attempts` is limited to
+  0-10 and `delay` (default `2s`) to at most `5m`. Two modes:
+  - `mode: shadow` (default) re-executes only the shadow, on the session's
+    own shadow connection, and compares against the primary's original
+    result. No extra load on the primary; a row the primary changed in
+    between stays a diff.
+  - `mode: both` also re-executes the primary, over a per-session
+    verification connection opened lazily with the session's credentials,
+    and compares the two fresh results. Sessions that ran `SET ...` or
+    created temporary tables fall back to `shadow`, as does an attempt
+    whose verification connect or primary re-execution fails.
+
+  Only `SELECT`s are retried, in shadow replay only (offline replay is
+  unchanged). Server-side SQL errors on the shadow go through the retry
+  path; transport errors are reported as-is. Pending retries are settled
+  at session teardown, and at most 64 are parked per session. Report
+  records carry `retries`, `resolved_by_retry` and `retry_mode` (resolved
+  records are written even without `log_matches`); the heartbeat gains
+  `window_resolved_by_retry`, the digest summary a `Retry` column, and the
+  metrics `comparisons_resolved_by_retry` (a subset of
+  `comparisons_matched`) and `shadow_retry_primary_queries`. (#49)
+
+### Changed
+
+- **`comparison.ignore_queries` matches across newlines and against the
+  query digest** (`internal/compare/engine.go`,
+  `internal/config/config.go`). Patterns are compiled with `(?is)`, so
+  `.` also matches a newline, and each pattern is tried against both the
+  raw SQL and its digest (comments stripped, whitespace runs collapsed to
+  one space, lower-cased, literals replaced with `?`, as printed in the
+  periodic digest summary). A pattern written for a one-line query now
+  matches the pretty-printed form some clients send, and a digest line
+  copied from the summary works as a pattern once `( ) ? * .` are
+  escaped. This only broadens what a pattern ignores; existing patterns
+  keep matching. (#48)
+
 <a id="v0.0.16"></a>
 ## v0.0.16
 
