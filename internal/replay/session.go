@@ -9,7 +9,9 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/client"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/takaidohigasi/mysql-interceptor/internal/backend"
 	"github.com/takaidohigasi/mysql-interceptor/internal/compare"
+	"github.com/takaidohigasi/mysql-interceptor/internal/config"
 	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
 )
 
@@ -44,11 +46,54 @@ type ShadowSession struct {
 	// comparison report surfaces the error divergence).
 	tempTables map[string]struct{}
 
+	// pendingRetries holds diverging queries waiting to be re-executed
+	// (comparison.retry), in due-time order. Owned by the run goroutine.
+	// retryTimer fires when pendingRetries[0] is due; nil when empty.
+	pendingRetries []pendingRetry
+	retryTimer     *time.Timer
+
+	// primaryCfg is set when comparison.retry.mode is "both": the primary
+	// backend with this session's credentials. primaryConn is the
+	// verification connection opened lazily from it by the run goroutine
+	// on the first retry that needs it; primaryConnFailed remembers a
+	// failed connect so it is attempted once per session.
+	primaryCfg        *config.BackendConfig
+	primaryConn       *client.Conn
+	primaryConnFailed bool
+
+	// sessionStateTouched is set (from the Send goroutine) once the
+	// session ran a session-state statement such as SET; tempTableCount
+	// mirrors len(tempTables) for the run goroutine. Either makes the
+	// primary verification connection unable to reproduce the session,
+	// so retries fall back to re-executing on the shadow only.
+	sessionStateTouched atomic.Bool
+	tempTableCount      atomic.Int64
+
+	// connBroken is set once the shadow connection has been closed
+	// because of a transport error or query timeout. Pending retries are
+	// then settled from their last result instead of being re-executed
+	// on a dead connection.
+	connBroken bool
+
 	closed atomic.Bool
 	done   chan struct{}
 	ctx    context.Context
 	cancel context.CancelFunc
 }
+
+// pendingRetry is a diverging query parked until its re-execution is due.
+type pendingRetry struct {
+	sq  ShadowQuery
+	due time.Time
+	// lastReplay is the shadow result of the most recent execution, kept
+	// so the diff can still be reported if the session ends before the
+	// retry runs.
+	lastReplay *compare.CapturedResult
+}
+
+// maxPendingRetriesPerSession bounds the memory held by parked results:
+// beyond this many outstanding retries a new diff is reported at once.
+const maxPendingRetriesPerSession = 64
 
 // Send applies the session-level filter — which includes the sender's
 // global gates (enabled/sample/CIDR) plus a session-aware category
@@ -135,7 +180,10 @@ func (ss *ShadowSession) passesCategoryCheck(query string) bool {
 				case startsWithKeyword(query, "DROP"):
 					delete(ss.tempTables, name)
 				}
+				ss.tempTableCount.Store(int64(len(ss.tempTables)))
 			}
+		case CategorySessionState:
+			ss.sessionStateTouched.Store(true)
 		}
 		return true
 	}
@@ -154,6 +202,7 @@ func (ss *ShadowSession) passesCategoryCheck(query string) bool {
 			// tracking entry.
 			if startsWithKeyword(query, "DROP") {
 				delete(ss.tempTables, name)
+				ss.tempTableCount.Store(int64(len(ss.tempTables)))
 			}
 			return true
 		}
@@ -189,13 +238,190 @@ func (ss *ShadowSession) run() {
 	reporter := ss.sender.reporter
 
 	for {
+		// Nil channel when nothing is parked: the select never picks it.
+		var retryC <-chan time.Time
+		if ss.retryTimer != nil {
+			retryC = ss.retryTimer.C
+		}
 		select {
 		case <-ss.ctx.Done():
 			ss.drainOnShutdown(engine, reporter)
 			return
 		case sq := <-ss.queryCh:
 			ss.processQuery(sq, engine, reporter)
+		case <-retryC:
+			ss.runDueRetries(engine, reporter)
 		}
+	}
+}
+
+// canRetry reports whether a diverging execution of sq should be parked
+// for re-execution instead of being reported now. Only SELECTs qualify:
+// re-running session-state, transaction or temp-table statements would
+// change the shadow session, and DML never reaches the shadow anyway.
+func (ss *ShadowSession) canRetry(sq ShadowQuery) bool {
+	if ss.sender.retryAttempts <= 0 || sq.retryAttempt >= ss.sender.retryAttempts {
+		return false
+	}
+	if ss.connBroken || ss.ctx.Err() != nil {
+		return false
+	}
+	if len(ss.pendingRetries) >= maxPendingRetriesPerSession {
+		slog.Debug("shadow: retry queue full, reporting diff without retry",
+			"session_id", ss.sessionID, "pending", len(ss.pendingRetries))
+		return false
+	}
+	return Classify(sq.Query) == CategorySelect
+}
+
+// scheduleRetry parks sq for re-execution after the configured delay.
+// Entries are appended in arrival order; because every entry uses the
+// same delay the slice stays sorted by due time, so the timer only ever
+// needs to track the head.
+func (ss *ShadowSession) scheduleRetry(sq ShadowQuery, lastReplay *compare.CapturedResult) {
+	sq.retryAttempt++
+	ss.pendingRetries = append(ss.pendingRetries, pendingRetry{
+		sq:         sq,
+		due:        time.Now().Add(ss.sender.retryDelay),
+		lastReplay: lastReplay,
+	})
+	if ss.retryTimer == nil {
+		ss.retryTimer = time.NewTimer(ss.sender.retryDelay)
+	}
+}
+
+// runDueRetries re-executes every parked query whose delay has elapsed
+// and re-arms the timer for the next one, if any.
+func (ss *ShadowSession) runDueRetries(engine *compare.Engine, reporter *compare.Reporter) {
+	// The timer that brought us here (if any) is spent; re-armed below
+	// when something is still parked.
+	if ss.retryTimer != nil {
+		ss.retryTimer.Stop()
+		ss.retryTimer = nil
+	}
+	now := time.Now()
+	for len(ss.pendingRetries) > 0 && !ss.pendingRetries[0].due.After(now) {
+		pr := ss.pendingRetries[0]
+		ss.pendingRetries[0] = pendingRetry{} // release the parked results
+		ss.pendingRetries = ss.pendingRetries[1:]
+		ss.reexecute(pr.sq, engine, reporter)
+	}
+	if len(ss.pendingRetries) == 0 {
+		ss.pendingRetries = nil
+		return
+	}
+	ss.retryTimer = time.NewTimer(time.Until(ss.pendingRetries[0].due))
+}
+
+// settlePendingRetries is called on teardown. Parked queries are
+// re-executed immediately (their delay may not have elapsed, so a
+// still-lagging shadow is reported as a diff — the conservative
+// outcome) while the connection is usable; once it is broken they are
+// reported from the result of their last execution.
+func (ss *ShadowSession) settlePendingRetries(engine *compare.Engine, reporter *compare.Reporter) {
+	pending := ss.pendingRetries
+	ss.pendingRetries = nil
+	if ss.retryTimer != nil {
+		ss.retryTimer.Stop()
+		ss.retryTimer = nil
+	}
+	for _, pr := range pending {
+		if ss.connBroken {
+			ss.reportComparison(pr.sq, pr.lastReplay, engine, reporter)
+			continue
+		}
+		ss.reexecute(pr.sq, engine, reporter)
+	}
+}
+
+// reexecute runs one parked retry. In mode "both" the query is first
+// re-executed on the primary verification connection and the fresh
+// primary result replaces sq.OrigResult, so the following shadow
+// execution compares two results taken at the same time; if the
+// primary side cannot be used (no connection, session state the
+// verification connection cannot reproduce, execution failure) the
+// retry degrades to the "shadow" mode for this attempt.
+func (ss *ShadowSession) reexecute(sq ShadowQuery, engine *compare.Engine, reporter *compare.Reporter) {
+	sq.retryMode = "shadow"
+	if ss.canReexecuteOnPrimary() {
+		if fresh := ss.executeOnPrimary(sq); fresh != nil {
+			sq.OrigResult = fresh
+			sq.retryMode = "both"
+		}
+	}
+	ss.processQuery(sq, engine, reporter)
+}
+
+// canReexecuteOnPrimary reports whether this retry may re-run the query
+// on the primary: mode "both" is configured, the session has not changed
+// session state or created temp tables (the verification connection has
+// neither), and a previous connect attempt did not fail.
+func (ss *ShadowSession) canReexecuteOnPrimary() bool {
+	return ss.primaryCfg != nil && !ss.primaryConnFailed &&
+		!ss.sessionStateTouched.Load() && ss.tempTableCount.Load() == 0
+}
+
+// executeOnPrimary runs sq on the primary verification connection,
+// opening it on first use, and returns the captured result or nil when
+// the connection could not be opened, the query failed, or it exceeded
+// the per-query timeout (the connection is then dropped and reopened on
+// the next retry).
+func (ss *ShadowSession) executeOnPrimary(sq ShadowQuery) *compare.CapturedResult {
+	if ss.primaryConn == nil {
+		conn, err := ss.sender.connectPrimary(*ss.primaryCfg, ss.sender.primaryTLS)
+		if err != nil {
+			slog.Info("shadow: primary verification connect failed; retries fall back to shadow-only for this session",
+				"session_id", ss.sessionID, "err", err)
+			ss.primaryConnFailed = true
+			return nil
+		}
+		ss.primaryConn = conn
+	}
+	if sq.Database != "" && sq.Database != ss.primaryConn.GetDB() {
+		if _, err := ss.primaryConn.Execute("USE `" + sq.Database + "`"); err != nil {
+			slog.Debug("shadow: primary verification USE failed", "session_id", ss.sessionID, "db", sq.Database, "err", err)
+			return nil
+		}
+	}
+
+	timeout := ss.sender.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	done := make(chan execResult, 1)
+	conn := ss.primaryConn
+	go func() {
+		r, e := ss.execFn(conn, sq.Query, sq.Args...)
+		done <- execResult{r, e}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		metrics.Global.ShadowRetryPrimaryQueries.Add(1)
+		if res.err != nil {
+			slog.Debug("shadow: primary verification query failed", "session_id", ss.sessionID, "err", res.err)
+			if isTransportError(res.err) {
+				ss.closePrimaryConn()
+			}
+			return nil
+		}
+		return res.result
+	case <-timer.C:
+		slog.Warn("shadow: primary verification query timed out; dropping the verification connection",
+			"session_id", ss.sessionID, "timeout", timeout)
+		// Closing the connection makes the in-flight Execute return.
+		ss.closePrimaryConn()
+		return nil
+	}
+}
+
+// closePrimaryConn releases the primary verification connection, if any.
+// A later retry reopens it.
+func (ss *ShadowSession) closePrimaryConn() {
+	if ss.primaryConn != nil {
+		backend.Quit(ss.primaryConn)
+		ss.primaryConn = nil
 	}
 }
 
@@ -218,6 +444,7 @@ func (ss *ShadowSession) drainOnShutdown(engine *compare.Engine, reporter *compa
 		case sq := <-ss.queryCh:
 			ss.processQuery(sq, engine, reporter)
 		default:
+			ss.settlePendingRetries(engine, reporter)
 			return
 		}
 	}
@@ -271,6 +498,7 @@ func (ss *ShadowSession) processQuery(sq ShadowQuery, engine *compare.Engine, re
 			"session_id", ss.sessionID, "timeout", timeout, "query", sq.Query)
 		ss.abortInFlightExec(done)
 		ss.conn.Close()
+		ss.connBroken = true
 		metrics.Global.ShadowDropped.Add(1)
 		ss.cancel()
 	case <-ss.ctx.Done():
@@ -312,14 +540,21 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 		// kouzoh/microservices#29641 post-mortem); a guard against
 		// res.result == nil is kept for defensiveness in case a
 		// future ExecuteAndCapture variant returns a nil captured.
+		transport := isTransportError(res.err)
 		if sq.OrigResult != nil {
 			replayRes := res.result
 			if replayRes == nil {
 				replayRes = &compare.CapturedResult{Error: res.err.Error()}
 			}
-			cmpResult := engine.Compare(sq.OrigResult, replayRes, sq.Query, sq.User, sq.SessionID)
-			reporter.Record(cmpResult)
-			compare.ReleaseCompareResult(cmpResult)
+			// A server-side SQL error (e.g. a table that the changefeed
+			// has not created yet) may be lag too, so it goes through
+			// the retry path; a transport error means the connection
+			// is about to be torn down, so report it as-is.
+			if transport {
+				ss.reportComparison(sq, replayRes, engine, reporter)
+			} else {
+				ss.compareOrRetry(sq, replayRes, engine, reporter)
+			}
 		}
 		// Transport-level errors poison go-mysql's *client.Conn: once
 		// the underlying net.Conn returns "i/o timeout" or "connection
@@ -329,20 +564,52 @@ func (ss *ShadowSession) recordResult(sq ShadowQuery, res execResult, engine *co
 		// Server-returned SQL errors arrive as *mysql.MyError and
 		// don't break the connection, so we keep the session alive
 		// for those (see isTransportError).
-		if isTransportError(res.err) {
+		if transport {
 			slog.Info("shadow: transport error, tearing down session",
 				"session_id", ss.sessionID, "err", res.err)
 			ss.conn.Close()
+			ss.connBroken = true
 			ss.cancel()
 		}
 		return
 	}
 	metrics.Global.ShadowQueriesReplayed.Add(1)
 	if sq.OrigResult != nil {
-		cmpResult := engine.Compare(sq.OrigResult, res.result, sq.Query, sq.User, sq.SessionID)
-		reporter.Record(cmpResult)
-		compare.ReleaseCompareResult(cmpResult)
+		ss.compareOrRetry(sq, res.result, engine, reporter)
 	}
+}
+
+// compareOrRetry compares the shadow result with the primary's original
+// result. A non-ignored divergence on a retryable query is parked for
+// re-execution (comparison.retry) instead of being reported now; every
+// other outcome is recorded immediately.
+func (ss *ShadowSession) compareOrRetry(sq ShadowQuery, replay *compare.CapturedResult, engine *compare.Engine, reporter *compare.Reporter) {
+	cmpResult := engine.Compare(sq.OrigResult, replay, sq.Query, sq.User, sq.SessionID)
+	if !cmpResult.Match && !cmpResult.Ignored && ss.canRetry(sq) {
+		compare.ReleaseCompareResult(cmpResult)
+		ss.scheduleRetry(sq, replay)
+		return
+	}
+	ss.recordComparison(sq, cmpResult, reporter)
+}
+
+// reportComparison records the comparison of sq against replay without
+// considering a retry. Used for transport errors and for parked queries
+// settled at teardown.
+func (ss *ShadowSession) reportComparison(sq ShadowQuery, replay *compare.CapturedResult, engine *compare.Engine, reporter *compare.Reporter) {
+	ss.recordComparison(sq, engine.Compare(sq.OrigResult, replay, sq.Query, sq.User, sq.SessionID), reporter)
+}
+
+// recordComparison stamps the retry bookkeeping on cmpResult, records it
+// and releases it to the pool.
+func (ss *ShadowSession) recordComparison(sq ShadowQuery, cmpResult *compare.CompareResult, reporter *compare.Reporter) {
+	if sq.retryAttempt > 0 {
+		cmpResult.Retries = sq.retryAttempt
+		cmpResult.ResolvedByRetry = cmpResult.Match && !cmpResult.Ignored
+		cmpResult.RetryMode = sq.retryMode
+	}
+	reporter.Record(cmpResult)
+	compare.ReleaseCompareResult(cmpResult)
 }
 
 // execResult carries the (result, err) pair from the per-query

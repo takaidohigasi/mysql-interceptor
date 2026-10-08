@@ -134,6 +134,9 @@ func runServe() {
 		if err != nil {
 			fatal("failed to create shadow sender", "err", err)
 		}
+		// comparison.retry.mode "both" re-executes diverging queries on the
+		// primary too; give the sender the primary endpoint for that.
+		shadowSender.SetPrimaryBackend(cfg.Backend, cfg.TLS.BackendSide)
 		// Read-only enforcement is always applied regardless of the
 		// readonly: field. Surface this up-front so operators don't expect
 		// DML replay if they set readonly: false.

@@ -294,6 +294,42 @@ multi-line form some clients send (the Datadog Agent's
 copied from the summary can be turned into a pattern by escaping
 `(`, `)`, `?`, `*` and `.`.
 
+**Re-verifying diffs after a delay (replication lag):** when the shadow
+target is fed asynchronously (a changefeed or replica), a SELECT that
+runs on the shadow right after the primary can legitimately read older
+data and show up as a diff. `comparison.retry` holds such a diff back
+and re-executes the SELECT after a delay:
+
+```yaml
+comparison:
+  retry:
+    max_attempts: 2   # 0 (default) disables retry
+    delay: 3s         # set above the shadow target's typical lag
+    mode: shadow      # or "both", see below
+```
+
+- `mode: shadow` re-runs the query on the session's pinned shadow
+  connection and compares with the primary's **original** result. No
+  extra load on the primary. A row the primary updated between the two
+  executions keeps showing as a diff (the conservative outcome).
+- `mode: both` also re-runs the query on the primary, over a dedicated
+  verification connection opened lazily per session with the session's
+  own credentials, and compares the two **fresh** results. This tells
+  lag apart from hot rows, at the cost of re-issuing the SELECT on
+  production (`shadow_retry_primary_queries` counts them). Sessions that
+  changed session state (`SET ...`) or created temp tables fall back to
+  `shadow` for that session, because the verification connection cannot
+  reproduce that state.
+
+A diff that matches on retry is recorded as `match: true` with
+`resolved_by_retry: true`, `retries: N` and `retry_mode`, and is counted
+in `comparisons_resolved_by_retry` (and in `comparisons_matched`); the
+digest summary shows these in its `Retry` column. A diff that persists is
+reported once, after the last attempt, with `retries: N`. Only SELECT
+statements are retried, and only in shadow mode (offline replay is
+unaffected). When a session ends with retries still waiting, they are
+re-executed immediately so no comparison is lost.
+
 **Session-pinned shadow:** each primary session gets its own dedicated shadow connection. Queries flow serially from the primary session to its own shadow queue and execute in order on the pinned connection. This means session-scoped state — temporary tables, session variables, transactions — is preserved:
 
 ```sql
@@ -407,6 +443,10 @@ The diff report (JSONL) shows per-query comparison results:
 
 Difference types: `error`, `row_count`, `column_count`, `column_name`, `cell_value`, `affected_rows`
 
+Records that went through `comparison.retry` also carry `retries` (number
+of re-executions), `resolved_by_retry` (true when a diff disappeared on
+retry) and `retry_mode` (`shadow` or `both`).
+
 ### Reading the report
 
 `mysql-interceptor report` prints the records in a report file. It needs no
@@ -481,8 +521,8 @@ Available metrics:
   - **Sessions:** `active_sessions`, `total_sessions`
   - **Queries:** `queries_handled`, `query_errors`
   - **Logger:** `logger_dropped` (entries dropped when the async buffer was full)
-  - **Shadow:** `shadow_enabled` (gauge), `shadow_active_sessions` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (not session-safe), `shadow_dropped` (queue full or connection timeout)
-  - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`, `comparisons_digest_count` (gauge), `comparisons_digest_overflow`
+  - **Shadow:** `shadow_enabled` (gauge), `shadow_active_sessions` (gauge), `shadow_queries_replayed`, `shadow_disabled` (rejected by toggle), `shadow_sampled_out` (dropped by `sample_rate`), `shadow_filtered_by_cidr` (rejected by CIDR filter), `shadow_skipped` (not session-safe), `shadow_dropped` (queue full or connection timeout), `shadow_retry_primary_queries` (re-executed on the primary by `comparison.retry.mode: both`)
+  - **Comparisons:** `comparisons_total`, `comparisons_matched`, `comparisons_differed`, `comparisons_ignored`, `comparisons_resolved_by_retry` (diffs that matched on re-execution; subset of matched), `comparisons_digest_count` (gauge), `comparisons_digest_overflow`
   - **Runtime (gauges):** `heap_alloc_bytes`, `heap_inuse_bytes`, `heap_idle_bytes`, `heap_sys_bytes`, `heap_objects`, `stack_inuse_bytes`, `sys_bytes`, `num_goroutines`, `gc_cycles_total`, `gc_pause_ns_total`
 
 ### Datadog integration

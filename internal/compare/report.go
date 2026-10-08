@@ -92,10 +92,11 @@ type Reporter struct {
 	closeOnce  sync.Once
 	closeErr   error
 
-	totalCount   atomic.Int64
-	matchCount   atomic.Int64
-	diffCount    atomic.Int64
-	ignoredCount atomic.Int64
+	totalCount    atomic.Int64
+	matchCount    atomic.Int64
+	diffCount     atomic.Int64
+	ignoredCount  atomic.Int64
+	resolvedCount atomic.Int64 // subset of matchCount: matched only after a retry
 	// Snapshots taken on the last heartbeat tick, used to compute
 	// per-window deltas without locking. Atomic Swap on each call
 	// keeps the deltas consistent with whatever cumulative counts
@@ -104,6 +105,7 @@ type Reporter struct {
 	lastMatched  atomic.Int64
 	lastDiffered atomic.Int64
 	lastIgnored  atomic.Int64
+	lastResolved atomic.Int64
 	logMatches   bool
 	digestStats  *DigestStats
 }
@@ -236,7 +238,9 @@ func (r *Reporter) shouldEmit(result *CompareResult) bool {
 	if result.Ignored {
 		return false
 	}
-	return !result.Match
+	// A diff that went away on retry is still worth a line: it tells
+	// operators how much of the noise is shadow-side lag.
+	return !result.Match || result.ResolvedByRetry
 }
 
 func (r *Reporter) Record(result *CompareResult) {
@@ -249,6 +253,10 @@ func (r *Reporter) Record(result *CompareResult) {
 	case result.Match:
 		r.matchCount.Add(1)
 		metrics.Global.ComparisonsMatched.Add(1)
+		if result.ResolvedByRetry {
+			r.resolvedCount.Add(1)
+			metrics.Global.ComparisonsResolvedRetry.Add(1)
+		}
 	default:
 		r.diffCount.Add(1)
 		metrics.Global.ComparisonsDiffered.Add(1)
@@ -316,6 +324,7 @@ type HeartbeatRecord struct {
 	WindowMatched   int64   `json:"window_matched"`
 	WindowDiffered  int64   `json:"window_differed"`
 	WindowIgnored   int64   `json:"window_ignored"`
+	WindowResolved  int64   `json:"window_resolved_by_retry"`
 	CumulativeTotal int64   `json:"cumulative_total"`
 	CumulativeDiff  int64   `json:"cumulative_differed"`
 }
@@ -339,6 +348,8 @@ func (h *HeartbeatRecord) appendJSON(buf []byte) []byte {
 	buf = strconv.AppendInt(buf, h.WindowDiffered, 10)
 	buf = append(buf, `,"window_ignored":`...)
 	buf = strconv.AppendInt(buf, h.WindowIgnored, 10)
+	buf = append(buf, `,"window_resolved_by_retry":`...)
+	buf = strconv.AppendInt(buf, h.WindowResolved, 10)
 	buf = append(buf, `,"cumulative_total":`...)
 	buf = strconv.AppendInt(buf, h.CumulativeTotal, 10)
 	buf = append(buf, `,"cumulative_differed":`...)
@@ -359,6 +370,7 @@ func (r *Reporter) WriteHeartbeat(window time.Duration) error {
 	matched := r.matchCount.Load()
 	diffed := r.diffCount.Load()
 	ignored := r.ignoredCount.Load()
+	resolved := r.resolvedCount.Load()
 
 	hb := HeartbeatRecord{
 		Type:            "heartbeat",
@@ -368,6 +380,7 @@ func (r *Reporter) WriteHeartbeat(window time.Duration) error {
 		WindowMatched:   matched - r.lastMatched.Swap(matched),
 		WindowDiffered:  diffed - r.lastDiffered.Swap(diffed),
 		WindowIgnored:   ignored - r.lastIgnored.Swap(ignored),
+		WindowResolved:  resolved - r.lastResolved.Swap(resolved),
 		CumulativeTotal: total,
 		CumulativeDiff:  diffed,
 	}
@@ -381,9 +394,10 @@ func (r *Reporter) Summary() string {
 	matched := r.matchCount.Load()
 	diffed := r.diffCount.Load()
 	ignored := r.ignoredCount.Load()
+	resolved := r.resolvedCount.Load()
 
-	s := fmt.Sprintf("Comparison summary: total=%d matched=%d different=%d ignored=%d",
-		total, matched, diffed, ignored)
+	s := fmt.Sprintf("Comparison summary: total=%d matched=%d different=%d ignored=%d resolved_by_retry=%d",
+		total, matched, diffed, ignored, resolved)
 	s += r.digestStats.PrintSummary()
 	return s
 }
