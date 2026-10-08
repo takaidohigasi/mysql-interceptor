@@ -193,6 +193,31 @@ comparison:
     - "\\bNOW\\s*\\("
     - "\\bCURRENT_TIMESTAMP\\b"
     - "\\bUUID\\s*\\("
+  # Re-verify a diff before reporting it. When the shadow target is fed
+  # asynchronously (changefeed / replica), a SELECT that runs on the
+  # shadow right after the primary can read older data and show up as a
+  # diff. With retry enabled, a differing SELECT is held back and run
+  # again on the session's shadow connection after `delay`; if it then
+  # matches, the comparison is recorded as matched with
+  # resolved_by_retry=true (and counted in comparisons_resolved_by_retry),
+  # otherwise it is retried up to `max_attempts` times and reported as a
+  # diff carrying `retries`. Shadow mode only; SELECT statements only.
+  retry:
+    max_attempts: 0            # 0 (default) disables retry
+    delay: 2s                  # wait before each re-execution; set above
+                               # the shadow target's typical lag
+    mode: shadow               # shadow: re-run on the shadow only and
+                               #   compare with the primary's ORIGINAL
+                               #   result (no extra primary load; a row
+                               #   the primary updated in between stays a
+                               #   diff)
+                               # both: also re-run on the primary over a
+                               #   per-session verification connection
+                               #   and compare the two FRESH results.
+                               #   Adds the SELECT again to primary load
+                               #   (shadow_retry_primary_queries). Sessions
+                               #   that ran SET or created temp tables
+                               #   fall back to shadow for that session.
     - "\\bRAND\\s*\\("
 
 bench:

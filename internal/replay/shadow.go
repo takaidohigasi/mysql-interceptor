@@ -51,6 +51,15 @@ type ShadowQuery struct {
 	// enqueueing so the closure doesn't pin variables for the queue
 	// lifetime.
 	Capture func() *compare.CapturedResult `json:"-"`
+
+	// retryAttempt is how many times this query has already been
+	// re-executed on the shadow after a divergence (comparison.retry).
+	// Zero on the first execution; set by ShadowSession when it
+	// re-enqueues the query for re-verification. retryMode records
+	// whether the latest re-execution also refreshed OrigResult from the
+	// primary ("both") or compared against the original ("shadow").
+	retryAttempt int
+	retryMode    string
 }
 
 // ShadowSender is the configuration and lifecycle root for shadow traffic.
@@ -65,11 +74,27 @@ type ShadowSender struct {
 	// connect opens a connection to the shadow backend. Defaults to a
 	// backend.ConnectWithTimeout call using shadowConnectTimeout;
 	// overridable in tests to simulate slow/failing shadow connects.
-	connect           func(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error)
-	engine            *compare.Engine
-	reporter          *compare.Reporter
-	timeout           time.Duration
-	sessionQueueSz    int
+	connect        func(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error)
+	engine         *compare.Engine
+	reporter       *compare.Reporter
+	timeout        time.Duration
+	sessionQueueSz int
+	// retryAttempts / retryDelay implement comparison.retry: a differing
+	// SELECT is re-executed on the session's shadow connection up to
+	// retryAttempts times, retryDelay apart, before the diff is
+	// reported. 0 attempts disables the mechanism.
+	retryAttempts int
+	retryDelay    time.Duration
+	// retryMode is "shadow" or "both" (comparison.retry.mode). "both"
+	// additionally needs primaryBackend, set via SetPrimaryBackend; until
+	// then sessions behave as "shadow".
+	retryMode      string
+	primaryBackend *config.BackendConfig
+	primaryTLS     config.BackendSideTLSConfig
+	// connectPrimary opens the per-session primary verification
+	// connection for retryMode "both". Defaults to backend.ConnectWithTimeout;
+	// overridable in tests.
+	connectPrimary    func(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error)
 	summaryInterval   time.Duration // 0 falls back to 1h; negative disables periodic logging
 	heartbeatInterval time.Duration // 0 falls back to 1m; negative disables heartbeat lines
 
@@ -155,6 +180,9 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		reporter:          reporter,
 		timeout:           cfg.Timeout,
 		sessionQueueSz:    queueSize,
+		retryAttempts:     compareCfg.Retry.MaxAttempts,
+		retryDelay:        compareCfg.Retry.Delay,
+		retryMode:         compareCfg.Retry.Mode,
 		summaryInterval:   compareCfg.SummaryInterval,
 		heartbeatInterval: compareCfg.HeartbeatInterval,
 		sessions:          make(map[uint64]*ShadowSession),
@@ -164,6 +192,7 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 	s.connect = func(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) (*client.Conn, error) {
 		return backend.ConnectWithTimeout(cfg, tlsCfg, shadowConnectTimeout)
 	}
+	s.connectPrimary = s.connect
 
 	initiallyEnabled := true
 	if cfg.Enabled != nil {
@@ -258,6 +287,18 @@ func (s *ShadowSender) runPeriodicSummary(interval time.Duration) {
 	}
 }
 
+// SetPrimaryBackend tells the sender how to reach the primary so that
+// comparison.retry.mode "both" can re-execute a diverging query there over
+// a per-session verification connection. Credentials are taken from each
+// session at StartSession; cfg only needs Addr, DB and KeepAlive. Must be
+// called before the first StartSession; without it "both" behaves as
+// "shadow".
+func (s *ShadowSender) SetPrimaryBackend(cfg config.BackendConfig, tlsCfg config.BackendSideTLSConfig) {
+	c := cfg
+	s.primaryBackend = &c
+	s.primaryTLS = tlsCfg
+}
+
 // StartSession registers a dedicated shadow session for the given primary
 // session and kicks off its backend connection asynchronously. Returns
 // (nil, nil) if shadow is currently disabled — callers should skip
@@ -310,6 +351,18 @@ func (s *ShadowSender) StartSession(sessionID uint64, initialDB, user, password 
 		ctx:        ctx,
 		cancel:     cancel,
 	}
+	if s.retryMode == "both" && s.primaryBackend != nil {
+		pcfg := *s.primaryBackend
+		if user != "" {
+			pcfg.User = user
+			pcfg.Password = password
+			pcfg.PasswordStage1 = stage1
+		}
+		if initialDB != "" {
+			pcfg.DB = initialDB
+		}
+		ss.primaryCfg = &pcfg
+	}
 
 	s.sessionsMu.Lock()
 	s.sessions[sessionID] = ss
@@ -357,6 +410,7 @@ func (ss *ShadowSession) connectAndRun(backendCfg config.BackendConfig, initialD
 	}
 
 	ss.conn = conn
+	defer ss.closePrimaryConn()
 	ss.run()
 }
 

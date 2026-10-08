@@ -517,3 +517,55 @@ comparison:
 		}
 	})
 }
+
+// TestLoad_ComparisonRetry covers the comparison.retry defaults and
+// validation: unset → disabled with a 2s delay and mode shadow; a bad
+// mode or an out-of-range delay / attempts is rejected at load time.
+func TestLoad_ComparisonRetry(t *testing.T) {
+	write := func(t *testing.T, retry string) string {
+		t.Helper()
+		content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "u"
+      password: "p"
+comparison:
+` + retry
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	cfg, err := Load(write(t, "  output_file: /tmp/x.jsonl\n"))
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if r := cfg.Comparison.Retry; r.MaxAttempts != 0 || r.Delay != 2*time.Second || r.Mode != "shadow" {
+		t.Errorf("unexpected defaults: %+v", r)
+	}
+
+	cfg, err = Load(write(t, "  retry:\n    max_attempts: 2\n    delay: 3s\n    mode: both\n"))
+	if err != nil {
+		t.Fatalf("both: %v", err)
+	}
+	if r := cfg.Comparison.Retry; r.MaxAttempts != 2 || r.Delay != 3*time.Second || r.Mode != "both" {
+		t.Errorf("not preserved: %+v", r)
+	}
+
+	for name, retry := range map[string]string{
+		"bad mode":          "  retry:\n    max_attempts: 1\n    mode: primary\n",
+		"too many attempts": "  retry:\n    max_attempts: 11\n",
+		"delay too long":    "  retry:\n    max_attempts: 1\n    delay: 10m\n",
+		"negative delay":    "  retry:\n    max_attempts: 1\n    delay: -1s\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(write(t, retry)); err == nil {
+				t.Errorf("expected validation error for %q", retry)
+			}
+		})
+	}
+}

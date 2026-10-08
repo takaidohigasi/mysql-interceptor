@@ -60,6 +60,9 @@ func ReleaseCompareResult(r *CompareResult) {
 	r.ReplayTimeMs = 0
 	r.TimeDiffMs = 0
 	r.TimeDiffExceed = false
+	r.Retries = 0
+	r.ResolvedByRetry = false
+	r.RetryMode = ""
 	compareResultPool.Put(r)
 }
 
@@ -84,6 +87,21 @@ type CompareResult struct {
 	ReplayTimeMs   float64      `json:"replay_time_ms"`
 	TimeDiffMs     float64      `json:"time_diff_ms"`
 	TimeDiffExceed bool         `json:"time_diff_exceeded"`
+	// Retries is how many times the query was re-executed on the shadow
+	// after an initial divergence (comparison.retry). 0 when the first
+	// execution was recorded as-is. The timings and Differences on a
+	// retried record describe the last execution.
+	Retries int `json:"retries,omitempty"`
+	// ResolvedByRetry is true when the first execution differed but a
+	// re-execution after comparison.retry.delay matched the primary's
+	// original result — the signature of replication / changefeed lag on
+	// the shadow target. Such records count as matched.
+	ResolvedByRetry bool `json:"resolved_by_retry,omitempty"`
+	// RetryMode is "shadow" when the retry re-executed the query on the
+	// shadow only and compared with the primary's original result, or
+	// "both" when the primary was re-executed as well and the two fresh
+	// results were compared. Empty on records that were not retried.
+	RetryMode string `json:"retry_mode,omitempty"`
 }
 
 // appendJSON appends the JSON encoding of r (followed by a newline,
@@ -131,6 +149,17 @@ func (r *CompareResult) appendJSON(buf []byte) []byte {
 	buf = appendJSONFloat(buf, r.TimeDiffMs)
 	buf = append(buf, `,"time_diff_exceeded":`...)
 	buf = appendJSONBool(buf, r.TimeDiffExceed)
+	if r.Retries > 0 {
+		buf = append(buf, `,"retries":`...)
+		buf = strconv.AppendInt(buf, int64(r.Retries), 10)
+	}
+	if r.ResolvedByRetry {
+		buf = append(buf, `,"resolved_by_retry":true`...)
+	}
+	if r.RetryMode != "" {
+		buf = append(buf, `,"retry_mode":`...)
+		buf = appendJSONString(buf, r.RetryMode)
+	}
 	buf = append(buf, '}', '\n')
 	return buf
 }

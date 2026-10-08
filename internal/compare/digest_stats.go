@@ -71,6 +71,9 @@ type DigestEntry struct {
 	MatchCount  int    `json:"match_count"`
 	DiffCount   int    `json:"diff_count"`
 	ErrorCount  int    `json:"error_count"`
+	// ResolvedCount is the subset of MatchCount that only matched after a
+	// comparison.retry re-execution (shadow-side lag).
+	ResolvedCount int `json:"resolved_by_retry_count"`
 
 	// Exact running sums for accurate mean regardless of reservoir size.
 	// These are internal-only: the public JSON output uses DigestSummary
@@ -87,21 +90,24 @@ type DigestEntry struct {
 }
 
 type DigestSummary struct {
-	Digest      string  `json:"digest"`
-	SampleQuery string  `json:"sample_query"`
-	Count       int     `json:"count"`
-	MatchCount  int     `json:"match_count"`
-	DiffCount   int     `json:"diff_count"`
-	ErrorCount  int     `json:"error_count"`
-	OriginalAvg float64 `json:"original_avg_ms"`
-	OriginalP95 float64 `json:"original_p95_ms"`
-	OriginalP99 float64 `json:"original_p99_ms"`
-	ReplayAvg   float64 `json:"replay_avg_ms"`
-	ReplayP95   float64 `json:"replay_p95_ms"`
-	ReplayP99   float64 `json:"replay_p99_ms"`
-	OverheadAvg float64 `json:"overhead_avg_ms"`
-	OverheadP95 float64 `json:"overhead_p95_ms"`
-	OverheadP99 float64 `json:"overhead_p99_ms"`
+	Digest      string `json:"digest"`
+	SampleQuery string `json:"sample_query"`
+	Count       int    `json:"count"`
+	MatchCount  int    `json:"match_count"`
+	DiffCount   int    `json:"diff_count"`
+	ErrorCount  int    `json:"error_count"`
+	// ResolvedCount is the subset of MatchCount that only matched after a
+	// comparison.retry re-execution.
+	ResolvedCount int     `json:"resolved_by_retry_count"`
+	OriginalAvg   float64 `json:"original_avg_ms"`
+	OriginalP95   float64 `json:"original_p95_ms"`
+	OriginalP99   float64 `json:"original_p99_ms"`
+	ReplayAvg     float64 `json:"replay_avg_ms"`
+	ReplayP95     float64 `json:"replay_p95_ms"`
+	ReplayP99     float64 `json:"replay_p99_ms"`
+	OverheadAvg   float64 `json:"overhead_avg_ms"`
+	OverheadP95   float64 `json:"overhead_p95_ms"`
+	OverheadP99   float64 `json:"overhead_p99_ms"`
 }
 
 func NewDigestStats() *DigestStats {
@@ -186,6 +192,9 @@ func (ds *DigestStats) Record(result *CompareResult) {
 	entry.Count++
 	if result.Match {
 		entry.MatchCount++
+		if result.ResolvedByRetry {
+			entry.ResolvedCount++
+		}
 	} else {
 		entry.DiffCount++
 	}
@@ -246,12 +255,13 @@ func (ds *DigestStats) Summaries() []DigestSummary {
 		sh.mu.Lock()
 		for _, entry := range sh.digests {
 			s := DigestSummary{
-				Digest:      entry.Digest,
-				SampleQuery: entry.SampleQuery,
-				Count:       entry.Count,
-				MatchCount:  entry.MatchCount,
-				DiffCount:   entry.DiffCount,
-				ErrorCount:  entry.ErrorCount,
+				Digest:        entry.Digest,
+				SampleQuery:   entry.SampleQuery,
+				Count:         entry.Count,
+				MatchCount:    entry.MatchCount,
+				DiffCount:     entry.DiffCount,
+				ErrorCount:    entry.ErrorCount,
+				ResolvedCount: entry.ResolvedCount,
 			}
 			if entry.OriginalCount > 0 {
 				s.OriginalAvg = round2(entry.OriginalSum / float64(entry.OriginalCount))
@@ -286,19 +296,21 @@ func (ds *DigestStats) PrintSummary() string {
 
 	var result string
 	result += fmt.Sprintf("\n=== Query Digest Summary (%d unique digests) ===\n\n", len(summaries))
-	result += fmt.Sprintf("%-60s %6s %6s %6s | %10s %10s %10s | %10s %10s %10s\n",
-		"Digest", "Count", "Match", "Diff",
+	// "Retry" is the number of matches that only matched after a
+	// comparison.retry re-execution; it is a subset of Match.
+	result += fmt.Sprintf("%-60s %6s %6s %6s %6s | %10s %10s %10s | %10s %10s %10s\n",
+		"Digest", "Count", "Match", "Diff", "Retry",
 		"Orig Avg", "Orig P95", "Orig P99",
 		"Rply Avg", "Rply P95", "Rply P99")
-	result += fmt.Sprintf("%s\n", repeat("-", 160))
+	result += fmt.Sprintf("%s\n", repeat("-", 167))
 
 	for _, s := range summaries {
 		digest := s.Digest
 		if len(digest) > 58 {
 			digest = digest[:55] + "..."
 		}
-		result += fmt.Sprintf("%-60s %6d %6d %6d | %8.2fms %8.2fms %8.2fms | %8.2fms %8.2fms %8.2fms\n",
-			digest, s.Count, s.MatchCount, s.DiffCount,
+		result += fmt.Sprintf("%-60s %6d %6d %6d %6d | %8.2fms %8.2fms %8.2fms | %8.2fms %8.2fms %8.2fms\n",
+			digest, s.Count, s.MatchCount, s.DiffCount, s.ResolvedCount,
 			s.OriginalAvg, s.OriginalP95, s.OriginalP99,
 			s.ReplayAvg, s.ReplayP95, s.ReplayP99)
 	}

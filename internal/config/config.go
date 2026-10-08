@@ -244,6 +244,31 @@ type OfflineConfig struct {
 	ScannerBufferSizeBytes int `yaml:"scanner_buffer_size_bytes"`
 }
 
+// RetryConfig controls the delayed re-verification of comparison diffs.
+// See ComparisonConfig.Retry.
+type RetryConfig struct {
+	// MaxAttempts is how many times a differing SELECT is re-executed on
+	// the shadow before the diff is reported. 0 (default) disables retry.
+	MaxAttempts int `yaml:"max_attempts"`
+	// Delay is how long to wait before each re-execution. Defaults to 2s.
+	// Pick a value above the typical replication / changefeed lag of the
+	// shadow target.
+	Delay time.Duration `yaml:"delay"`
+	// Mode selects what is re-executed:
+	//   - "shadow" (default): only the shadow runs the query again and the
+	//     result is compared with the primary's original result. No extra
+	//     load on the primary, but a row the primary updated after the
+	//     original execution keeps showing as a diff.
+	//   - "both": the query is also re-executed on the primary, over a
+	//     dedicated verification connection opened lazily per session
+	//     with the session's own credentials, and the two fresh results
+	//     are compared. This re-issues the SELECT on production, so it
+	//     adds load there. Sessions that changed session state (SET ...)
+	//     or created temp tables fall back to "shadow" because the
+	//     verification connection cannot reproduce that state.
+	Mode string `yaml:"mode"`
+}
+
 type ComparisonConfig struct {
 	OutputFile      string   `yaml:"output_file"`
 	IgnoreColumns   []string `yaml:"ignore_columns"`
@@ -297,6 +322,18 @@ type ComparisonConfig struct {
 	// while otherwise looks indistinguishable from a stuck proxy. Only
 	// shadow mode emits heartbeats. Negative disables. Default 1m.
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
+
+	// Retry re-verifies a divergence before reporting it. When the
+	// shadow target is fed asynchronously (a changefeed / replica), a
+	// SELECT that runs on the shadow a moment after the primary can
+	// legitimately see older data and show up as a diff. With retry
+	// enabled, a non-ignored diff on a SELECT is held back and the same
+	// query is executed again on the session's shadow connection after
+	// Delay; if the result then matches the primary's original result the
+	// comparison is recorded as matched with resolved_by_retry=true,
+	// otherwise it is retried up to MaxAttempts times and finally
+	// recorded as a diff carrying the number of retries. Shadow mode only.
+	Retry RetryConfig `yaml:"retry"`
 
 	// RedactColumns is the per-column list of columns whose cell-value
 	// diff payloads are masked. When a cell_value diff is recorded for
@@ -495,6 +532,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Comparison.Upload.Timeout == 0 {
 		cfg.Comparison.Upload.Timeout = 20 * time.Second
 	}
+	if cfg.Comparison.Retry.Delay == 0 {
+		cfg.Comparison.Retry.Delay = 2 * time.Second
+	}
+	if cfg.Comparison.Retry.Mode == "" {
+		cfg.Comparison.Retry.Mode = "shadow"
+	}
 
 	// TCP keep-alive: on by default for both the primary backend and the
 	// shadow target. Unset enabled (nil) → true; an explicit
@@ -582,6 +625,17 @@ func (c *Config) Validate() error {
 		if _, err := regexp.Compile("(?i)" + pat); err != nil {
 			return fmt.Errorf("comparison.ignore_queries[%d] invalid regex %q: %w", i, pat, err)
 		}
+	}
+	if c.Comparison.Retry.MaxAttempts < 0 || c.Comparison.Retry.MaxAttempts > 10 {
+		return fmt.Errorf("comparison.retry.max_attempts must be in [0, 10], got %d", c.Comparison.Retry.MaxAttempts)
+	}
+	if c.Comparison.Retry.MaxAttempts > 0 && (c.Comparison.Retry.Delay <= 0 || c.Comparison.Retry.Delay > 5*time.Minute) {
+		return fmt.Errorf("comparison.retry.delay must be in (0, 5m] when retry is enabled, got %v", c.Comparison.Retry.Delay)
+	}
+	switch c.Comparison.Retry.Mode {
+	case "shadow", "both":
+	default:
+		return fmt.Errorf("comparison.retry.mode must be one of: shadow, both (got %q)", c.Comparison.Retry.Mode)
 	}
 	if c.Replay.Shadow.SampleRate != nil {
 		r := *c.Replay.Shadow.SampleRate

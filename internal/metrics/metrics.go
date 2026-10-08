@@ -41,6 +41,8 @@ type Counters struct {
 	ComparisonsMatched        atomic.Int64
 	ComparisonsDiffered       atomic.Int64
 	ComparisonsIgnored        atomic.Int64
+	ComparisonsResolvedRetry  atomic.Int64 // diffs that matched when re-executed after comparison.retry.delay
+	ShadowRetryPrimaryQueries atomic.Int64 // queries re-executed on the primary for comparison.retry.mode=both (extra primary load)
 	ComparisonsDigestOver     atomic.Int64 // new digests dropped because cap hit
 	ComparisonsDigestCount    atomic.Int64 // current unique digests tracked (gauge)
 	ComparisonsReportDropped  atomic.Int64 // diff/heartbeat records dropped because the async writer queue was full
@@ -169,6 +171,8 @@ func snapshot() []metric {
 		{"comparisons_matched", "counter", "Comparisons where primary and shadow agreed", float64(Global.ComparisonsMatched.Load())},
 		{"comparisons_differed", "counter", "Comparisons with a content or error divergence", float64(Global.ComparisonsDiffered.Load())},
 		{"comparisons_ignored", "counter", "Comparisons that matched a configured ignore pattern", float64(Global.ComparisonsIgnored.Load())},
+		{"shadow_retry_primary_queries", "counter", "Queries re-executed on the primary over the per-session verification connection (comparison.retry.mode=both)", float64(Global.ShadowRetryPrimaryQueries.Load())},
+		{"comparisons_resolved_by_retry", "counter", "Comparisons that differed at first but matched when the query was re-executed on the shadow after comparison.retry.delay (counted in comparisons_matched as well)", float64(Global.ComparisonsResolvedRetry.Load())},
 		{"comparisons_digest_count", "gauge", "Current number of unique query digests being tracked", float64(Global.ComparisonsDigestCount.Load())},
 		{"comparisons_digest_overflow", "counter", "New digests dropped because the max_unique_digests cap was reached", float64(Global.ComparisonsDigestOver.Load())},
 		{"comparisons_report_dropped", "counter", "Diff/heartbeat records dropped because the async reporter writer queue was full (consumer fell behind producers)", float64(Global.ComparisonsReportDropped.Load())},
