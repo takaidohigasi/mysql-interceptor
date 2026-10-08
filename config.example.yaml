@@ -184,6 +184,16 @@ comparison:
   # recorded in the diff report but marked "ignored" instead of counted
   # as differences. Use for queries that read server-local state and
   # always diverge between MySQL instances.
+  #
+  # Each pattern is matched against the raw SQL (with `.` also matching
+  # newlines) AND against the query digest: comments stripped,
+  # whitespace runs collapsed to one space, lower-cased, literals
+  # replaced with `?` (the form shown in the periodic digest summary).
+  # So a pattern written for a one-line query also matches the
+  # multi-line form some clients send, e.g. both of these match the
+  # Datadog Agent's pretty-printed table-size query:
+  #   - "select .+ from information_schema.tables"
+  #   - "from information_schema.tables where table_schema not in \(\?\)"
   ignore_queries:
     - "@@server_uuid"
     - "@@hostname"

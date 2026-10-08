@@ -518,3 +518,61 @@ func TestCompare_RedactColumnsAndAllValues(t *testing.T) {
 		}
 	}
 }
+
+// TestCompare_IgnoreQueryPattern_MultiLine covers the gap operators hit
+// with pretty-printed queries: a pattern written for the one-line form
+// must also match when the client sends the statement across several
+// lines with indentation and a leading comment. The Datadog Agent's
+// table-size query is the motivating example.
+func TestCompare_IgnoreQueryPattern_MultiLine(t *testing.T) {
+	const ddQuery = `/* service='datadog-agent' */ SELECT table_schema, table_name,
+ IFNULL(index_length/1024/1024,0) AS index_size_mb,
+ IFNULL(data_length/1024/1024,0) AS data_size_mb
+FROM information_schema.tables
+WHERE table_schema not in ('mysql', 'performance_schema', 'information_schema')`
+
+	original := &CapturedResult{Columns: []string{"c"}, Rows: [][]string{{"1"}}}
+	replay := &CapturedResult{Columns: []string{"c"}, Rows: [][]string{{"2"}}}
+
+	cases := []struct {
+		name    string
+		pattern string
+	}{
+		// `.+` must cross the newline between "table_name," and "IFNULL".
+		{"dot crosses newlines in the raw query", "select .+ from information_schema.tables"},
+		// A literal space in the pattern where the raw query has a
+		// newline: only the digest (single-spaced) can match this.
+		{"single space matches a newline via the digest", "data_size_mb from information_schema.tables where"},
+		// Pattern written against the digest form itself, with the
+		// IN list collapsed to (?).
+		{"digest form with collapsed literals", `from information_schema\.tables where table_schema not in \(\?\)`},
+		// Patterns stay case-insensitive on both forms.
+		{"case-insensitive", "FROM INFORMATION_SCHEMA.TABLES"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			regexes, err := CompileIgnoreQueries([]string{tc.pattern})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			engine := NewEngine(EngineConfig{IgnoreQueryRegex: regexes})
+			result := engine.Compare(original, replay, ddQuery, "", 1)
+			if !result.Ignored {
+				t.Errorf("pattern %q should ignore the multi-line query\ndigest: %s", tc.pattern, result.QueryDigest)
+			}
+		})
+	}
+
+	// A pattern for a different table must not match either form.
+	regexes, err := CompileIgnoreQueries([]string{"select .+ from mysql.user"})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	engine := NewEngine(EngineConfig{IgnoreQueryRegex: regexes})
+	if result := engine.Compare(original, replay, ddQuery, "", 2); result.Ignored {
+		t.Error("unrelated pattern must not ignore the query")
+	}
+	if result := engine.Compare(original, replay, "SELECT * FROM users WHERE id = 1", "", 3); result.Ignored {
+		t.Error("unrelated query must not be ignored")
+	}
+}

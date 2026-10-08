@@ -42,13 +42,21 @@ func NewEngine(cfg EngineConfig) *Engine {
 // CompileIgnoreQueries compiles a list of string patterns into case-
 // insensitive regular expressions. Returns an error if any pattern is
 // invalid. Helper for EngineConfig construction from string config.
+//
+// Patterns are compiled with (?is): case-insensitive, and `.` also
+// matches a newline so a pattern written for a one-line query still
+// matches the multi-line form clients such as the Datadog Agent send.
+// The engine additionally matches every pattern against the query's
+// digest (see Digest), which has comments stripped, whitespace runs
+// collapsed to one space, keywords lower-cased and literals replaced
+// with `?`, so operators can write patterns against either form.
 func CompileIgnoreQueries(patterns []string) ([]*regexp.Regexp, error) {
 	if len(patterns) == 0 {
 		return nil, nil
 	}
 	out := make([]*regexp.Regexp, 0, len(patterns))
 	for _, p := range patterns {
-		re, err := regexp.Compile("(?i)" + p)
+		re, err := regexp.Compile("(?is)" + p)
 		if err != nil {
 			return nil, fmt.Errorf("compiling ignore pattern %q: %w", p, err)
 		}
@@ -58,9 +66,15 @@ func CompileIgnoreQueries(patterns []string) ([]*regexp.Regexp, error) {
 }
 
 // matchesIgnore reports whether the query matches any ignore pattern.
-func (e *Engine) matchesIgnore(query string) bool {
+// Each pattern is tried against the raw query text and against its
+// digest. The digest form absorbs the formatting differences that make
+// raw-text patterns brittle — newlines and indentation inside the
+// statement, comments, letter case and literal values — so a pattern
+// such as `select .+ from information_schema.tables` matches the same
+// statement whether a client sent it on one line or pretty-printed.
+func (e *Engine) matchesIgnore(query, digest string) bool {
 	for _, re := range e.cfg.IgnoreQueryRegex {
-		if re.MatchString(query) {
+		if re.MatchString(query) || re.MatchString(digest) {
 			return true
 		}
 	}
@@ -102,7 +116,7 @@ func (e *Engine) Compare(original, replay *CapturedResult, query, user string, s
 	result.SessionID = sessionID
 	result.Timestamp = time.Now()
 	result.Match = true
-	result.Ignored = e.matchesIgnore(query)
+	result.Ignored = e.matchesIgnore(query, result.QueryDigest)
 	result.OriginalTimeMs = float64(original.Duration.Microseconds()) / 1000.0
 	result.ReplayTimeMs = float64(replay.Duration.Microseconds()) / 1000.0
 	// User is attached only when the result is a real divergence

@@ -274,8 +274,13 @@ type ComparisonConfig struct {
 	IgnoreColumns   []string `yaml:"ignore_columns"`
 	TimeThresholdMs float64  `yaml:"time_threshold_ms"`
 	// IgnoreQueries is a list of case-insensitive regular expressions.
-	// If the query text matches any pattern, the comparison result is
-	// marked Ignored=true and doesn't contribute to the diff count.
+	// If the query matches any pattern, the comparison result is marked
+	// Ignored=true and doesn't contribute to the diff count. Each
+	// pattern is matched against both the raw query text (with `.`
+	// also matching newlines) and the query digest — comments stripped,
+	// whitespace collapsed to single spaces, lower-cased, literals
+	// replaced with `?` — so multi-line or differently indented forms
+	// of the same statement match the same pattern.
 	// Use this for queries that read server-local state and therefore
 	// always diverge between instances:
 	//   - "@@server_uuid"
@@ -622,7 +627,8 @@ func (c *Config) Validate() error {
 		}
 	}
 	for i, pat := range c.Comparison.IgnoreQueries {
-		if _, err := regexp.Compile("(?i)" + pat); err != nil {
+		// Same flags as compare.CompileIgnoreQueries.
+		if _, err := regexp.Compile("(?is)" + pat); err != nil {
 			return fmt.Errorf("comparison.ignore_queries[%d] invalid regex %q: %w", i, pat, err)
 		}
 	}

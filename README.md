@@ -276,7 +276,23 @@ comparison:
   output_file: "./logs/diff-report.jsonl"
   ignore_columns: ["updated_at"]
   time_threshold_ms: 100
+  ignore_queries:
+    - "@@server_uuid"
+    - "select .+ from information_schema.tables"
 ```
+
+**Ignoring noisy queries:** `comparison.ignore_queries` is a list of
+case-insensitive regexes. A query that matches any of them is still
+recorded in the report but marked `ignored` instead of counted as a
+difference. Each pattern is matched against the raw SQL (with `.` also
+matching newlines) and against the query digest — comments stripped,
+whitespace runs collapsed to one space, lower-cased, literals replaced
+with `?`, exactly the form printed in the digest summary. So a pattern
+written for a one-line query also matches the pretty-printed,
+multi-line form some clients send (the Datadog Agent's
+`information_schema.tables` size query, for example), and a digest line
+copied from the summary can be turned into a pattern by escaping
+`(`, `)`, `?`, `*` and `.`.
 
 **Re-verifying diffs after a delay (replication lag):** when the shadow
 target is fed asynchronously (a changefeed or replica), a SELECT that
