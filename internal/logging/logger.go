@@ -14,18 +14,21 @@ import (
 )
 
 type Logger struct {
-	entryCh chan LogEntry
-	stop    chan struct{}
-	done    chan struct{}
-	writer  *lumberjack.Logger
-	enabled atomic.Bool
-	closed  atomic.Bool
-	dropped atomic.Int64
-	once    sync.Once
+	entryCh    chan LogEntry
+	stop       chan struct{}
+	done       chan struct{}
+	writer     *lumberjack.Logger
+	enabled    atomic.Bool
+	errorsOnly atomic.Bool
+	closed     atomic.Bool
+	dropped    atomic.Int64
+	once       sync.Once
 }
 
 type LoggerConfig struct {
-	Enabled    bool
+	Enabled bool
+	// Level is "all" (default) or "error". See Logger.SetLevel.
+	Level      string
 	OutputDir  string
 	FilePrefix string
 	QueueSize  int // channel buffer size; 0 → default 10000
@@ -64,6 +67,7 @@ func NewLogger(cfg LoggerConfig) (*Logger, error) {
 		writer:  lj,
 	}
 	l.enabled.Store(cfg.Enabled)
+	l.errorsOnly.Store(cfg.Level == "error")
 
 	go l.writeLoop()
 
@@ -72,6 +76,13 @@ func NewLogger(cfg LoggerConfig) (*Logger, error) {
 
 func (l *Logger) Log(entry LogEntry) {
 	if l.closed.Load() || !l.enabled.Load() {
+		return
+	}
+
+	// Level=error: skip entries from queries that didn't error, before
+	// they ever reach the channel. Cuts volume during a noisy incident
+	// while keeping every failure.
+	if l.errorsOnly.Load() && entry.Error == "" {
 		return
 	}
 
@@ -92,6 +103,15 @@ func (l *Logger) Log(entry LogEntry) {
 func (l *Logger) SetEnabled(enabled bool) {
 	l.enabled.Store(enabled)
 	slog.Info("sql logging toggled", "enabled", enabled)
+}
+
+// SetLevel changes which entries Log records: "error" keeps only entries
+// whose query returned a backend error, "all" (or any other value) keeps
+// every entry. Hot-reloadable, same as SetEnabled.
+func (l *Logger) SetLevel(level string) {
+	errorsOnly := level == "error"
+	l.errorsOnly.Store(errorsOnly)
+	slog.Info("sql logging level changed", "level", level, "errors_only", errorsOnly)
 }
 
 func (l *Logger) Dropped() int64 {

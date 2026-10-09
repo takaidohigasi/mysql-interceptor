@@ -166,6 +166,13 @@ type LoggingConfig struct {
 	// bind passwords, tokens, or other PII. The query text (with ?
 	// placeholders) is still recorded.
 	RedactArgs bool `yaml:"redact_args"`
+	// Level selects which entries get written once logging is enabled:
+	// "all" (default) logs every query, "error" logs only queries whose
+	// backend execution returned an error. Hot-reloadable, same as
+	// Enabled — toggle to "error" to cut volume during a noisy incident
+	// without losing visibility into failures, then back to "all" when
+	// investigating further.
+	Level string `yaml:"level"`
 	// QueueSize bounds the async log channel. Larger = more burst tolerance
 	// but higher memory ceiling. Entries beyond the buffer are dropped
 	// (counted as logger_dropped). Default 10000.
@@ -462,6 +469,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Logging.FilePrefix == "" {
 		cfg.Logging.FilePrefix = "queries"
 	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "all"
+	}
 	if cfg.Logging.Rotation.MaxSizeMB == 0 {
 		cfg.Logging.Rotation.MaxSizeMB = 100
 	}
@@ -620,6 +630,11 @@ func (c *Config) Validate() error {
 	case "disabled", "shadow", "offline":
 	default:
 		return fmt.Errorf("replay.mode must be one of: disabled, shadow, offline")
+	}
+	switch c.Logging.Level {
+	case "all", "error":
+	default:
+		return fmt.Errorf("logging.level must be one of: all, error (got %q)", c.Logging.Level)
 	}
 	if c.TLS.ClientSide.Enabled {
 		if c.TLS.ClientSide.CertFile == "" || c.TLS.ClientSide.KeyFile == "" {
