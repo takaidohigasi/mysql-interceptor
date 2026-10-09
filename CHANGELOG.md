@@ -7,6 +7,71 @@ and the project adheres to [Semantic Versioning](https://semver.org/) once it
 reaches 1.0 (everything before is 0.y.z with breaking changes possible between
 minor versions).
 
+<a id="v0.0.18"></a>
+## v0.0.18
+
+_Released 2026-10-09._
+
+The comparison report rotates every hour in `serve` and, with
+`upload.gcs`, is uploaded every hour instead of only at shutdown. The
+query log can be cut down to failing queries.
+
+**Upgrade notes**
+
+- Rotation is **on by default** for a file `comparison.output_file`
+  in `serve`. Set `comparison.rotation.interval: none` to keep the single
+  file.
+- GCS object names gain a UTC hour directory, and a `latest/` object is
+  added (see below).
+- The uploading identity needs `storage.objects.delete` as well as
+  `storage.objects.create`, because objects are now overwritten.
+
+### Added
+
+- **`comparison.rotation`** (`internal/compare/report.go`,
+  `internal/upload/shipper.go`, `internal/segment/`,
+  `internal/config/config.go`, `cmd/mysql-interceptor/main.go`). At every
+  UTC hour the report file is renamed to
+  `<output_file>-<UTC start, YYYYMMDDTHHMMSSZ>` (a segment) and a fresh
+  one is opened.
+  - `interval: hourly` (default) or `none`.
+  - `min_size_kb` (default 0): while the file is smaller than this, it is
+    written on through the next hour, and the segment keeps its start
+    time. An empty file is never rotated.
+  - `keep` (default 24): how many closed segments are kept on local disk.
+  - Shutdown closes the last non-empty file as a segment, and a file left
+    by a previous process becomes a segment at start-up.
+
+  With `upload.gcs`, every hour (and at shutdown) the data is uploaded:
+  - gzipped to `<prefix>/<YYYYMMDDHH>/<instance>/<segment>.gz`. There is one
+    object per segment, overwritten while the segment grows;
+    `YYYYMMDDHH` is the UTC hour the segment started.
+  - uncompressed to `latest/<prefix>/<instance>-<file>`
+    (`application/x-ndjson`).
+
+  Only the bytes flushed before the size was taken are uploaded, so the
+  upload never ends mid-record. A closed segment is removed locally once
+  uploaded; a failed one is kept and retried on the next segment and at
+  shutdown. Without `upload.gcs`, closed segments stay on disk. (#52)
+- **`logging.level`** (`internal/logging/logger.go`,
+  `internal/config/config.go`). `all` (default) or `error`: with `error`
+  the query log keeps only the entries whose backend execution returned an
+  error. The filter runs before the entry is queued, so it also lowers
+  channel and writer load. Hot-reloadable like `logging.enabled`. (#51)
+
+### Changed
+
+- **GCS object names include the UTC hour, and `latest/` is written**
+  (`internal/upload/gcs.go`). Objects are
+  `<prefix>/<YYYYMMDDHH>/<instance>/<file>-<UTC timestamp>.gz` instead of
+  `<prefix>/<instance>/<file>-<UTC timestamp>.gz`. With
+  `rotation.interval: none` the single shutdown upload uses the upload
+  time for the hour and also writes the `latest/` copy. Overwriting
+  objects needs `storage.objects.delete` as well as
+  `storage.objects.create`. (#52)
+- **`upload.timeout`** now bounds each upload and, with rotation, the
+  whole shutdown upload pass. (#52)
+
 <a id="v0.0.17"></a>
 ## v0.0.17
 
