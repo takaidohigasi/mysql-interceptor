@@ -115,6 +115,7 @@ func runServe() {
 	if cfg.Logging.OutputDir != "" {
 		queryLogger, err = logging.NewLogger(logging.LoggerConfig{
 			Enabled:    cfg.Logging.Enabled,
+			Level:      cfg.Logging.Level,
 			OutputDir:  cfg.Logging.OutputDir,
 			FilePrefix: cfg.Logging.FilePrefix,
 			QueueSize:  cfg.Logging.QueueSize,
@@ -165,6 +166,7 @@ func runServe() {
 		cfgWatcher.OnChange(func(newCfg *config.Config) {
 			if queryLogger != nil {
 				queryLogger.SetEnabled(newCfg.Logging.Enabled)
+				queryLogger.SetLevel(newCfg.Logging.Level)
 			}
 			if shadowSender != nil {
 				if newCfg.Replay.Shadow.Enabled != nil {

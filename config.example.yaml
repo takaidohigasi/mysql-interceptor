@@ -68,6 +68,10 @@ tls:
 
 logging:
   enabled: true
+  level: "all"             # "all" (default) | "error" — hot-reloadable like enabled.
+                           # "error" keeps only queries whose backend execution
+                           # returned an error, for cutting volume during a
+                           # noisy incident without losing failure visibility.
   output_dir: "./logs"
   file_prefix: "queries"
   redact_args: false       # set true to replace prepared-stmt bind values with <redacted>

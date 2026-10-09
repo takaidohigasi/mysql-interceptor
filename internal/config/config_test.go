@@ -176,6 +176,53 @@ replay:
 	}
 }
 
+func TestLoad_LoggingLevelDefaultsToAll(t *testing.T) {
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "root"
+      password: "p"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if cfg.Logging.Level != "all" {
+		t.Errorf("expected default logging level 'all', got %s", cfg.Logging.Level)
+	}
+}
+
+func TestLoad_InvalidLoggingLevel(t *testing.T) {
+	content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "root"
+      password: "p"
+logging:
+  level: "warn"
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Error("expected validation error for invalid logging level")
+	}
+}
+
 func TestLoad_MultiUserMode(t *testing.T) {
 	// Each session opens its backend connection using the authenticated
 	// user's creds; backend.user is not used.
