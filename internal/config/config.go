@@ -167,11 +167,10 @@ type LoggingConfig struct {
 	// placeholders) is still recorded.
 	RedactArgs bool `yaml:"redact_args"`
 	// Level selects which entries get written once logging is enabled:
-	// "all" (default) logs every query, "error" logs only queries whose
-	// backend execution returned an error. Hot-reloadable, same as
-	// Enabled — toggle to "error" to cut volume during a noisy incident
-	// without losing visibility into failures, then back to "all" when
-	// investigating further.
+	// "error" (default) logs only queries whose backend execution
+	// returned an error, "all" logs every query. Hot-reloadable, same as
+	// Enabled — toggle to "all" when investigating further, then back to
+	// "error" to keep steady-state volume low.
 	Level string `yaml:"level"`
 	// QueueSize bounds the async log channel. Larger = more burst tolerance
 	// but higher memory ceiling. Entries beyond the buffer are dropped
@@ -470,7 +469,7 @@ func applyDefaults(cfg *Config) {
 		cfg.Logging.FilePrefix = "queries"
 	}
 	if cfg.Logging.Level == "" {
-		cfg.Logging.Level = "all"
+		cfg.Logging.Level = "error"
 	}
 	if cfg.Logging.Rotation.MaxSizeMB == 0 {
 		cfg.Logging.Rotation.MaxSizeMB = 100

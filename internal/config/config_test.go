@@ -176,7 +176,7 @@ replay:
 	}
 }
 
-func TestLoad_LoggingLevelDefaultsToAll(t *testing.T) {
+func TestLoad_LoggingLevelDefaultsToError(t *testing.T) {
 	content := `
 backend:
   addr: "127.0.0.1:3306"
@@ -195,8 +195,8 @@ proxy:
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
-	if cfg.Logging.Level != "all" {
-		t.Errorf("expected default logging level 'all', got %s", cfg.Logging.Level)
+	if cfg.Logging.Level != "error" {
+		t.Errorf("expected default logging level 'error', got %s", cfg.Logging.Level)
 	}
 }
 

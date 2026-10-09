@@ -222,7 +222,7 @@ Logs all queries as JSON lines with rotation. Enable/disable at runtime by editi
 ```yaml
 logging:
   enabled: true          # hot-reloadable
-  level: "all"            # "all" (default) | "error" — also hot-reloadable
+  level: "error"          # "error" (default) | "all" — also hot-reloadable
   output_dir: "./logs"
   file_prefix: "queries"
   redact_args: false     # set true to redact prepared-statement bind values
@@ -233,11 +233,11 @@ logging:
     compress: true
 ```
 
-**Level:** `level: "error"` records only entries whose backend execution
-returned an error, skipping everything else before it reaches the async
-write queue — useful for cutting log volume during a noisy incident while
-keeping every failure. Toggle back to `"all"` the same way as `enabled`,
-by editing the config file — no restart needed.
+**Level:** `level: "error"` (the default) records only entries whose backend
+execution returned an error, skipping everything else before it reaches
+the async write queue — keeps steady-state volume low while still
+capturing every failure. Switch to `"all"` the same way as `enabled`, by
+editing the config file — no restart needed — when investigating further.
 
 Log entry format:
 
