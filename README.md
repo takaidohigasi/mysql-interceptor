@@ -463,15 +463,17 @@ The query text and the `original` / `replay` values are shown as
 `<hidden>` unless `--show-values` is passed, since diff records can carry row
 data. Heartbeat lines are skipped, and `.gz` files are decompressed.
 
-### Uploading the report to GCS
+### Rotating and uploading the report
 
-When the report lives on ephemeral storage (e.g. a Kubernetes `emptyDir`), it
-is lost with the pod. `comparison.upload.gcs` copies it to GCS when `serve`
-shuts down, after sessions drain and the report is flushed:
+In `serve`, the report rotates every UTC hour by default:
 
 ```yaml
 comparison:
   output_file: "/tmp/diff-report.jsonl"
+  rotation:
+    interval: hourly      # default; "none" keeps one file
+    min_size_kb: 0        # skip an hour's rotation while the file is smaller
+    keep: 24              # closed segments kept on local disk
   upload:
     gcs:
       bucket: "my-bucket"
@@ -480,13 +482,35 @@ comparison:
     timeout: 20s
 ```
 
-The object is `gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz`
-(gzip), so every pod writes under its own path. Credentials come from
-Application Default Credentials (Workload Identity on GKE); the identity needs
-`storage.objects.create` on the bucket. Keep `proxy.shutdown_timeout` plus
-`upload.timeout` below the process grace period (e.g.
-`terminationGracePeriodSeconds`). A failed upload is logged and the local file
-is left in place.
+At every UTC hour the file is renamed to
+`diff-report.jsonl-<UTC start, YYYYMMDDTHHMMSSZ>` (a *segment*) and a fresh one
+is opened. An empty file is not rotated, and one smaller than `min_size_kb` is
+written on through the next hour, so a segment can span several hours; its
+name keeps the time it started. Shutdown always closes the last non-empty file
+as a segment, and a non-empty file left by a previous process becomes a
+segment at start-up. `mysql-interceptor report` reads one file, so pass it the
+segments to look at past hours.
+
+What happens to the data depends on `upload.gcs`:
+
+| | with `upload.gcs.bucket` | without |
+| --- | --- | --- |
+| every hour (and at shutdown) | the current data is uploaded gzipped to `gs://<bucket>/<prefix>/<YYYYMMDDHH>/<instance>/<segment>.gz` (one object per segment, overwritten while it grows; `YYYYMMDDHH` is the UTC hour it started) and uncompressed to `gs://<bucket>/latest/<prefix>/<instance>-<file>` | nothing is uploaded |
+| a closed segment | removed locally once uploaded; a failed upload is kept and retried on the next segment and at shutdown | kept on local disk |
+| local disk | at most `keep` closed segments | at most `keep` closed segments |
+
+Only complete records are uploaded: the writer flushes before the size is
+taken, and only that many bytes are read. With `interval: none` the single
+file is uploaded once at shutdown (`YYYYMMDDHH` and the timestamp are then the
+upload time), plus the `latest/` copy.
+
+Credentials come from Application Default Credentials (Workload Identity on
+GKE). Objects are overwritten, so the identity needs `storage.objects.create`
+**and** `storage.objects.delete` on the bucket (e.g. `roles/storage.objectUser`;
+`roles/storage.objectCreator` alone fails on the second upload of an object).
+`upload.timeout` bounds each upload and, with rotation, the whole shutdown
+pass; keep `proxy.shutdown_timeout` plus `upload.timeout` below the process
+grace period (e.g. `terminationGracePeriodSeconds`). Failed uploads are logged.
 
 ### Query digest stats
 

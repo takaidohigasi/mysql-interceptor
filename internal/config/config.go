@@ -363,24 +363,59 @@ type ComparisonConfig struct {
 	// list.
 	RedactAllValues bool `yaml:"redact_all_values"`
 
-	// Upload copies OutputFile to object storage when `serve` shuts
-	// down, so the diff report survives the process and its local disk
-	// (e.g. a pod's emptyDir). Shadow mode only.
+	// Upload copies OutputFile to object storage, so the diff report
+	// survives the process and its local disk (e.g. a pod's emptyDir):
+	// every hour with Rotation, otherwise when `serve` shuts down.
+	// Shadow mode only.
 	Upload ReportUploadConfig `yaml:"upload"`
+
+	// Rotation splits OutputFile into hourly segments in `serve`
+	// (shadow mode). See ReportRotationConfig.
+	Rotation ReportRotationConfig `yaml:"rotation"`
 }
 
-// ReportUploadConfig configures the shutdown upload of the comparison
-// report. Leaving gcs.bucket empty disables it.
+// ReportRotationConfig controls the hourly rotation of the comparison report.
+//
+// At every UTC hour the report file is renamed to
+// <output_file>-<UTC start, YYYYMMDDTHHMMSSZ> and a fresh one is opened,
+// unless it is smaller than MinSizeKB (then it is written on through the
+// next hour) or empty. With upload.gcs every hour's data is uploaded to
+// gs://<bucket>/<prefix>/<YYYYMMDDHH of its start>/<instance>/<segment>.gz
+// (overwritten while the segment grows) and, uncompressed, to
+// gs://<bucket>/latest/<prefix>/<instance>-<file>; a closed segment is
+// removed locally once uploaded. Without upload.gcs, closed segments stay
+// on disk. Either way at most Keep closed segments are kept locally.
+type ReportRotationConfig struct {
+	// Interval is "hourly" (default) or "none" (one file, uploaded at
+	// shutdown only).
+	Interval string `yaml:"interval"`
+	// MinSizeKB skips an hour's rotation while the file is smaller than
+	// this. 0 (default) rotates every non-empty hour.
+	MinSizeKB int `yaml:"min_size_kb"`
+	// Keep is the number of closed segments kept on local disk. Default 24.
+	Keep int `yaml:"keep"`
+}
+
+// RotateHourly reports whether the report rotates every hour.
+func (r ReportRotationConfig) RotateHourly() bool { return r.Interval == "hourly" }
+
+// ReportUploadConfig configures the upload of the comparison report
+// (hourly with rotation, at shutdown otherwise). Leaving gcs.bucket empty
+// disables it.
 type ReportUploadConfig struct {
 	GCS GCSUploadConfig `yaml:"gcs"`
-	// Timeout bounds the upload at shutdown. Keep shutdown_timeout plus
-	// this below the grace period of whatever stops the process (e.g.
+	// Timeout bounds each upload, and with rotation also the whole
+	// shutdown upload pass. Keep shutdown_timeout plus this below the
+	// grace period of whatever stops the process (e.g.
 	// terminationGracePeriodSeconds). Default 20s.
 	Timeout time.Duration `yaml:"timeout"`
 }
 
-// GCSUploadConfig names the destination of the report upload. The object
-// is written to gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz.
+// GCSUploadConfig names the destination of the report upload. Objects are
+// written to gs://<bucket>/<prefix>/<YYYYMMDDHH>/<instance>/<file>-<UTC
+// timestamp>.gz, plus the uncompressed latest copy at
+// gs://<bucket>/latest/<prefix>/<instance>-<file>. Overwriting an object
+// needs storage.objects.delete as well as storage.objects.create.
 type GCSUploadConfig struct {
 	Bucket string `yaml:"bucket"`
 	// Prefix is prepended to every object name. Empty means the bucket root.
@@ -537,6 +572,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Comparison.Upload.Timeout == 0 {
 		cfg.Comparison.Upload.Timeout = 20 * time.Second
 	}
+	if cfg.Comparison.Rotation.Interval == "" {
+		cfg.Comparison.Rotation.Interval = "hourly"
+	}
+	if cfg.Comparison.Rotation.Keep == 0 {
+		cfg.Comparison.Rotation.Keep = 24
+	}
 	if cfg.Comparison.Retry.Delay == 0 {
 		cfg.Comparison.Retry.Delay = 2 * time.Second
 	}
@@ -661,6 +702,17 @@ func (c *Config) Validate() error {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("replay.shadow.excluded_source_cidrs[%d] invalid CIDR %q: %w", i, cidr, err)
 		}
+	}
+	switch c.Comparison.Rotation.Interval {
+	case "hourly", "none":
+	default:
+		return fmt.Errorf("comparison.rotation.interval must be one of: hourly, none (got %q)", c.Comparison.Rotation.Interval)
+	}
+	if c.Comparison.Rotation.MinSizeKB < 0 {
+		return fmt.Errorf("comparison.rotation.min_size_kb must be non-negative, got %d", c.Comparison.Rotation.MinSizeKB)
+	}
+	if c.Comparison.Rotation.Keep < 1 {
+		return fmt.Errorf("comparison.rotation.keep must be at least 1, got %d", c.Comparison.Rotation.Keep)
 	}
 	if c.Comparison.Upload.GCS.Bucket != "" {
 		if c.Comparison.OutputFile == "" || c.Comparison.OutputFile == "-" {

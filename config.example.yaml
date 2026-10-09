@@ -167,19 +167,36 @@ comparison:
   # regardless of redact_columns. Defense-in-depth fallback for
   # high-sensitivity environments.
   redact_all_values: false
-  # upload: copy output_file to GCS when `serve` shuts down, so the
-  # report outlives the process and its local disk. The object is
-  # gs://<bucket>/<prefix>/<instance>/<file>-<UTC timestamp>.gz.
-  # Uses Application Default Credentials (Workload Identity on GKE).
-  # Leave bucket empty to disable.
+  # rotation: in `serve`, split output_file at every UTC hour. The file is
+  # renamed to <output_file>-<UTC start, YYYYMMDDTHHMMSSZ> and a fresh one
+  # is opened, unless it is empty or smaller than min_size_kb (then it is
+  # written on through the next hour). The last file is always closed at
+  # shutdown. Without upload.gcs, closed segments stay on disk; with it,
+  # see upload below. Either way at most `keep` closed segments are kept.
+  rotation:
+    interval: hourly           # or "none": one file, uploaded at shutdown
+    min_size_kb: 0             # 0 = rotate every non-empty hour
+    keep: 24
+  # upload: copy the report to GCS so it outlives the process and its
+  # local disk. With rotation, every hour (and at shutdown) the data is
+  # uploaded to
+  #   gs://<bucket>/<prefix>/<YYYYMMDDHH>/<instance>/<file>-<start>.gz
+  # (one object per segment, overwritten while it grows; YYYYMMDDHH is
+  # the UTC hour it started) and, uncompressed, to
+  #   gs://<bucket>/latest/<prefix>/<instance>-<file>
+  # A closed segment is removed locally once uploaded; a failed upload is
+  # retried. Without rotation the file is uploaded once at shutdown (the
+  # hour is the upload time). Uses Application Default Credentials
+  # (Workload Identity on GKE); overwriting needs storage.objects.delete
+  # as well as storage.objects.create. Leave bucket empty to disable.
   upload:
     gcs:
       bucket: ""
       prefix: "mysql-interceptor"
       # instance defaults to the hostname (the pod name on Kubernetes).
       # instance: "${POD_NAME}"
-    timeout: 20s               # keep shutdown_timeout + this below the
-                               # process grace period
+    timeout: 20s               # per upload; keep shutdown_timeout + this
+                               # below the process grace period
   # Queries that match any of these case-insensitive regexes are still
   # recorded in the diff report but marked "ignored" instead of counted
   # as differences. Use for queries that read server-local state and

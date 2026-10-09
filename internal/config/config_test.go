@@ -569,3 +569,50 @@ comparison:
 		})
 	}
 }
+
+func TestLoad_ComparisonRotation(t *testing.T) {
+	write := func(t *testing.T, cmp string) string {
+		t.Helper()
+		content := `
+backend:
+  addr: "127.0.0.1:3306"
+proxy:
+  users:
+    - username: "u"
+      password: "p"
+comparison:
+  output_file: /tmp/x.jsonl
+` + cmp
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	cfg, err := Load(write(t, ""))
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if r := cfg.Comparison.Rotation; r.Interval != "hourly" || r.MinSizeKB != 0 || r.Keep != 24 || !r.RotateHourly() {
+		t.Errorf("unexpected defaults: %+v", r)
+	}
+
+	cfg, err = Load(write(t, "  rotation:\n    interval: none\n    min_size_kb: 512\n    keep: 3\n"))
+	if err != nil {
+		t.Fatalf("explicit: %v", err)
+	}
+	if r := cfg.Comparison.Rotation; r.Interval != "none" || r.MinSizeKB != 512 || r.Keep != 3 || r.RotateHourly() {
+		t.Errorf("unexpected values: %+v", r)
+	}
+
+	for name, cmp := range map[string]string{
+		"bad interval":  "  rotation:\n    interval: daily\n",
+		"negative min":  "  rotation:\n    min_size_kb: -1\n",
+		"negative keep": "  rotation:\n    keep: -1\n",
+	} {
+		if _, err := Load(write(t, cmp)); err == nil || !strings.Contains(err.Error(), "comparison.rotation") {
+			t.Errorf("%s: err = %v, want a comparison.rotation error", name, err)
+		}
+	}
+}

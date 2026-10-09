@@ -126,7 +126,19 @@ type ShadowSender struct {
 	cancel context.CancelFunc
 }
 
+// ShadowOptions are the NewShadowSenderWithOptions knobs that do not come
+// from the config file.
+type ShadowOptions struct {
+	// OnReportSegment receives every compare.SegmentEvent of the rotated
+	// comparison report (comparison.rotation). It must not block.
+	OnReportSegment func(compare.SegmentEvent)
+}
+
 func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig) (*ShadowSender, error) {
+	return NewShadowSenderWithOptions(cfg, compareCfg, ShadowOptions{})
+}
+
+func NewShadowSenderWithOptions(cfg config.ShadowConfig, compareCfg config.ComparisonConfig, opts ShadowOptions) (*ShadowSender, error) {
 	ignoreColumns := make(map[string]bool)
 	for _, col := range compareCfg.IgnoreColumns {
 		ignoreColumns[col] = true
@@ -154,6 +166,9 @@ func NewShadowSender(cfg config.ShadowConfig, compareCfg config.ComparisonConfig
 		OutputFile:       compareCfg.OutputFile,
 		MaxUniqueDigests: compareCfg.MaxUniqueDigests,
 		LogMatches:       compareCfg.LogMatches,
+		Rotate:           compareCfg.Rotation.RotateHourly(),
+		RotateMinSize:    int64(compareCfg.Rotation.MinSizeKB) * 1024,
+		OnSegment:        opts.OnReportSegment,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating shadow reporter: %w", err)

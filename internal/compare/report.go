@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/takaidohigasi/mysql-interceptor/internal/metrics"
+	"github.com/takaidohigasi/mysql-interceptor/internal/segment"
 )
 
 // reporterWriteChCap is the buffer size of the async writer channel.
@@ -92,6 +93,17 @@ type Reporter struct {
 	closeOnce  sync.Once
 	closeErr   error
 
+	// Hourly rotation of a file-backed sink (ReporterOptions.Rotate).
+	// Touched only by runWriter, and by Close after runWriter returned.
+	path      string
+	rotate    bool
+	rotateMin int64
+	onSegment func(SegmentEvent)
+	now       func() time.Time
+	segStart  time.Time // when the current file started
+	broken    bool      // reopening path failed; writing to io.Discard
+	rotateReq chan chan struct{}
+
 	totalCount    atomic.Int64
 	matchCount    atomic.Int64
 	diffCount     atomic.Int64
@@ -120,6 +132,23 @@ type ReporterOptions struct {
 	// and ignored results are summarized via the periodic heartbeat
 	// (see WriteHeartbeat) instead of one line per query.
 	LogMatches bool
+
+	// Rotate splits a file-backed OutputFile at every UTC hour: the
+	// current file is renamed to segment.Name(OutputFile, <its start>)
+	// and a fresh OutputFile is opened. A file smaller than
+	// RotateMinSize bytes is kept and written on through the next hour;
+	// an empty one is never rotated. Close always closes the last
+	// non-empty file as a segment. A non-empty OutputFile left by a
+	// previous process becomes a segment at start-up, named after its
+	// last modification. Ignored for stdout.
+	Rotate        bool
+	RotateMinSize int64
+	// OnSegment is called every hour with the file's state (and at
+	// start-up / Close for the segments they close), from the writer
+	// goroutine or Close. It must not block.
+	OnSegment func(SegmentEvent)
+	// Now returns the current time; for tests.
+	Now func() time.Time
 }
 
 func NewReporter(outputFile string) (*Reporter, error) {
@@ -141,10 +170,24 @@ func NewReporterWithDigestCap(outputFile string, maxUniqueDigests int) (*Reporte
 // or "-" routes output to stdout. Spawns the async writer goroutine;
 // callers MUST call Close to flush and stop it.
 func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	toStdout := opts.OutputFile == "" || opts.OutputFile == "-"
+	rotate := opts.Rotate && !toStdout
+
+	var leftover string
 	var w io.WriteCloser
-	if opts.OutputFile == "" || opts.OutputFile == "-" {
+	if toStdout {
 		w = os.Stdout
 	} else {
+		if rotate {
+			var err error
+			if leftover, err = adoptLeftover(opts.OutputFile); err != nil {
+				return nil, fmt.Errorf("rotating the previous report file: %w", err)
+			}
+		}
 		f, err := os.OpenFile(opts.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			return nil, fmt.Errorf("opening report file: %w", err)
@@ -158,13 +201,142 @@ func NewReporterFromOptions(opts ReporterOptions) (*Reporter, error) {
 		writerDone:  make(chan struct{}),
 		logMatches:  opts.LogMatches,
 		digestStats: NewDigestStatsWithCap(opts.MaxUniqueDigests),
+		path:        opts.OutputFile,
+		rotate:      rotate,
+		rotateMin:   opts.RotateMinSize,
+		onSegment:   opts.OnSegment,
+		now:         now,
+		segStart:    now(),
+		rotateReq:   make(chan chan struct{}),
 	}
 	if w != os.Stdout {
 		r.bw = bufio.NewWriterSize(w, reporterBufSize)
 	}
+	if leftover != "" {
+		if st, err := os.Stat(leftover); err == nil {
+			start, _ := segment.Start(r.path, leftover)
+			r.notify(SegmentEvent{Path: leftover, Size: st.Size(), Start: start, Closed: true})
+		}
+	}
 	go r.runWriter()
 	return r, nil
 }
+
+// adoptLeftover renames a non-empty report left at path by a previous
+// process to a segment named after its last modification, so this process
+// starts a fresh file and the old content is handled like any segment.
+func adoptLeftover(path string) (string, error) {
+	st, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if st.Size() == 0 {
+		return "", nil
+	}
+	seg := segment.Name(path, st.ModTime())
+	if err := os.Rename(path, seg); err != nil {
+		return "", err
+	}
+	return seg, nil
+}
+
+func (r *Reporter) notify(ev SegmentEvent) {
+	if ev.Closed {
+		slog.Info("comparison report rotated", "segment", ev.Path, "bytes", ev.Size)
+	}
+	if r.onSegment != nil {
+		r.onSegment(ev)
+	}
+}
+
+// untilNextHour is the wait from t to the next full UTC hour.
+func untilNextHour(t time.Time) time.Duration {
+	return t.UTC().Truncate(time.Hour).Add(time.Hour).Sub(t)
+}
+
+// rotateAtHour runs on the writer goroutine at each UTC hour. It closes
+// the current file as a segment unless it is empty or smaller than
+// rotateMin, in which case the file is written on through the next hour
+// and reported as a not-yet-closed snapshot.
+func (r *Reporter) rotateAtHour() {
+	if r.broken {
+		r.reopen()
+		return
+	}
+	if err := r.bw.Flush(); err != nil {
+		slog.Error("failed to flush comparison records", "err", err)
+	}
+	st, err := os.Stat(r.path)
+	if err != nil {
+		slog.Error("report rotation skipped", "file", r.path, "err", err)
+		return
+	}
+	if st.Size() == 0 {
+		return
+	}
+	if st.Size() < r.rotateMin {
+		r.notify(SegmentEvent{Path: r.path, Size: st.Size(), Start: r.segStart})
+		return
+	}
+	if err := r.writer.Close(); err != nil {
+		slog.Error("failed to close report file", "file", r.path, "err", err)
+	}
+	start := r.segStart
+	seg, err := r.closeSegment()
+	r.reopen()
+	if err != nil {
+		slog.Error("report rotation failed", "file", r.path, "err", err)
+		return
+	}
+	r.notify(SegmentEvent{Path: seg, Size: st.Size(), Start: start, Closed: true})
+}
+
+// closeSegment renames the (closed) current file to its segment name.
+func (r *Reporter) closeSegment() (string, error) {
+	seg := segment.Name(r.path, r.segStart)
+	if err := os.Rename(r.path, seg); err != nil {
+		return "", err
+	}
+	return seg, nil
+}
+
+// reopen opens a fresh file at path. On failure records go to io.Discard
+// until the next hour retries; the error is logged.
+func (r *Reporter) reopen() {
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		slog.Error("failed to reopen report file; dropping records until the next rotation", "file", r.path, "err", err)
+		r.writer = nopWriteCloser{io.Discard}
+		r.bw.Reset(io.Discard)
+		r.broken = true
+		return
+	}
+	r.writer = f
+	r.bw.Reset(f)
+	r.segStart = r.now()
+	r.broken = false
+}
+
+// SegmentEvent describes the report data a Rotate tick (or start-up /
+// Close) has settled: the first Size bytes of Path, which hold complete
+// records only (the writer flushed before measuring).
+type SegmentEvent struct {
+	// Path is the file to read: a closed segment when Closed, otherwise
+	// the live OutputFile, which keeps growing past Size.
+	Path string
+	Size int64
+	// Start is when the data began; it names the segment.
+	Start time.Time
+	// Closed is true once Path is a closed segment that will not change.
+	Closed bool
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
 
 // runWriter is the sole consumer of writeCh. By concentrating the
 // underlying file Write into one goroutine we eliminate the previous
@@ -206,6 +378,13 @@ func (r *Reporter) runWriter() {
 		defer t.Stop()
 		tickerC = t.C
 	}
+	var rotateC <-chan time.Time
+	var rotateTimer *time.Timer
+	if r.rotate {
+		rotateTimer = time.NewTimer(untilNextHour(r.now()))
+		defer rotateTimer.Stop()
+		rotateC = rotateTimer.C
+	}
 
 	for {
 		select {
@@ -224,8 +403,37 @@ func (r *Reporter) runWriter() {
 			emitterPool.Put(e)
 		case <-tickerC:
 			flush()
+		case <-rotateC:
+			r.rotateAtHour()
+			rotateTimer.Reset(untilNextHour(r.now()))
+		case done := <-r.rotateReq:
+			// Tests trigger a rotation without waiting for the hour.
+			// Write what is already queued first, so a test sees the
+			// records it sent before asking.
+			for drained := false; !drained; {
+				select {
+				case e := <-r.writeCh:
+					if _, err := sink.Write(e.buf); err != nil {
+						slog.Error("failed to write comparison record", "err", err)
+					}
+					emitterPool.Put(e)
+				default:
+					drained = true
+				}
+			}
+			if r.rotate {
+				r.rotateAtHour()
+			}
+			close(done)
 		}
 	}
+}
+
+// rotateNow runs an hourly rotation now and waits for it; for tests.
+func (r *Reporter) rotateNow() {
+	done := make(chan struct{})
+	r.rotateReq <- done
+	<-done
 }
 
 // shouldEmit reports whether a comparison result should be written
@@ -422,6 +630,19 @@ func (r *Reporter) Close() error {
 		close(r.writeCh)
 		<-r.writerDone
 		r.closeErr = r.writer.Close()
+		if r.rotate && !r.broken {
+			// The last file always becomes a segment, however small, so
+			// it is shipped with the others before the process exits.
+			if st, err := os.Stat(r.path); err == nil && st.Size() > 0 {
+				start := r.segStart
+				seg, err := r.closeSegment()
+				if err != nil {
+					slog.Error("report rotation at close failed", "file", r.path, "err", err)
+				} else {
+					r.notify(SegmentEvent{Path: seg, Size: st.Size(), Start: start, Closed: true})
+				}
+			}
+		}
 	})
 	return r.closeErr
 }
