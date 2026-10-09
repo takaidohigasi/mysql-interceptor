@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -130,8 +131,19 @@ func runServe() {
 	}
 
 	var shadowSender *replay.ShadowSender
+	var reportShipper *upload.Shipper
 	if cfg.Replay.Mode == "shadow" {
-		shadowSender, err = replay.NewShadowSender(cfg.Replay.Shadow, cfg.Comparison)
+		var opts replay.ShadowOptions
+		if cfg.Comparison.Rotation.RotateHourly() && cfg.Comparison.OutputFile != "" && cfg.Comparison.OutputFile != "-" {
+			uploader, err := reportUploader(cfg.Comparison)
+			if err != nil {
+				fatal("report upload: no instance name", "err", err)
+			}
+			reportShipper = upload.NewShipper(cfg.Comparison.OutputFile, uploader, cfg.Comparison.Rotation.Keep, cfg.Comparison.Upload.Timeout)
+			reportShipper.Start()
+			opts.OnReportSegment = reportShipper.Notify
+		}
+		shadowSender, err = replay.NewShadowSenderWithOptions(cfg.Replay.Shadow, cfg.Comparison, opts)
 		if err != nil {
 			fatal("failed to create shadow sender", "err", err)
 		}
@@ -212,8 +224,15 @@ func runServe() {
 	if shadowSender != nil {
 		shadowSender.Close()
 		// The reporter is closed (and the report flushed) by
-		// shadowSender.Close, so the file is complete now.
-		uploadReport(cfg.Comparison)
+		// shadowSender.Close, so the file is complete now. With rotation
+		// its last segment is already queued on the shipper.
+		if reportShipper != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.Comparison.Upload.Timeout)
+			reportShipper.Close(ctx)
+			cancel()
+		} else {
+			uploadReport(cfg.Comparison)
+		}
 	}
 	if queryLogger != nil {
 		queryLogger.Close()
@@ -224,35 +243,61 @@ func runServe() {
 	}
 }
 
-// uploadReport copies the comparison report to GCS when
-// comparison.upload.gcs.bucket is set. Failures are logged, not fatal:
-// the proxy is already shutting down and the local file is still there.
-func uploadReport(cmp config.ComparisonConfig) {
+// reportUploader returns the GCS uploader for the comparison report, or
+// nil when comparison.upload.gcs.bucket is not set. The instance name
+// defaults to the hostname (the pod name on Kubernetes).
+func reportUploader(cmp config.ComparisonConfig) (*upload.GCSUploader, error) {
 	gcs := cmp.Upload.GCS
 	if gcs.Bucket == "" {
-		return
+		return nil, nil
 	}
 	instance := gcs.Instance
 	if instance == "" {
 		h, err := os.Hostname()
 		if err != nil {
-			slog.Error("report upload skipped: no instance name", "err", err)
-			return
+			return nil, err
 		}
 		instance = h
 	}
-	u := &upload.GCSUploader{Bucket: gcs.Bucket, Prefix: gcs.Prefix, Instance: instance}
+	return &upload.GCSUploader{Bucket: gcs.Bucket, Prefix: gcs.Prefix, Instance: instance}, nil
+}
+
+// uploadReport copies the (unrotated) comparison report to GCS when
+// comparison.upload.gcs.bucket is set: gzipped, and uncompressed as the
+// latest copy. Failures are logged, not fatal: the proxy is already
+// shutting down and the local file is still there.
+func uploadReport(cmp config.ComparisonConfig) {
+	u, err := reportUploader(cmp)
+	if err != nil {
+		slog.Error("report upload skipped: no instance name", "err", err)
+		return
+	}
+	if u == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), cmp.Upload.Timeout)
 	defer cancel()
 	object, err := u.UploadGzip(ctx, cmp.OutputFile)
 	switch {
 	case err != nil:
-		slog.Error("report upload failed", "bucket", gcs.Bucket, "file", cmp.OutputFile, "err", err)
+		slog.Error("report upload failed", "bucket", u.Bucket, "file", cmp.OutputFile, "err", err)
+		return
 	case object == "":
 		slog.Info("report upload skipped: report is empty", "file", cmp.OutputFile)
+		return
 	default:
-		slog.Info("report uploaded", "bucket", gcs.Bucket, "object", object)
+		slog.Info("report uploaded", "bucket", u.Bucket, "object", object)
 	}
+	st, err := os.Stat(cmp.OutputFile)
+	if err != nil {
+		return
+	}
+	latest := u.LatestObjectName(filepath.Base(cmp.OutputFile))
+	if err := u.Upload(ctx, cmp.OutputFile, st.Size(), latest, false); err != nil {
+		slog.Error("report upload failed", "bucket", u.Bucket, "object", latest, "err", err)
+		return
+	}
+	slog.Info("report uploaded", "bucket", u.Bucket, "object", latest)
 }
 
 func runReplay() {

@@ -60,7 +60,8 @@ you didn't achieve.
 | `internal/backend/` | Backend connection factory (`Connect`) and a small connection pool used by offline replay. |
 | `internal/replay/` | Shadow sender (`shadow.go`, `session.go`) and offline replayer (`offline.go`). Query category classification (`filter.go`) gates what is safe to forward. Checkpoint tracking lives in `checkpoint.go`. |
 | `internal/compare/` | Response comparison engine (`engine.go`), per-digest stats (`digest_stats.go`), reporter (`report.go`). `result.go` defines `CompareResult`, the JSONL line format. |
-| `internal/upload/` | Shutdown upload of the comparison report to GCS (`gcs.go`, JSON API media upload with Application Default Credentials). |
+| `internal/upload/` | Upload of the comparison report to GCS (`gcs.go`, JSON API media upload with Application Default Credentials) and the hourly segment shipper (`shipper.go`). |
+| `internal/segment/` | Names and lists the closed segments of the rotated report (`<file>-<UTC start>`). |
 | `internal/logging/` | Async query log writer with rotation. |
 | `internal/config/` | YAML config types, defaults (`applyDefaults`), validation, and hot-reload watcher (`watcher.go`). |
 | `internal/metrics/` | `:9090` HTTP server exposing `/healthz`, `/metrics` (Prometheus/OpenMetrics), `/metrics.json`, `/debug/vars`. Metrics are unlabeled by default; pass `Labels{Cluster: ...}` to add a `cluster` label. |
