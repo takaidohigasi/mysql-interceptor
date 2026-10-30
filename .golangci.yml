@@ -30,6 +30,7 @@ linters:
         - G301 # dir perms 0o755 are fine for log output dirs
         - G302 # file perms 0o644 are fine for log output files
         - G304 # file paths come from config, not untrusted input
+        - G703 # same as G304, from taint analysis (e.g. --markdown-out flag)
         - G404 # use of weak rng is fine for reservoir sampling (non-crypto)
     revive:
       # The 'exported' rule would require a doc comment on every exported
